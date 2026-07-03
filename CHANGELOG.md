@@ -4,6 +4,12 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.8.0] - 2026-07-03
+
+### Changed
+
+- Fix backtest readiness checks and automate Web data-check/report-refresh flow.
+
 ## [0.7.3] - 2026-07-03
 
 ### Changed
