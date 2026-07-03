@@ -14,7 +14,7 @@ import pandas as pd
 from jq_tushare_sdk import __version__
 from jq_tushare_sdk import cli as cli_module
 from jq_tushare_sdk.config import BacktestConfig
-from jq_tushare_sdk.data.readiness import ReadinessIssue
+from jq_tushare_sdk.data.readiness import DataUpdateRequest, ReadinessIssue
 from jq_tushare_sdk.runtime.engine import BacktestEngine
 
 
@@ -376,6 +376,54 @@ def handle_bad(context):
             token="placeholder",
             cache_mode="strict_local",
         )
+        engine_cls.assert_called_once()
+
+    def test_cli_backtest_auto_updates_missing_data_before_running(self):
+        issue = ReadinessIssue(
+            api_name="daily",
+            message="daily starts at 20240103, missing requested start 2024-01-02.",
+            suggestion="python update_data.py --api daily --start-date 20240102 --end-date 20240103",
+            update_requests=(DataUpdateRequest("daily", "20240102", "20240103"),),
+        )
+        readiness_results = [[issue], []]
+        backend = SimpleNamespace(update_data=mock.Mock(return_value=3))
+        manifest = SimpleNamespace(run_dir=Path("/tmp/backtest-runs/run-1"))
+        engine = SimpleNamespace(run=lambda: manifest)
+        stdout = io.StringIO()
+
+        with (
+            mock.patch.dict(os.environ, {"TUSHARE_TOKEN": "placeholder"}, clear=False),
+            mock.patch.object(cli_module, "TushareCacheBackend", return_value=backend),
+            mock.patch.object(
+                cli_module,
+                "DataReadinessCheck",
+                return_value=SimpleNamespace(check_required=lambda *args, **kwargs: readiness_results.pop(0)),
+            ),
+            mock.patch.object(cli_module, "BacktestEngine", return_value=engine) as engine_cls,
+            redirect_stdout(stdout),
+        ):
+            result = cli_module.main(
+                [
+                    "backtest",
+                    "demo.py",
+                    "--no-deterministic",
+                    "--start",
+                    "2024-01-02",
+                    "--end",
+                    "2024-01-03",
+                    "--cache-db",
+                    "/tmp/cache.db",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        backend.update_data.assert_called_once_with(
+            "daily",
+            start_date="20240102",
+            end_date="20240103",
+        )
+        self.assertIn("Automatic data update completed", stdout.getvalue())
+        self.assertIn("Backtest complete: /tmp/backtest-runs/run-1", stdout.getvalue())
         engine_cls.assert_called_once()
 
     def test_cli_backtest_can_disable_data_optimization(self):

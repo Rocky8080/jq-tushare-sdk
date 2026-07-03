@@ -9,7 +9,7 @@ from jq_tushare_sdk.adapters.tushare.cache_backend import TushareCacheBackend
 from jq_tushare_sdk.config import BacktestConfig
 from jq_tushare_sdk.data.code_map import to_joinquant_code, to_tushare_code
 from jq_tushare_sdk.data.portal import DataPortal
-from jq_tushare_sdk.data.readiness import DataReadinessCheck
+from jq_tushare_sdk.data.readiness import DataReadinessCheck, update_missing_data
 
 
 class FakeBackend:
@@ -853,8 +853,14 @@ class TestDataLayer(unittest.TestCase):
         self.assertEqual(len(issues), 2)
         self.assertEqual(issues[0].api_name, "daily")
         self.assertIn("2024-01-01", issues[0].message)
+        self.assertEqual(issues[0].update_requests[0].api_name, "daily")
+        self.assertEqual(issues[0].update_requests[0].start_date, "20240101")
+        self.assertEqual(issues[0].update_requests[0].end_date, "20240102")
         self.assertEqual(issues[1].api_name, "daily_basic")
         self.assertIn("update_data.py --api daily_basic", issues[1].suggestion)
+        self.assertEqual(issues[1].update_requests[0].api_name, "daily_basic")
+        self.assertEqual(issues[1].update_requests[0].start_date, "20240101")
+        self.assertEqual(issues[1].update_requests[0].end_date, "20240131")
 
     def test_readiness_reports_missing_strategy_benchmark_index_daily(self):
         with TemporaryDirectory() as tmp:
@@ -885,6 +891,155 @@ def initialize(context):
         self.assertEqual(issues[0].api_name, "index_daily")
         self.assertIn("000985.XSHG", issues[0].message)
         self.assertIn("ts_code 000985.SH", issues[0].suggestion)
+        self.assertEqual(issues[0].update_requests[0].api_name, "index_daily")
+        self.assertEqual(dict(issues[0].update_requests[0].params), {"ts_code": "000985.SH"})
+
+    def test_readiness_reports_partial_fund_daily_coverage(self):
+        class FundBackend(FakeBackend):
+            def fetch(self, api_name, **params):
+                if api_name == "fund_daily":
+                    return pd.DataFrame(
+                        [
+                            {
+                                "ts_code": params["ts_code"],
+                                "trade_date": "20260602",
+                                "close": 4.0,
+                            }
+                        ]
+                    )
+                return super().fetch(api_name, **params)
+
+        with TemporaryDirectory() as tmp:
+            strategy_path = Path(tmp) / "etf_strategy.py"
+            strategy_path.write_text(
+                """
+def initialize(context):
+    g.pool = ["510300.XSHG"]
+""",
+                encoding="utf-8",
+            )
+            config = BacktestConfig(
+                strategy_path=str(strategy_path),
+                start_date="2026-01-01",
+                end_date="2026-07-02",
+                initial_cash=1000000.0,
+                cache_db="/tmp/cache.db",
+            )
+
+            issues = DataReadinessCheck(FundBackend()).check_required(config, [])
+
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].api_name, "fund_daily")
+        self.assertIn("510300.XSHG", issues[0].message)
+        self.assertEqual(len(issues[0].update_requests), 2)
+        first_request = issues[0].update_requests[0]
+        self.assertEqual(first_request.api_name, "fund_daily")
+        self.assertEqual(first_request.start_date, "20260101")
+        self.assertEqual(first_request.end_date, "20260602")
+        self.assertEqual(dict(first_request.params), {"ts_code": "510300.SH"})
+
+    def test_readiness_extends_fund_daily_for_get_price_count_lookback(self):
+        class LookbackFundBackend(FakeBackend):
+            def fetch(self, api_name, **params):
+                if api_name == "trade_cal":
+                    return pd.DataFrame(
+                        [
+                            {"exchange": "SSE", "cal_date": "20250628", "is_open": 0},
+                            {"exchange": "SSE", "cal_date": "20250630", "is_open": 1},
+                            {"exchange": "SSE", "cal_date": "20260105", "is_open": 1},
+                            {"exchange": "SSE", "cal_date": "20260106", "is_open": 1},
+                        ]
+                    )
+                if api_name == "fund_daily":
+                    return pd.DataFrame()
+                return super().fetch(api_name, **params)
+
+        with TemporaryDirectory() as tmp:
+            strategy_path = Path(tmp) / "etf_lookback_strategy.py"
+            strategy_path.write_text(
+                """
+def set_params(context):
+    context.vol_period = 60
+
+def get_volatility(context):
+    return get_price("510300.XSHG", count=context.vol_period, fields=["close"], panel=False)
+""",
+                encoding="utf-8",
+            )
+            config = BacktestConfig(
+                strategy_path=str(strategy_path),
+                start_date="2026-01-01",
+                end_date="2026-01-06",
+                initial_cash=1000000.0,
+                cache_db="/tmp/cache.db",
+            )
+
+            issues = DataReadinessCheck(LookbackFundBackend()).check_required(config, [])
+
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].api_name, "fund_daily")
+        self.assertEqual(issues[0].update_requests[0].start_date, "20250630")
+        self.assertEqual(issues[0].update_requests[0].end_date, "20260106")
+
+    def test_update_missing_data_runs_structured_update_requests_once(self):
+        calls = []
+
+        class UpdateBackend:
+            def update_data(self, api_name, start_date=None, end_date=None, **params):
+                calls.append((api_name, start_date, end_date, params))
+                return 7
+
+        issue = DataReadinessCheck(FakeBackend()).check_required(
+            BacktestConfig(
+                strategy_path="strategy.py",
+                start_date="2024-01-01",
+                end_date="2024-01-31",
+                initial_cash=1000000.0,
+                cache_db="/tmp/cache.db",
+            ),
+            ["daily"],
+        )[0]
+
+        counts = update_missing_data(UpdateBackend(), [issue, issue])
+
+        self.assertEqual(calls, [("daily", "20240101", "20240102", {})])
+        self.assertEqual(counts, {"daily 20240101-20240102": 7})
+
+    def test_readiness_accepts_first_open_day_after_requested_start(self):
+        class HolidayStartBackend(FakeBackend):
+            def status(self, api_name):
+                if api_name == "daily":
+                    return {
+                        "exists": True,
+                        "record_count": 2,
+                        "min_date": "20260105",
+                        "max_date": "20260106",
+                    }
+                return super().status(api_name)
+
+            def fetch(self, api_name, **params):
+                if api_name == "trade_cal":
+                    return pd.DataFrame(
+                        [
+                            {"exchange": "SSE", "cal_date": "20260101", "is_open": 0},
+                            {"exchange": "SSE", "cal_date": "20260102", "is_open": 0},
+                            {"exchange": "SSE", "cal_date": "20260105", "is_open": 1},
+                            {"exchange": "SSE", "cal_date": "20260106", "is_open": 1},
+                        ]
+                    )
+                return super().fetch(api_name, **params)
+
+        config = BacktestConfig(
+            strategy_path="strategy.py",
+            start_date="2026-01-01",
+            end_date="2026-01-06",
+            initial_cash=1000000.0,
+            cache_db="/tmp/cache.db",
+        )
+
+        issues = DataReadinessCheck(HolidayStartBackend()).check_required(config, ["daily"])
+
+        self.assertEqual(issues, [])
 
     def test_readiness_accepts_recent_income_quarter_before_backtest_end(self):
         class IncomeBackend:

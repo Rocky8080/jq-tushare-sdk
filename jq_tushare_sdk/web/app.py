@@ -498,15 +498,25 @@ def _run_local_backtest(config: BacktestConfig) -> RunManifest:
         token=os.environ.get("TUSHARE_TOKEN"),
         cache_mode="strict_local",
     )
-    issues = _check_data_readiness(config, backend=backend)
+    issues = _readiness_issues(config, backend=backend)
     if issues:
-        lines = ["Local cache is not ready:"]
-        lines.extend(f"{item['api_name']}: {item['message']} {item['suggestion']}" for item in issues)
-        raise RuntimeError("\n".join(lines))
+        from jq_tushare_sdk.data.readiness import update_missing_data
+
+        try:
+            update_missing_data(backend, issues)
+        except Exception as exc:
+            raise RuntimeError(_format_readiness_error(config, issues, f"Automatic data update failed: {exc}")) from exc
+        issues = _readiness_issues(config, backend=backend)
+    if issues:
+        raise RuntimeError(_format_readiness_error(config, issues, "Local cache is not ready after automatic update:"))
     return BacktestEngine(config, backend=backend).run()
 
 
 def _check_data_readiness(config: BacktestConfig, *, backend=None) -> list[dict]:
+    return _serialize_readiness_issues(_readiness_issues(config, backend=backend))
+
+
+def _readiness_issues(config: BacktestConfig, *, backend=None):
     from jq_tushare_sdk.adapters.tushare.cache_backend import TushareCacheBackend
     from jq_tushare_sdk.data.readiness import DataReadinessCheck
 
@@ -516,7 +526,10 @@ def _check_data_readiness(config: BacktestConfig, *, backend=None) -> list[dict]
             token=os.environ.get("TUSHARE_TOKEN"),
             cache_mode="strict_local",
         )
-    issues = DataReadinessCheck(backend).check_required(config, _REQUIRED_LOCAL_APIS)
+    return DataReadinessCheck(backend).check_required(config, _REQUIRED_LOCAL_APIS)
+
+
+def _serialize_readiness_issues(issues) -> list[dict]:
     return [
         {
             "api_name": issue.api_name,
@@ -525,6 +538,13 @@ def _check_data_readiness(config: BacktestConfig, *, backend=None) -> list[dict]
         }
         for issue in issues
     ]
+
+
+def _format_readiness_error(config: BacktestConfig, issues, heading: str) -> str:
+    lines = [heading]
+    lines.extend(f"{issue.api_name}: {issue.message} {issue.suggestion}" for issue in issues)
+    lines.append(f"Local cache DB: {config.cache_db}")
+    return "\n".join(lines)
 
 
 def _refresh_report_request(run_store: RunStore, cache_db: Path, payload: dict) -> dict:
@@ -1668,18 +1688,12 @@ async function submitBacktest(event) {
   event.preventDefault();
   try {
     const request = requestPayload();
-    setNotice('正在检查本地缓存...');
-    const readiness = await runDataReadinessCheck(request);
-    if (!readiness.ok) {
-      setNotice(formatReadinessIssues(readiness.issues), 'error');
-      return;
-    }
-    setNotice('数据检查通过，正在提交回测...');
+    setNotice('正在提交任务，后端会自动检查并补齐本地缓存...');
     const payload = await api('/api/backtests', {
       method: 'POST',
       body: JSON.stringify(request),
     });
-    setNotice(`任务已提交：${payload.job.job_id}`);
+    setNotice(`任务已提交：${payload.job.job_id}，正在准备数据并运行回测。`);
     await refreshAll();
   } catch (error) {
     setNotice(error.message, 'error');

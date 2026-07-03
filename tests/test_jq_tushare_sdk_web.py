@@ -195,6 +195,16 @@ class TestWebConsole(unittest.TestCase):
         self.assertIn("formatDateInput", script)
         self.assertNotIn("toISOString", script)
 
+    def test_submit_backtest_delegates_data_preparation_to_backend_job(self):
+        script = web_app._app_js()
+        submit_script = script[
+            script.index("async function submitBacktest") : script.index("async function runDataReadinessCheck")
+        ]
+
+        self.assertNotIn("runDataReadinessCheck", submit_script)
+        self.assertIn("自动检查并补齐", submit_script)
+        self.assertIn("api('/api/backtests'", submit_script)
+
     def test_main_console_uses_top_file_picker_and_report_workspace(self):
         html = web_app._render_app_html(
             Path("/repo"),

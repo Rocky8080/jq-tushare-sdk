@@ -5,6 +5,7 @@ import sys
 from jq_tushare_sdk.adapters.tushare.cache_backend import TushareCacheBackend
 from jq_tushare_sdk.config import BacktestConfig
 from jq_tushare_sdk.data.readiness import DataReadinessCheck
+from jq_tushare_sdk.data.readiness import update_missing_data
 from jq_tushare_sdk.reports.refresher import refresh_backtest_report
 from jq_tushare_sdk.runtime.engine import BacktestEngine
 from jq_tushare_sdk.web.app import serve_web_console
@@ -126,13 +127,14 @@ def main(argv=None):
         cache_mode="strict_local",
     )
 
-    issues = _check_local_readiness(config, backend)
     if args.command == "check-data":
+        issues = _check_local_readiness(config, backend)
         if issues:
             return 1
         print("Data readiness check passed")
         return 0
 
+    issues = _ensure_local_readiness(config, backend)
     if issues:
         return 1
     manifest = BacktestEngine(config, backend=backend).run()
@@ -153,15 +155,49 @@ def _add_cache_args(parser):
 
 
 def _check_local_readiness(config, backend):
-    issues = DataReadinessCheck(backend).check_required(config, _REQUIRED_LOCAL_APIS)
+    issues = _local_readiness_issues(config, backend)
     if not issues:
         return []
+    _print_readiness_issues(config, issues)
+    return issues
+
+
+def _ensure_local_readiness(config, backend):
+    issues = _local_readiness_issues(config, backend)
+    if not issues:
+        return []
+
+    print("Local cache is incomplete; attempting automatic Tushare data update...")
+    try:
+        counts = update_missing_data(backend, issues)
+    except Exception as exc:
+        print(f"Automatic data update failed: {exc}")
+        _print_readiness_issues(config, issues)
+        return issues
+
+    if counts:
+        print("Automatic data update completed:")
+        for label, count in counts.items():
+            print(f"  {label}: {count} rows")
+    else:
+        print("No automatic data update request could be inferred from readiness issues.")
+
+    issues = _local_readiness_issues(config, backend)
+    if issues:
+        _print_readiness_issues(config, issues)
+    return issues
+
+
+def _local_readiness_issues(config, backend):
+    return DataReadinessCheck(backend).check_required(config, _REQUIRED_LOCAL_APIS)
+
+
+def _print_readiness_issues(config, issues):
     for issue in issues:
         print(f"{issue.api_name}: {issue.message}")
         print(f"  {issue.suggestion}")
     print(f"  Local cache DB: {config.cache_db}")
     print("  Populate the missing local cache data before rerunning.")
-    return issues
 
 
 def _maybe_reexec_for_deterministic_backtest(args, argv=None) -> None:

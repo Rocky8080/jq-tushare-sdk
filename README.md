@@ -8,7 +8,7 @@ JQ Tushare SDK 是一个本地回测运行时，用 Tushare 数据和本地缓�
 
 - 兼容常用聚宽风格 API，例如 `get_price`、`get_fundamentals`、`get_index_stocks`、`order_target_value`、`run_daily`。
 - 使用 Tushare 作为数据源，并缓存到项目内 SQLite 数据库。
-- 支持本地数据就绪检查，缺数据时提前失败并给出补数建议。
+- 支持本地数据就绪检查；运行回测时会在本地缓存缺口明确且已配置 token 的情况下自动补齐数据。
 - 支持订单、成交、持仓、手续费、每日收益和日志输出。
 - 每次回测写入独立目录，便于保留和对比多次结果。
 - 生成接近聚宽回测风格的 HTML 报告。
@@ -74,7 +74,7 @@ python -m jq_tushare_sdk.cli update-data \
 
 ## Check Data
 
-运行回测前建议先检查本地缓存是否齐备：
+如需单独诊断，可在运行回测前检查本地缓存是否齐备：
 
 ```bash
 python -m jq_tushare_sdk.cli check-data \
@@ -90,7 +90,7 @@ python -m jq_tushare_sdk.cli check-data \
 Data readiness check passed
 ```
 
-如果缺数据，命令会输出缺失的数据表和建议执行的补数命令。
+如果缺数据，命令会输出缺失的数据表和建议执行的补数命令。`check-data` 只做诊断，不会写入缓存；`backtest` 和 Web 控制台运行回测时会先尝试自动补齐这些缺口。
 
 ## Run Backtest
 
@@ -103,6 +103,8 @@ python -m jq_tushare_sdk.cli backtest \
   --cache-db data/jq_tushare_cache.db \
   --output-dir backtest_runs
 ```
+
+运行回测前会先检查本地缓存；如发现可定位的缺口，会使用 `TUSHARE_TOKEN` 自动补齐并复查，复查仍失败时才停止回测并输出原因。检查会识别策略中静态可推断的 `get_price(count=...)` 历史窗口，并为 ETF/基金价格和基准指数补齐回测开始日前的必要 lookback。
 
 默认会启用数据层优化，不改变策略回调顺序。需要做性能对照时可以关闭：
 
@@ -231,7 +233,7 @@ http://127.0.0.1:8787/report.html
 
 ## Versioning
 
-当前版本：`v0.9.0`
+当前版本：`v0.10.0`
 
 版本号遵循 Semantic Versioning：
 
