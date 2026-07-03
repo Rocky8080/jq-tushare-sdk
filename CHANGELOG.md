@@ -4,6 +4,13 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.3] - 2026-07-04
+
+### Changed
+
+- Accept zero `close_today_commission`, support `FixedSlippage`, and expose `get_security_info`.
+- Backfill historical `stock_basic` list statuses so delisted securities keep metadata in historical backtests.
+
 ## [0.10.2] - 2026-07-04
 
 ### Changed

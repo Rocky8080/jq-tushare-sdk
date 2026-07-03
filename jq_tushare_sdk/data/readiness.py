@@ -36,6 +36,7 @@ _UPDATE_PRIORITY = {
     "income": 8,
 }
 _MARKET_DAILY_APIS = {"daily", "daily_basic", "adj_factor", "index_daily"}
+_REQUIRED_STOCK_BASIC_LIST_STATUSES = {"L", "D"}
 
 
 def update_missing_data(backend, issues: list[ReadinessIssue]) -> dict[str, int]:
@@ -114,6 +115,11 @@ class DataReadinessCheck:
                     )
                 )
                 continue
+            if api_name == "stock_basic":
+                issue = self._check_stock_basic_statuses()
+                if issue is not None:
+                    issues.append(issue)
+                continue
             min_date = status.get("min_date")
             max_date = status.get("max_date")
             if min_date and check_start < str(min_date):
@@ -135,6 +141,30 @@ class DataReadinessCheck:
                     )
                 )
         return issues
+
+    def _check_stock_basic_statuses(self) -> ReadinessIssue | None:
+        try:
+            frame = self.backend.fetch("stock_basic")
+        except Exception:
+            return None
+        if frame is None or frame.empty or "list_status" not in frame.columns:
+            missing = sorted(_REQUIRED_STOCK_BASIC_LIST_STATUSES)
+        else:
+            present = {
+                str(value).strip()
+                for value in frame["list_status"].tolist()
+                if str(value).strip()
+            }
+            missing = sorted(_REQUIRED_STOCK_BASIC_LIST_STATUSES - present)
+        if not missing:
+            return None
+        names = ", ".join(missing)
+        return ReadinessIssue(
+            api_name="stock_basic",
+            message=f"stock_basic is missing list_status {names} for historical backtests.",
+            suggestion="python update_data.py --api stock_basic",
+            update_requests=(_update_request("stock_basic"),),
+        )
 
     def _check_benchmark_index(self, config, start: str, end: str) -> ReadinessIssue | None:
         benchmark = infer_strategy_benchmark(getattr(config, "strategy_path", None)) or getattr(config, "benchmark", None)

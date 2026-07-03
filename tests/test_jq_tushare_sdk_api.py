@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime
+from datetime import date, datetime
 from types import SimpleNamespace
 
 import pandas as pd
@@ -17,7 +17,9 @@ from jq_tushare_sdk.api.jqdata import (
     get_index_stocks,
     get_industry,
     get_price,
+    get_security_info,
     get_trade_days,
+    runtime_state,
 )
 from jq_tushare_sdk.api.query import query
 from jq_tushare_sdk.data.portal import DataPortal
@@ -121,8 +123,8 @@ class APIPortalBackend:
             ),
             "stock_basic": pd.DataFrame(
                 [
-                    {"ts_code": "000001.SZ", "name": "平安银行", "industry": "银行"},
-                    {"ts_code": "600000.SH", "name": "浦发银行", "industry": "银行"},
+                    {"ts_code": "000001.SZ", "name": "平安银行", "industry": "银行", "list_date": "19910403"},
+                    {"ts_code": "600000.SH", "name": "浦发银行", "industry": "银行", "list_date": "19991110"},
                 ]
             ),
         }
@@ -157,6 +159,7 @@ class TestJoinQuantAPI(unittest.TestCase):
             "get_price",
             "get_fundamentals",
             "get_fundamentals_continuously",
+            "get_security_info",
             "query",
             "valuation",
             "income",
@@ -172,6 +175,15 @@ class TestJoinQuantAPI(unittest.TestCase):
     def test_get_trade_days_and_index_stocks_delegate_to_portal(self):
         self.assertEqual(get_trade_days(start_date="2024-01-01", end_date="2024-01-03"), ["2024-01-02"])
         self.assertEqual(get_index_stocks("399006.XSHE", date="2024-01-02"), ["000001.XSHE", "600000.XSHG"])
+
+    def test_get_security_info_delegates_to_portal(self):
+        set_runtime_state(RuntimeState(data_portal=DataPortal(APIPortalBackend())))
+
+        info = get_security_info("000001.XSHE")
+
+        self.assertEqual(info.code, "000001.XSHE")
+        self.assertEqual(info.display_name, "平安银行")
+        self.assertEqual(info.start_date, date(1991, 4, 3))
 
     def test_get_index_stocks_defaults_date_to_visible_data_date_at_open(self):
         class RecordingPortal(FakePortal):
@@ -432,6 +444,32 @@ class TestJoinQuantAPI(unittest.TestCase):
         self.assertAlmostEqual(order.commission, 8.0)
         self.assertAlmostEqual(order.stamp_tax, 2.12)
 
+    def test_set_order_cost_accepts_zero_close_today_commission(self):
+        exports = exported_globals()
+        set_runtime_state(
+            RuntimeState(
+                data_portal=SimpleNamespace(),
+                broker=SimpleNamespace(cost_model=CostModel()),
+            )
+        )
+
+        exports["set_order_cost"](
+            exports["OrderCost"](
+                open_tax=0.0,
+                close_tax=0.001,
+                open_commission=0.0004,
+                close_commission=0.0005,
+                close_today_commission=0,
+                min_commission=6.0,
+            ),
+            type="stock",
+        )
+
+        broker_cost = runtime_state().broker.cost_model
+        self.assertAlmostEqual(broker_cost.open_commission, 0.0004)
+        self.assertAlmostEqual(broker_cost.close_commission, 0.0005)
+        self.assertAlmostEqual(broker_cost.min_commission, 6.0)
+
     def test_set_order_cost_rejects_unsupported_variants(self):
         exports = exported_globals()
         set_runtime_state(
@@ -463,7 +501,29 @@ class TestJoinQuantAPI(unittest.TestCase):
 
         self.assertAlmostEqual(order.price, 10.812)
 
+    def test_set_slippage_supports_fixed_style(self):
+        exports = exported_globals()
+        context = Context(Portfolio(100000.0), current_dt=datetime(2024, 1, 3, 9, 30))
+        broker = Broker(context, DataPortal(APIPortalBackend()), CostModel())
+        set_runtime_state(
+            RuntimeState(
+                data_portal=broker.data_portal,
+                broker=broker,
+                context=context,
+            )
+        )
+
+        exports["set_slippage"](exports["FixedSlippage"](0.01))
+        buy_order = broker.order("000001.XSHE", 100)
+        sell_order = broker.order("000001.XSHE", -100)
+
+        self.assertAlmostEqual(buy_order.price, 10.61)
+        self.assertAlmostEqual(sell_order.price, 10.59)
+
     def test_set_slippage_rejects_unsupported_styles(self):
+        class UnsupportedSlippage:
+            pass
+
         exports = exported_globals()
         set_runtime_state(
             RuntimeState(
@@ -473,7 +533,7 @@ class TestJoinQuantAPI(unittest.TestCase):
         )
 
         with self.assertRaises(NotImplementedError):
-            exports["set_slippage"](exports["FixedSlippage"](0.02))
+            exports["set_slippage"](UnsupportedSlippage())
 
     def test_get_fundamentals_continuously_returns_turnover_history_by_security(self):
         set_runtime_state(RuntimeState(data_portal=DataPortal(APIPortalBackend())))

@@ -1,4 +1,5 @@
 import unittest
+from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
@@ -109,8 +110,8 @@ class FakeBackend:
             ),
             "stock_basic": pd.DataFrame(
                 [
-                    {"ts_code": "000001.SZ", "name": "平安银行", "industry": "银行"},
-                    {"ts_code": "600000.SH", "name": "浦发银行", "industry": "银行"},
+                    {"ts_code": "000001.SZ", "name": "平安银行", "industry": "银行", "list_date": "19910403"},
+                    {"ts_code": "600000.SH", "name": "浦发银行", "industry": "银行", "list_date": "19991110"},
                 ]
             ),
             "daily_basic": pd.DataFrame(
@@ -486,6 +487,16 @@ class TestDataLayer(unittest.TestCase):
         self.assertEqual(current["000001.XSHE"].name, "平安银行")
         self.assertEqual(current["000001.XSHE"].last_price, 10.2)
         self.assertEqual(current["600000.XSHG"].day_open, 20.5)
+
+    def test_get_security_info_returns_joinquant_style_metadata(self):
+        portal = DataPortal(FakeBackend())
+
+        info = portal.get_security_info("000001.XSHE")
+
+        self.assertEqual(info.code, "000001.XSHE")
+        self.assertEqual(info.display_name, "平安银行")
+        self.assertEqual(info.name, "平安银行")
+        self.assertEqual(info.start_date, date(1991, 4, 3))
 
     def test_get_current_data_with_security_list_returns_requested_objects(self):
         portal = DataPortal(FakeBackend())
@@ -958,6 +969,42 @@ class TestDataLayer(unittest.TestCase):
         self.assertEqual(issues[1].update_requests[0].start_date, "20240101")
         self.assertEqual(issues[1].update_requests[0].end_date, "20240131")
 
+    def test_readiness_reports_stock_basic_missing_historical_statuses(self):
+        class ListedOnlyBackend(FakeBackend):
+            def fetch(self, api_name, **params):
+                if api_name == "stock_basic":
+                    return pd.DataFrame(
+                        [
+                            {
+                                "ts_code": "000001.SZ",
+                                "name": "平安银行",
+                                "list_status": "L",
+                                "list_date": "19910403",
+                            }
+                        ]
+                    )
+                return super().fetch(api_name, **params)
+
+            def status(self, api_name):
+                if api_name == "stock_basic":
+                    return {"exists": True, "record_count": 1}
+                return super().status(api_name)
+
+        config = BacktestConfig(
+            strategy_path="strategy.py",
+            start_date="2025-01-02",
+            end_date="2025-12-02",
+            initial_cash=1000000.0,
+            cache_db="/tmp/cache.db",
+        )
+
+        issues = DataReadinessCheck(ListedOnlyBackend()).check_required(config, ["stock_basic"])
+
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].api_name, "stock_basic")
+        self.assertIn("list_status D", issues[0].message)
+        self.assertEqual(issues[0].update_requests[0].api_name, "stock_basic")
+
     def test_readiness_reports_missing_strategy_benchmark_index_daily(self):
         with TemporaryDirectory() as tmp:
             strategy_path = Path(tmp) / "benchmark_strategy.py"
@@ -1261,6 +1308,38 @@ def get_volatility(context):
             frame = backend.fetch("stock_basic")
 
         self.assertEqual(frame["ts_code"].tolist(), ["000001.SZ", "600000.SH"])
+
+    def test_cache_backend_update_data_fetches_all_stock_basic_statuses(self):
+        pro = Mock()
+
+        def stock_basic(**kwargs):
+            status = kwargs.get("list_status")
+            code_by_status = {"L": "000001.SZ", "D": "300344.SZ", "P": "001001.SZ"}
+            return pd.DataFrame(
+                [
+                    {
+                        "ts_code": code_by_status[status],
+                        "name": f"{status}示例",
+                        "list_date": "20240101",
+                    }
+                ]
+            )
+
+        pro.stock_basic.side_effect = stock_basic
+
+        with TemporaryDirectory() as tmp, patch("tushare.pro_api", return_value=pro):
+            backend = TushareCacheBackend(
+                str(Path(tmp) / "data" / "jq_tushare_cache.db"),
+                token="placeholder",
+                cache_mode="strict_local",
+            )
+            count = backend.update_data("stock_basic")
+            frame = backend.fetch("stock_basic")
+
+        requested_statuses = [call.kwargs.get("list_status") for call in pro.stock_basic.mock_calls]
+        self.assertEqual(requested_statuses, ["L", "D", "P"])
+        self.assertEqual(count, 3)
+        self.assertEqual(set(frame["list_status"].tolist()), {"L", "D", "P"})
 
     def test_cache_backend_update_data_uses_tushare_client_and_upserts(self):
         pro = Mock()

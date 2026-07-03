@@ -45,6 +45,9 @@ def exported_globals() -> dict:
             raise NotImplementedError(f"Unsupported order cost type: {type}")
 
         payload = dict(getattr(order_cost, "__dict__", {}))
+        close_today_commission = float(payload.pop("close_today_commission", 0.0) or 0.0)
+        if close_today_commission != 0.0:
+            raise NotImplementedError("Non-zero close_today_commission is unsupported")
         allowed = {
             "open_tax",
             "close_tax",
@@ -67,6 +70,7 @@ def exported_globals() -> dict:
             close_tax=float(payload.get("close_tax", current.close_tax)),
             min_commission=float(payload.get("min_commission", current.min_commission)),
             slippage_rate=float(current.slippage_rate),
+            slippage_fixed=float(current.slippage_fixed),
         )
 
     def set_slippage(slippage, type="stock", **kwargs):
@@ -75,11 +79,15 @@ def exported_globals() -> dict:
             raise NotImplementedError(f"Unsupported set_slippage kwargs: {names}")
         if type != "stock":
             raise NotImplementedError(f"Unsupported slippage type: {type}")
-        if isinstance(slippage, FixedSlippage):
-            raise NotImplementedError("FixedSlippage is unsupported")
-        if not isinstance(slippage, PriceRelatedSlippage):
+        if isinstance(slippage, PriceRelatedSlippage):
+            slippage_rate = float(slippage.rate)
+            slippage_fixed = 0.0
+        elif isinstance(slippage, FixedSlippage):
+            slippage_rate = 0.0
+            slippage_fixed = float(slippage.value)
+        else:
             raise NotImplementedError(
-                f"Unsupported slippage style: {type(slippage).__name__}"
+                f"Unsupported slippage style: {slippage.__class__.__name__}"
             )
 
         broker = jqdata.runtime_state().broker
@@ -89,7 +97,8 @@ def exported_globals() -> dict:
             close_commission=float(current.close_commission),
             close_tax=float(current.close_tax),
             min_commission=float(current.min_commission),
-            slippage_rate=float(slippage.rate),
+            slippage_rate=slippage_rate,
+            slippage_fixed=slippage_fixed,
         )
 
     class OrderCost:
@@ -119,6 +128,7 @@ def exported_globals() -> dict:
         "get_trade_days": jqdata.get_trade_days,
         "get_index_stocks": jqdata.get_index_stocks,
         "get_all_securities": jqdata.get_all_securities,
+        "get_security_info": jqdata.get_security_info,
         "get_current_data": jqdata.get_current_data,
         "get_industry": jqdata.get_industry,
         "get_fundamentals": jqdata.get_fundamentals,
@@ -149,7 +159,6 @@ def exported_globals() -> dict:
     }
 
     for name in (
-        "get_security_info",
         "get_factor_values",
         "get_bars",
         "get_ticks",

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from types import SimpleNamespace
 from typing import Iterable
 
@@ -127,6 +127,24 @@ class DataPortal:
         if "ts_code" in result.columns:
             result.index = [to_joinquant_code(code) for code in result["ts_code"].tolist()]
         return result
+
+    def get_security_info(self, security):
+        code = to_joinquant_code(security)
+        metadata_by_code = self._security_metadata_map()
+        if code not in metadata_by_code:
+            raise NotImplementedError(
+                f"stock_basic backend data does not include requested security: {code}"
+            )
+        metadata = metadata_by_code[code]
+        name = str(metadata.get("name") or code)
+        return SimpleNamespace(
+            code=code,
+            display_name=name,
+            name=name,
+            start_date=self._security_start_date(metadata, code),
+            end_date=date(2200, 1, 1),
+            type="stock",
+        )
 
     def get_current_data(self, securities=None, date=None):
         metadata_by_code = self._security_metadata_map()
@@ -749,6 +767,23 @@ class DataPortal:
             for _, row in df.iterrows()
         }
         return self._security_metadata_cache
+
+    def _security_start_date(self, metadata: dict, code: str) -> date:
+        raw_value = metadata.get("list_date")
+        if raw_value is None or pd.isna(raw_value) or str(raw_value).strip() == "":
+            raise NotImplementedError(
+                f"stock_basic backend data does not include list_date for requested security: {code}"
+            )
+        text = str(raw_value).strip()
+        if text.endswith(".0") and text[:-2].isdigit():
+            text = text[:-2]
+        text = normalize_date(text)
+        try:
+            return datetime.strptime(text, "%Y%m%d").date()
+        except ValueError as exc:
+            raise NotImplementedError(
+                f"stock_basic backend data has invalid list_date for requested security: {code}"
+            ) from exc
 
     def _is_st_name(self, name: str) -> bool:
         normalized = str(name or "").upper().replace("＊", "*")

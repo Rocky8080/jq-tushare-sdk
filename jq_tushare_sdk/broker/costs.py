@@ -8,6 +8,7 @@ class CostModel:
     close_tax: float = 0.001
     min_commission: float = 5.0
     slippage_rate: float = 0.0
+    slippage_fixed: float = 0.0
 
     def commission(self, value: float, side: str) -> float:
         if side not in {"buy", "sell"}:

@@ -222,9 +222,10 @@ http://127.0.0.1:8787/report.html
 - 策略生命周期：`initialize`、`run_daily`、`run_weekly`、`run_monthly`
 - 行情数据：`get_price`、`attribute_history`、`history`
 - 基本面数据：`get_fundamentals`、`get_fundamentals_continuously`
-- 标的查询：`get_index_stocks`、`get_all_securities`、`get_current_data`、`get_industry`
+- 标的查询：`get_index_stocks`、`get_all_securities`、`get_security_info`、`get_current_data`、`get_industry`
 - 查询对象：`query`、`valuation`、`income`
 - 交易接口：`order`、`order_value`、`order_target`、`order_target_value`
+- 交易成本与滑点：支持 `OrderCost(..., close_today_commission=0)`、`PriceRelatedSlippage` 和 `FixedSlippage`
 - 输出结果：日志、订单、成交、每日收益、HTML 报告
 
 主要限制：
@@ -232,12 +233,12 @@ http://127.0.0.1:8787/report.html
 - 不覆盖聚宽全部 API。
 - 不默认支持完整分钟级撮合。
 - 不连接实盘交易系统。
-- 数据口径依赖本地 Tushare 缓存，可能与平台回测结果存在差异。
+- 数据口径依赖本地 Tushare 缓存，可能与平台回测结果存在差异；历史回测会补齐 `stock_basic` 的上市与退市状态，避免只用当前上市列表造成元数据缺口。
 - 前复权行情依赖本地 `adj_factor` 缓存，缺失时会回退到原始行情。
 
 ## Versioning
 
-当前版本：`v0.10.2`
+当前版本：`v0.10.3`
 
 版本号遵循 Semantic Versioning：
 

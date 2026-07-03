@@ -185,6 +185,7 @@ _DEFAULT_INDEX_CODES = (
     "000852.SH",
     "000985.SH",
 )
+_STOCK_BASIC_LIST_STATUSES = ("L", "D", "P")
 _QUARTER_ENDS = {"q1": "0331", "q2": "0630", "q3": "0930", "q4": "1231"}
 _INCOME_UPDATE_FIELDS = ",".join(_API_SPECS["income"].columns)
 
@@ -282,6 +283,12 @@ class TushareCacheBackend:
         if self.cache_mode == "strict_local" and not self.token:
             raise ValueError("update_data requires TUSHARE_TOKEN or token even when backtest reads are strict_local")
 
+        if api_name == "stock_basic" and "list_status" not in params:
+            return sum(
+                self.update_data(api_name, list_status=status)
+                for status in _STOCK_BASIC_LIST_STATUSES
+            )
+
         if api_name in {"daily", "daily_basic", "adj_factor"} and "trade_date" not in params:
             total = 0
             for trade_date in self._trade_dates_for_update(start_date, end_date):
@@ -313,6 +320,14 @@ class TushareCacheBackend:
         method = getattr(self._pro_api(), api_name)
         self._wait_for_rate_limit()
         data = method(**api_params)
+        if (
+            data is not None
+            and api_name == "stock_basic"
+            and "list_status" in api_params
+            and "list_status" not in data.columns
+        ):
+            data = data.copy()
+            data["list_status"] = api_params["list_status"]
         return self.cache_data(api_name, data)
 
     def _update_income_period(self, period: str) -> int:

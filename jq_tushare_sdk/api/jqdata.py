@@ -134,6 +134,13 @@ def get_all_securities(types=None, date=None):
     )
 
 
+def get_security_info(security):
+    portal = runtime_state().data_portal
+    if hasattr(portal, "get_security_info"):
+        return portal.get_security_info(security)
+    raise NotImplementedError("JoinQuant API is not implemented locally: get_security_info")
+
+
 def get_current_data(securities=None):
     return runtime_state().data_portal.get_current_data(
         securities,

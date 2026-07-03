@@ -182,8 +182,14 @@ class Broker:
         if raw_price <= 0:
             raise NotImplementedError(f"Non-positive local {price_field} price for {security}")
         if amount > 0:
-            return round(raw_price * (1 + self.cost_model.slippage_rate), 4)
-        return round(raw_price * (1 - self.cost_model.slippage_rate), 4)
+            return round(
+                raw_price * (1 + self.cost_model.slippage_rate) + self.cost_model.slippage_fixed,
+                4,
+            )
+        return round(
+            raw_price * (1 - self.cost_model.slippage_rate) - self.cost_model.slippage_fixed,
+            4,
+        )
 
     def _current_state(self, security: str):
         current = self._portal_call(
