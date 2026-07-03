@@ -4,6 +4,12 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.8.2] - 2026-07-04
+
+### Changed
+
+- Widen Web console date inputs to avoid clipped date text.
+
 ## [0.8.1] - 2026-07-03
 
 ### Changed

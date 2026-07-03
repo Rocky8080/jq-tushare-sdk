@@ -1150,8 +1150,8 @@ def _render_app_html(project_root: Path, cache_db: Path, output_dir: Path) -> st
         <input id="strategy-path" type="hidden">
         <button type="button" id="choose-strategy" class="secondary">选择策略文件</button>
         <div class="selected-file" id="selected-strategy">未选择策略文件</div>
-        <label><span>开始</span><input id="start-date" name="start_date" type="date" required></label>
-        <label><span>结束</span><input id="end-date" name="end_date" type="date" required></label>
+        <label class="date-field"><span>开始</span><input id="start-date" name="start_date" type="date" required></label>
+        <label class="date-field"><span>结束</span><input id="end-date" name="end_date" type="date" required></label>
         <label><span>资金</span><input id="initial-cash" name="initial_cash" type="number" min="1" step="1" value="1000000" required></label>
         <button type="submit" class="primary">运行回测</button>
         <button type="button" id="settings-toggle" class="secondary" aria-expanded="false" aria-controls="settings-panel">设置</button>
@@ -1295,7 +1295,7 @@ h2 { font-size: 18px; }
 .parameter-bar { padding: 9px 10px; }
 .parameter-form.compact {
   display: grid;
-  grid-template-columns: auto minmax(140px, 1fr) 146px 146px 132px auto auto;
+  grid-template-columns: auto minmax(120px, 1fr) 174px 174px 132px auto auto;
   gap: 8px;
   align-items: center;
 }
@@ -1333,6 +1333,9 @@ input {
 .parameter-form.compact label span {
   color: var(--muted);
   font-size: 12px;
+}
+.parameter-form.compact .date-field input {
+  min-width: 142px;
 }
 .switch-row {
   grid-template-columns: 18px auto;
@@ -1474,7 +1477,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .negative { color: var(--green); font-weight: 800; }
 @media (max-width: 1180px) {
   .parameter-form.compact {
-    grid-template-columns: auto minmax(150px, 1fr) 150px 150px 136px;
+    grid-template-columns: auto minmax(120px, 1fr) 174px 174px 136px;
   }
   .parameter-form.compact button { padding: 0 10px; }
   .settings-panel { grid-template-columns: 1fr 1fr; }
