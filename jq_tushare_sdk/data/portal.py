@@ -5,6 +5,7 @@ from typing import Iterable
 import pandas as pd
 
 from jq_tushare_sdk.data.code_map import (
+    is_tushare_fund_code,
     joinquant_date,
     normalize_date,
     to_joinquant_code,
@@ -136,9 +137,14 @@ class DataPortal:
             codes = list(codes)
         for code in codes:
             if code not in metadata_by_code:
-                raise NotImplementedError(
-                    f"stock_basic backend data does not include requested security: {code}"
-                )
+                if not is_tushare_fund_code(code):
+                    raise NotImplementedError(
+                        f"stock_basic backend data does not include requested security: {code}"
+                    )
+                metadata_by_code[code] = {
+                    "ts_code": to_tushare_code(code),
+                    "name": code,
+                }
 
         price_by_code = {}
         if self.optimize_data and codes:
@@ -334,6 +340,8 @@ class DataPortal:
         code = to_tushare_code(security)
         if self._is_index_code(code):
             return "index_daily"
+        if is_tushare_fund_code(code):
+            return "fund_daily"
         return "daily"
 
     def _is_index_code(self, code: str) -> bool:

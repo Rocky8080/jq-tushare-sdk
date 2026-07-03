@@ -365,6 +365,8 @@ class BacktestEngine:
         return [(label, time_text) for _, _, label, time_text in timeline_items]
 
     def _parse_schedule_label(self, label: str) -> time:
+        if str(label).strip() == "close":
+            return time(15, 0)
         canonical_time = dict(self._TIMELINE).get(label)
         if canonical_time is not None:
             return datetime.strptime(canonical_time, "%H:%M:%S").time()

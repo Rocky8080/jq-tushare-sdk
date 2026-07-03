@@ -16,6 +16,10 @@ class Position:
     price: float = 0.0
 
     @property
+    def security(self) -> str:
+        return self.code
+
+    @property
     def value(self) -> float:
         return float(self.total_amount) * float(self.price)
 

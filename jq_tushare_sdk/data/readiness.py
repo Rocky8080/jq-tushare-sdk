@@ -2,6 +2,7 @@ import ast
 from dataclasses import dataclass
 from pathlib import Path
 
+from jq_tushare_sdk.data.code_map import is_tushare_fund_code
 from jq_tushare_sdk.data.code_map import normalize_date
 from jq_tushare_sdk.data.code_map import to_tushare_code
 
@@ -21,6 +22,9 @@ class DataReadinessCheck:
         start = normalize_date(config.start_date)
         end = normalize_date(config.end_date)
         issues = []
+        fund_issue = self._check_strategy_funds(config, start, end)
+        if fund_issue is not None:
+            issues.append(fund_issue)
         for api_name in apis:
             if api_name == "index_daily":
                 issue = self._check_benchmark_index(config, start, end)
@@ -151,6 +155,41 @@ class DataReadinessCheck:
             )
         return None
 
+    def _check_strategy_funds(self, config, start: str, end: str) -> ReadinessIssue | None:
+        symbols = infer_strategy_fund_symbols(getattr(config, "strategy_path", None))
+        if not symbols:
+            return None
+        missing = []
+        for symbol in symbols:
+            ts_code = to_tushare_code(symbol)
+            try:
+                frame = self.backend.fetch(
+                    "fund_daily",
+                    ts_code=ts_code,
+                    start_date=start,
+                    end_date=end,
+                )
+            except Exception:
+                frame = None
+            if frame is None or frame.empty:
+                missing.append(f"{symbol}({ts_code})")
+        if not missing:
+            return None
+        commands = [
+            "python -m jq_tushare_sdk.cli update-data --api fund_daily "
+            f"--start {start} --end {end} --cache-db <cache_db> --ts-code {to_tushare_code(symbol)}"
+            for symbol in symbols
+            if f"{symbol}({to_tushare_code(symbol)})" in missing
+        ]
+        return ReadinessIssue(
+            api_name="fund_daily",
+            message=(
+                "Local cache has no fund_daily data between "
+                f"{config.start_date} and {config.end_date} for ETF/fund {', '.join(missing)}."
+            ),
+            suggestion=" && ".join(commands),
+        )
+
     def _income_periods_for_range(self, end_date: str) -> list[str]:
         end = normalize_date(end_date)
         year = int(end[:4])
@@ -222,6 +261,28 @@ def infer_strategy_index_symbols(strategy_path) -> list[str]:
         if isinstance(value, str) and value not in seen:
             symbols.append(value)
             seen.add(value)
+    return symbols
+
+
+def infer_strategy_fund_symbols(strategy_path) -> list[str]:
+    if not strategy_path:
+        return []
+    path = Path(strategy_path)
+    if not path.is_file():
+        return []
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
+    except SyntaxError:
+        return []
+
+    symbols = []
+    seen = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            value = node.value
+            if is_tushare_fund_code(value) and value not in seen:
+                symbols.append(value)
+                seen.add(value)
     return symbols
 
 

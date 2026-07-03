@@ -226,14 +226,16 @@ class TestWebConsole(unittest.TestCase):
         self.assertIn('id="start-date"', top_form)
         self.assertIn('id="end-date"', top_form)
         self.assertIn('id="initial-cash"', top_form)
-        self.assertIn('id="check-data"', top_form)
-        self.assertIn('id="refresh-report"', top_form)
+        self.assertNotIn('id="check-data"', top_form)
+        self.assertNotIn('id="refresh-report"', top_form)
         self.assertNotIn('id="cache-db"', top_form)
         self.assertNotIn('id="output-dir"', top_form)
         self.assertNotIn('id="optimize-data"', top_form)
         self.assertGreater(html.index('id="cache-db"'), settings_index)
         self.assertGreater(html.index('id="output-dir"'), settings_index)
         self.assertGreater(html.index('id="optimize-data"'), settings_index)
+        self.assertGreater(html.index('id="check-data"'), settings_index)
+        self.assertGreater(html.index('id="refresh-report"'), settings_index)
 
     def test_main_console_accepts_one_million_initial_cash(self):
         html = web_app._render_app_html(

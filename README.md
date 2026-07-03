@@ -64,6 +64,7 @@ python -m jq_tushare_sdk.cli update-data \
 
 - `trade_cal`
 - `daily`
+- `fund_daily`
 - `daily_basic`
 - `adj_factor`
 - `stock_basic`
@@ -230,7 +231,7 @@ http://127.0.0.1:8787/report.html
 
 ## Versioning
 
-当前版本：`v0.8.2`
+当前版本：`v0.9.0`
 
 版本号遵循 Semantic Versioning：
 

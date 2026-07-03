@@ -4,6 +4,12 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.9.0] - 2026-07-04
+
+### Changed
+
+- Add fund_daily cache support for ETF price reads and common strategy compatibility aliases.
+
 ## [0.8.2] - 2026-07-04
 
 ### Changed

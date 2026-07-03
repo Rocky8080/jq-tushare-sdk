@@ -29,7 +29,7 @@ def get_price(
     fields=None,
     skip_paused=False,
     fq="pre",
-    panel=True,
+    panel=False,
     fill_paused=True,
 ):
     _validate_price_compat_kwargs(

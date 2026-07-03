@@ -1,3 +1,7 @@
+_SH_FUND_PREFIXES = ("510", "511", "512", "513", "515", "516", "517", "518", "560", "561", "562", "563", "588", "589")
+_SZ_FUND_PREFIXES = ("159", "160", "161", "162", "163", "164", "165", "166", "167", "168", "169")
+
+
 def to_tushare_code(code: str) -> str:
     raw = str(code).strip()
     if raw.endswith(".XSHE"):
@@ -26,6 +30,18 @@ def to_joinquant_code(code: str) -> str:
     if raw.startswith("6"):
         return f"{raw}.XSHG"
     return raw
+
+
+def is_tushare_fund_code(code: str) -> bool:
+    raw = to_tushare_code(code)
+    if "." not in raw:
+        return False
+    symbol, exchange = raw.split(".", 1)
+    if exchange == "SH":
+        return symbol.startswith(_SH_FUND_PREFIXES)
+    if exchange == "SZ":
+        return symbol.startswith(_SZ_FUND_PREFIXES)
+    return False
 
 
 def normalize_date(value) -> str:
