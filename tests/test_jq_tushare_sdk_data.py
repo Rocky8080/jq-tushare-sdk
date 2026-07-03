@@ -766,6 +766,102 @@ class TestDataLayer(unittest.TestCase):
         self.assertEqual(df["total_operating_revenue"].tolist(), [160.0])
         self.assertEqual(df["np_parent_company_owners"].tolist(), [25.0])
 
+    def test_get_fundamentals_falls_back_to_latest_announced_income_period(self):
+        from jq_tushare_sdk.api.finance_tables import income
+        from jq_tushare_sdk.api.query import query
+
+        backend = FakeBackend()
+        backend.frames["income"] = pd.DataFrame(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "end_date": "20250630",
+                    "ann_date": "20250820",
+                    "f_ann_date": "20250820",
+                    "report_type": "1",
+                    "total_revenue": 200.0,
+                    "n_income_attr_p": 20.0,
+                },
+                {
+                    "ts_code": "000001.SZ",
+                    "end_date": "20250930",
+                    "ann_date": "20251025",
+                    "f_ann_date": "20251025",
+                    "report_type": "1",
+                    "total_revenue": 350.0,
+                    "n_income_attr_p": 45.0,
+                },
+                {
+                    "ts_code": "000002.SZ",
+                    "end_date": "20250930",
+                    "ann_date": "20251025",
+                    "f_ann_date": "20260107",
+                    "report_type": "1",
+                    "total_revenue": 100.0,
+                    "n_income_attr_p": 10.0,
+                },
+                {
+                    "ts_code": "000001.SZ",
+                    "end_date": "20251231",
+                    "ann_date": "20260117",
+                    "f_ann_date": "20260117",
+                    "report_type": "1",
+                    "total_revenue": 520.0,
+                    "n_income_attr_p": 70.0,
+                },
+            ]
+        )
+        portal = DataPortal(backend)
+
+        df = portal.get_fundamentals(
+            query(income.code, income.total_operating_revenue, income.np_parent_company_owners),
+            date="2026-01-05",
+            statDate="2025q4",
+        )
+
+        self.assertEqual(df["code"].tolist(), ["000001.XSHE"])
+        self.assertEqual(df["total_operating_revenue"].tolist(), [150.0])
+        self.assertEqual(df["np_parent_company_owners"].tolist(), [25.0])
+
+    def test_get_fundamentals_uses_requested_income_period_after_announcement(self):
+        from jq_tushare_sdk.api.finance_tables import income
+        from jq_tushare_sdk.api.query import query
+
+        backend = FakeBackend()
+        backend.frames["income"] = pd.DataFrame(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "end_date": "20250930",
+                    "ann_date": "20251025",
+                    "f_ann_date": "20251025",
+                    "report_type": "1",
+                    "total_revenue": 350.0,
+                    "n_income_attr_p": 45.0,
+                },
+                {
+                    "ts_code": "000001.SZ",
+                    "end_date": "20251231",
+                    "ann_date": "20260117",
+                    "f_ann_date": "20260117",
+                    "report_type": "1",
+                    "total_revenue": 520.0,
+                    "n_income_attr_p": 70.0,
+                },
+            ]
+        )
+        portal = DataPortal(backend)
+
+        df = portal.get_fundamentals(
+            query(income.code, income.total_operating_revenue, income.np_parent_company_owners),
+            date="2026-01-20",
+            statDate="2025q4",
+        )
+
+        self.assertEqual(df["code"].tolist(), ["000001.XSHE"])
+        self.assertEqual(df["total_operating_revenue"].tolist(), [170.0])
+        self.assertEqual(df["np_parent_company_owners"].tolist(), [25.0])
+
     def test_get_fundamentals_applies_filters_ordering_and_field_projection(self):
         from jq_tushare_sdk.api.finance_tables import valuation
         from jq_tushare_sdk.api.query import query

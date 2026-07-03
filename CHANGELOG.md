@@ -4,6 +4,12 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.1] - 2026-07-04
+
+### Changed
+
+- Use announcement-date-safe income fallback for fundamentals.
+
 ## [0.10.0] - 2026-07-04
 
 ### Changed

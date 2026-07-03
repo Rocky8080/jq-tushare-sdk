@@ -106,6 +106,8 @@ python -m jq_tushare_sdk.cli backtest \
 
 运行回测前会先检查本地缓存；如发现可定位的缺口，会使用 `TUSHARE_TOKEN` 自动补齐并复查，复查仍失败时才停止回测并输出原因。检查会识别策略中静态可推断的 `get_price(count=...)` 历史窗口，并为 ETF/基金价格和基准指数补齐回测开始日前的必要 lookback。
 
+`get_fundamentals(..., statDate=...)` 读取 `income` 财务数据时会按查询日过滤 `ann_date` / `f_ann_date`，避免使用未来才披露的报表；如果请求季度在查询日尚无可见数据，会自动回退到前一个已披露且无未来数据的季度。
+
 默认会启用数据层优化，不改变策略回调顺序。需要做性能对照时可以关闭：
 
 ```bash
@@ -233,7 +235,7 @@ http://127.0.0.1:8787/report.html
 
 ## Versioning
 
-当前版本：`v0.10.0`
+当前版本：`v0.10.1`
 
 版本号遵循 Semantic Versioning：
 

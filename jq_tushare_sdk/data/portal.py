@@ -229,9 +229,9 @@ class DataPortal:
             if not daily_basic.empty:
                 frames.append(daily_basic.copy())
         if "income" in table_names:
-            income_df = self._fetch("income", period=statDate)
+            income_df, income_stat_date = self._income_frame_for_stat_date(statDate, date)
             if not income_df.empty:
-                income_df = self._income_single_quarter_frame(income_df, statDate)
+                income_df = self._income_single_quarter_frame(income_df, income_stat_date, date=date)
                 income_df = income_df.rename(
                     columns={
                         "ts_code": "code",
@@ -425,13 +425,61 @@ class DataPortal:
         self._valuation_cache[cache_key] = daily_basic.copy()
         return daily_basic.copy()
 
-    def _income_single_quarter_frame(self, income_df: pd.DataFrame, stat_date) -> pd.DataFrame:
+    def _income_frame_for_stat_date(self, stat_date, date=None) -> tuple[pd.DataFrame, str | None]:
+        if stat_date is None:
+            return self._filter_income_asof(self._fetch("income"), date), None
+
+        period = self._normalize_income_period(stat_date)
+        if period is None:
+            return self._filter_income_asof(self._fetch("income", period=stat_date), date), stat_date
+
+        current = period
+        for _ in range(12):
+            frame = self._filter_income_asof(self._fetch("income", period=current), date)
+            if not frame.empty:
+                return frame, current
+            previous = self._previous_calendar_income_period(current)
+            if previous is None:
+                break
+            current = previous
+        return pd.DataFrame(), period
+
+    def _filter_income_asof(self, income_df: pd.DataFrame, date=None) -> pd.DataFrame:
+        if income_df.empty or date is None:
+            return income_df
+        date_columns = [column for column in ("f_ann_date", "ann_date") if column in income_df.columns]
+        if not date_columns:
+            return income_df
+        asof = normalize_date(date)
+        result = income_df.copy()
+        visible = pd.Series(True, index=result.index)
+        has_announcement_date = pd.Series(False, index=result.index)
+        for column in date_columns:
+            values = result[column].map(self._normalize_income_announcement_date)
+            has_value = values.notna()
+            has_announcement_date = has_announcement_date | has_value
+            visible = visible & (~has_value | (values <= asof))
+        return result[visible & has_announcement_date].reset_index(drop=True)
+
+    def _normalize_income_announcement_date(self, value) -> str | None:
+        if pd.isna(value):
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        digits = "".join(character for character in text if character.isdigit())
+        if len(digits) >= 8:
+            return digits[:8]
+        return normalize_date(text)
+
+    def _income_single_quarter_frame(self, income_df: pd.DataFrame, stat_date, date=None) -> pd.DataFrame:
         result = self._latest_income_per_security(income_df)
         prev_period = self._previous_income_period(stat_date)
         if prev_period is None:
             return result
 
         prev_df = self._fetch("income", period=prev_period)
+        prev_df = self._filter_income_asof(prev_df, date)
         if prev_df.empty:
             return result
         prev_df = self._latest_income_per_security(prev_df)
@@ -452,21 +500,43 @@ class DataPortal:
         return income_df.groupby("ts_code", group_keys=False).tail(1).reset_index(drop=True)
 
     def _previous_income_period(self, stat_date) -> str | None:
-        text = str(stat_date or "").strip().lower()
-        if len(text) == 6 and text[:4].isdigit() and text[4] == "q" and text[5].isdigit():
-            year = int(text[:4])
-            quarter = int(text[5])
-        elif len(text) == 8 and text[:4].isdigit():
-            quarter_by_end = {"0331": 1, "0630": 2, "0930": 3, "1231": 4}
-            quarter = quarter_by_end.get(text[4:])
-            if quarter is None:
-                return None
-            year = int(text[:4])
-        else:
+        parsed = self._parse_income_period(stat_date)
+        if parsed is None:
             return None
+        year, quarter = parsed
         if quarter <= 1:
             return None
         return f"{year}q{quarter - 1}"
+
+    def _previous_calendar_income_period(self, stat_date) -> str | None:
+        parsed = self._parse_income_period(stat_date)
+        if parsed is None:
+            return None
+        year, quarter = parsed
+        if quarter <= 1:
+            return f"{year - 1}q4"
+        return f"{year}q{quarter - 1}"
+
+    def _normalize_income_period(self, stat_date) -> str | None:
+        parsed = self._parse_income_period(stat_date)
+        if parsed is None:
+            return None
+        year, quarter = parsed
+        return f"{year}q{quarter}"
+
+    def _parse_income_period(self, stat_date) -> tuple[int, int] | None:
+        text = str(stat_date or "").strip().lower()
+        if len(text) == 6 and text[:4].isdigit() and text[4] == "q" and text[5].isdigit():
+            quarter = int(text[5])
+            if 1 <= quarter <= 4:
+                return int(text[:4]), quarter
+            return None
+        if len(text) == 8 and text[:4].isdigit():
+            quarter_by_end = {"0331": 1, "0630": 2, "0930": 3, "1231": 4}
+            quarter = quarter_by_end.get(text[4:])
+            if quarter is not None:
+                return int(text[:4]), quarter
+        return None
 
     def _latest_per_security(self, df: pd.DataFrame) -> pd.DataFrame:
         if "ts_code" not in df.columns or "trade_date" not in df.columns:
