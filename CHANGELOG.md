@@ -4,6 +4,12 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.2] - 2026-07-04
+
+### Changed
+
+- Look back for index weight snapshots before backtest starts.
+
 ## [0.10.1] - 2026-07-04
 
 ### Changed

@@ -1,3 +1,3 @@
 """Local JoinQuant-compatible runtime backed by Tushare cache."""
 
-__version__ = "0.10.1"
+__version__ = "0.10.2"

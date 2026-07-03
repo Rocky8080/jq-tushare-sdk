@@ -990,6 +990,42 @@ def initialize(context):
         self.assertEqual(issues[0].update_requests[0].api_name, "index_daily")
         self.assertEqual(dict(issues[0].update_requests[0].params), {"ts_code": "000985.SH"})
 
+    def test_readiness_looks_back_for_missing_start_index_weight_snapshot(self):
+        class MissingStartIndexWeightBackend(FakeBackend):
+            def fetch(self, api_name, **params):
+                if api_name == "index_weight":
+                    return pd.DataFrame()
+                return super().fetch(api_name, **params)
+
+        with TemporaryDirectory() as tmp:
+            strategy_path = Path(tmp) / "index_weight_strategy.py"
+            strategy_path.write_text(
+                """
+INDEX_CODE = "399006.XSHE"
+
+def select_stock(context):
+    return get_index_stocks(INDEX_CODE)
+""",
+                encoding="utf-8",
+            )
+            config = BacktestConfig(
+                strategy_path=str(strategy_path),
+                start_date="2025-01-02",
+                end_date="2025-12-02",
+                initial_cash=1000000.0,
+                cache_db="/tmp/cache.db",
+            )
+
+            issues = DataReadinessCheck(MissingStartIndexWeightBackend()).check_required(config, ["index_weight"])
+
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].api_name, "index_weight")
+        request = issues[0].update_requests[0]
+        self.assertEqual(request.api_name, "index_weight")
+        self.assertEqual(request.start_date, "20231229")
+        self.assertEqual(request.end_date, "20251202")
+        self.assertEqual(dict(request.params), {"index_code": "399006.SZ"})
+
     def test_readiness_reports_partial_fund_daily_coverage(self):
         class FundBackend(FakeBackend):
             def fetch(self, api_name, **params):

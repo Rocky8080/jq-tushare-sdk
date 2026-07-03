@@ -200,6 +200,7 @@ class DataReadinessCheck:
 
     def _check_index_weight(self, config, start: str, end: str) -> ReadinessIssue | None:
         symbols = infer_strategy_index_symbols(getattr(config, "strategy_path", None))
+        lookback_start = _index_weight_lookback_start(start)
         if symbols:
             missing = []
             update_requests = []
@@ -211,7 +212,7 @@ class DataReadinessCheck:
                     frame = None
                 if frame is None or frame.empty:
                     missing.append(f"{symbol}({ts_code})")
-                    update_requests.append(_update_request("index_weight", "20250101", end, index_code=ts_code))
+                    update_requests.append(_update_request("index_weight", lookback_start, end, index_code=ts_code))
             if not missing:
                 return None
             return ReadinessIssue(
@@ -222,7 +223,7 @@ class DataReadinessCheck:
                 ),
                 suggestion=(
                     "python -m jq_tushare_sdk.cli update-data --api index_weight "
-                    f"--start 20250101 --end {end} --cache-db <cache_db>"
+                    f"--start {lookback_start} --end {end} --cache-db <cache_db>"
                 ),
                 update_requests=tuple(update_requests),
             )
@@ -232,16 +233,16 @@ class DataReadinessCheck:
             return ReadinessIssue(
                 api_name="index_weight",
                 message="Local cache has no data for index_weight.",
-                suggestion=f"python update_data.py --api index_weight --start-date {start} --end-date {end}",
-                update_requests=(_update_request("index_weight", start, end),),
+                suggestion=f"python update_data.py --api index_weight --start-date {lookback_start} --end-date {end}",
+                update_requests=(_update_request("index_weight", lookback_start, end),),
             )
         min_date = status.get("min_date")
         if min_date and start < str(min_date):
             return ReadinessIssue(
                 api_name="index_weight",
                 message=f"index_weight starts at {min_date}, missing requested start {config.start_date}.",
-                suggestion=f"python update_data.py --api index_weight --start-date {start} --end-date {min_date}",
-                update_requests=(_update_request("index_weight", start, str(min_date)),),
+                suggestion=f"python update_data.py --api index_weight --start-date {lookback_start} --end-date {min_date}",
+                update_requests=(_update_request("index_weight", lookback_start, str(min_date)),),
             )
         return None
 
@@ -548,6 +549,11 @@ def _evaluate_static_expression(node: ast.AST, env: dict[str, object]):
 
 def _is_name(node: ast.AST, name: str) -> bool:
     return isinstance(node, ast.Name) and node.id == name
+
+
+def _index_weight_lookback_start(start_date: str) -> str:
+    start_dt = datetime.strptime(normalize_date(start_date), "%Y%m%d")
+    return (start_dt - timedelta(days=370)).strftime("%Y%m%d")
 
 
 def _update_request(api_name: str, start_date: str | None = None, end_date: str | None = None, **params) -> DataUpdateRequest:
