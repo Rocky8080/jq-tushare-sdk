@@ -1153,8 +1153,6 @@ def _render_app_html(project_root: Path, cache_db: Path, output_dir: Path) -> st
         <label><span>开始</span><input id="start-date" name="start_date" type="date" required></label>
         <label><span>结束</span><input id="end-date" name="end_date" type="date" required></label>
         <label><span>资金</span><input id="initial-cash" name="initial_cash" type="number" min="1" step="1" value="1000000" required></label>
-        <button type="button" id="check-data" class="secondary">检查数据</button>
-        <button type="button" id="refresh-report" class="secondary">刷新报告</button>
         <button type="submit" class="primary">运行回测</button>
         <button type="button" id="settings-toggle" class="secondary" aria-expanded="false" aria-controls="settings-panel">设置</button>
       </form>
@@ -1162,6 +1160,10 @@ def _render_app_html(project_root: Path, cache_db: Path, output_dir: Path) -> st
         <label><span>缓存数据库</span><input id="cache-db" name="cache_db" type="text" value="{escape(str(cache_db))}" required></label>
         <label><span>结果目录</span><input id="output-dir" name="output_dir" type="text" value="{escape(str(output_dir))}" required></label>
         <label class="switch-row"><input id="optimize-data" name="optimize_data" type="checkbox" checked><span>启用数据层批量优化</span></label>
+        <div class="settings-actions">
+          <button type="button" id="check-data" class="secondary">检查数据</button>
+          <button type="button" id="refresh-report" class="secondary">刷新报告</button>
+        </div>
         <div class="settings-note">项目目录：{escape(str(project_root))}</div>
       </div>
       <div id="notice" class="notice inline" hidden></div>
@@ -1293,7 +1295,7 @@ h2 { font-size: 18px; }
 .parameter-bar { padding: 9px 10px; }
 .parameter-form.compact {
   display: grid;
-  grid-template-columns: auto minmax(140px, 1fr) 146px 146px 132px auto auto auto auto;
+  grid-template-columns: auto minmax(140px, 1fr) 146px 146px 132px auto auto;
   gap: 8px;
   align-items: center;
 }
@@ -1343,7 +1345,7 @@ input {
 .settings-panel {
   margin-top: 8px;
   display: grid;
-  grid-template-columns: minmax(240px, 1fr) minmax(220px, 1fr) auto minmax(220px, 1.2fr);
+  grid-template-columns: minmax(240px, 1fr) minmax(220px, 1fr) auto auto minmax(220px, 1.2fr);
   gap: 10px;
   align-items: end;
   padding: 10px;
@@ -1352,6 +1354,11 @@ input {
   background: var(--panel-soft);
 }
 .settings-panel[hidden] { display: none; }
+.settings-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 .settings-note {
   color: var(--muted);
   line-height: 1.45;
@@ -1477,7 +1484,14 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 
 def _app_js() -> str:
     return """
-const state = { runs: [], jobs: [], selectedRun: null, strategyPath: '' };
+const state = {
+  runs: [],
+  jobs: [],
+  selectedRun: null,
+  strategyPath: '',
+  autoRefreshedReports: new Set(),
+  refreshingReports: new Set(),
+};
 
 const $ = (id) => document.getElementById(id);
 const money = (value) => value == null ? '--' : Number(value).toLocaleString('zh-CN', { maximumFractionDigits: 2 });
@@ -1539,6 +1553,7 @@ async function loadJobs() {
   const payload = await api('/api/jobs');
   state.jobs = payload.jobs;
   renderJobs();
+  await refreshCompletedReports(payload.jobs);
 }
 
 async function loadRuns() {
@@ -1630,9 +1645,17 @@ function escapeHtml(value) {
 async function submitBacktest(event) {
   event.preventDefault();
   try {
+    const request = requestPayload();
+    setNotice('正在检查本地缓存...');
+    const readiness = await runDataReadinessCheck(request);
+    if (!readiness.ok) {
+      setNotice(formatReadinessIssues(readiness.issues), 'error');
+      return;
+    }
+    setNotice('数据检查通过，正在提交回测...');
     const payload = await api('/api/backtests', {
       method: 'POST',
-      body: JSON.stringify(requestPayload()),
+      body: JSON.stringify(request),
     });
     setNotice(`任务已提交：${payload.job.job_id}`);
     await refreshAll();
@@ -1641,46 +1664,83 @@ async function submitBacktest(event) {
   }
 }
 
+async function runDataReadinessCheck(request = requestPayload()) {
+  return api('/api/check-data', {
+    method: 'POST',
+    body: JSON.stringify(request),
+  });
+}
+
+function formatReadinessIssues(issues) {
+  return (issues || []).map((item) => `${item.api_name}: ${item.message}`).join('\\n') || '数据检查未通过。';
+}
+
 async function checkData() {
   try {
     setNotice('正在检查本地缓存...');
-    const payload = await api('/api/check-data', {
-      method: 'POST',
-      body: JSON.stringify(requestPayload()),
-    });
+    const payload = await runDataReadinessCheck();
     if (payload.ok) {
       setNotice('数据检查通过，可以运行回测。');
     } else {
-      setNotice(payload.issues.map((item) => `${item.api_name}: ${item.message}`).join('\\n'));
+      setNotice(formatReadinessIssues(payload.issues), 'error');
     }
   } catch (error) {
     setNotice(error.message, 'error');
   }
 }
 
-async function refreshSelectedReport() {
-  const params = new URLSearchParams(window.location.search);
-  const runId = state.selectedRun?.run_id || params.get('run_id');
-  if (!runId) {
-    setNotice('请先选择一条历史回测记录。', 'error');
-    return;
-  }
-  try {
-    setNotice('正在刷新历史报告...');
-    const payload = await api('/api/refresh-report', {
-      method: 'POST',
-      body: JSON.stringify({ run_id: runId }),
-    });
+async function refreshReportByRunId(runId) {
+  return api('/api/refresh-report', {
+    method: 'POST',
+    body: JSON.stringify({ run_id: runId }),
+  });
+}
+
+async function refreshReportAndReload(runId, { manual = false } = {}) {
+  if (!runId) throw new Error('请先选择一条历史回测记录。');
+  if (manual) setNotice('正在刷新历史报告...');
+  const payload = await refreshReportByRunId(runId);
+  if (manual || payload.updated) {
     if (payload.updated) {
       setNotice(`报告已刷新：${payload.benchmark}`);
     } else {
       setNotice(`报告仍有未实现指标：${payload.reason || '基准数据缺失'}`, 'error');
     }
-    await refreshAll();
-    const run = state.runs.find((item) => item.run_id === runId) || state.selectedRun;
-    forceLoadReport(run);
+  }
+  await loadRuns();
+  const run = state.runs.find((item) => item.run_id === runId) || state.selectedRun;
+  forceLoadReport(run);
+  return payload;
+}
+
+async function refreshSelectedReport() {
+  const params = new URLSearchParams(window.location.search);
+  const runId = state.selectedRun?.run_id || params.get('run_id');
+  try {
+    await refreshReportAndReload(runId, { manual: true });
   } catch (error) {
     setNotice(error.message, 'error');
+  }
+}
+
+async function refreshCompletedReports(jobs) {
+  const completedJobs = jobs.filter((job) => (
+    job.status === 'completed'
+    && job.run_id
+    && job.report_path
+    && !state.autoRefreshedReports.has(job.run_id)
+    && !state.refreshingReports.has(job.run_id)
+  ));
+  for (const job of completedJobs) {
+    state.refreshingReports.add(job.run_id);
+    try {
+      await refreshReportAndReload(job.run_id);
+    } catch (error) {
+      setNotice(`报告自动刷新失败：${error.message}`, 'error');
+    } finally {
+      state.autoRefreshedReports.add(job.run_id);
+      state.refreshingReports.delete(job.run_id);
+    }
   }
 }
 
