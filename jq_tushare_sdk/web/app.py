@@ -1387,11 +1387,16 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   line-height: 1.45;
   white-space: pre-wrap;
 }
+.notice[hidden] { display: none; }
 .notice.error { color: var(--red); background: #fff6f6; border-color: #f1caca; }
 .job-list.compact {
   display: grid;
   gap: 8px;
   margin-top: 10px;
+}
+.job-list.compact[hidden] {
+  display: none;
+  margin-top: 0;
 }
 .job-item {
   display: grid;
@@ -1491,6 +1496,7 @@ const state = {
   strategyPath: '',
   autoRefreshedReports: new Set(),
   refreshingReports: new Set(),
+  noticeTimer: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -1522,9 +1528,20 @@ function requestPayload() {
 }
 
 function setNotice(message, tone = '') {
+  if (state.noticeTimer) {
+    clearTimeout(state.noticeTimer);
+    state.noticeTimer = null;
+  }
   $('notice').textContent = message;
   $('notice').className = `notice inline ${tone}`;
   $('notice').hidden = false;
+  const sticky = tone === 'error' || String(message).startsWith('正在');
+  if (!sticky) {
+    state.noticeTimer = setTimeout(() => {
+      $('notice').hidden = true;
+      state.noticeTimer = null;
+    }, 4500);
+  }
 }
 
 async function chooseStrategyFile() {
@@ -1570,8 +1587,10 @@ async function loadRuns() {
 function renderJobs() {
   const root = $('jobs');
   root.innerHTML = '';
-  if (!state.jobs.length) return;
-  for (const job of state.jobs.slice(0, 3)) {
+  const visibleJobs = state.jobs.filter((job) => ['queued', 'running', 'failed'].includes(job.status));
+  root.hidden = visibleJobs.length === 0;
+  if (!visibleJobs.length) return;
+  for (const job of visibleJobs.slice(0, 3)) {
     const div = document.createElement('div');
     div.className = 'job-item';
     div.innerHTML = `

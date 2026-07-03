@@ -4,6 +4,12 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.8.1] - 2026-07-03
+
+### Changed
+
+- Keep completed Web console jobs out of the main report workspace.
+
 ## [0.8.0] - 2026-07-03
 
 ### Changed
