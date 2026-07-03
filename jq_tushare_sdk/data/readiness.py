@@ -27,6 +27,11 @@ class DataReadinessCheck:
                 if issue is not None:
                     issues.append(issue)
                     continue
+            if api_name == "index_weight":
+                issue = self._check_index_weight(config, start, end)
+                if issue is not None:
+                    issues.append(issue)
+                continue
             if api_name == "income":
                 issue = self._check_income(config, start, end)
                 if issue is not None:
@@ -104,6 +109,48 @@ class DataReadinessCheck:
             suggestion=f"python update_data.py --api income --start-date {start} --end-date {end}",
         )
 
+    def _check_index_weight(self, config, start: str, end: str) -> ReadinessIssue | None:
+        symbols = infer_strategy_index_symbols(getattr(config, "strategy_path", None))
+        if symbols:
+            missing = []
+            for symbol in symbols:
+                ts_code = to_tushare_code(symbol)
+                try:
+                    frame = self.backend.fetch("index_weight", index_code=ts_code, end_date=start)
+                except Exception:
+                    frame = None
+                if frame is None or frame.empty:
+                    missing.append(f"{symbol}({ts_code})")
+            if not missing:
+                return None
+            return ReadinessIssue(
+                api_name="index_weight",
+                message=(
+                    "Local cache has no index_weight data on or before requested start "
+                    f"{config.start_date} for index {', '.join(missing)}."
+                ),
+                suggestion=(
+                    "python -m jq_tushare_sdk.cli update-data --api index_weight "
+                    f"--start 20250101 --end {end} --cache-db <cache_db>"
+                ),
+            )
+
+        status = self.backend.status("index_weight")
+        if not status.get("exists") or int(status.get("record_count", 0) or 0) == 0:
+            return ReadinessIssue(
+                api_name="index_weight",
+                message="Local cache has no data for index_weight.",
+                suggestion=f"python update_data.py --api index_weight --start-date {start} --end-date {end}",
+            )
+        min_date = status.get("min_date")
+        if min_date and start < str(min_date):
+            return ReadinessIssue(
+                api_name="index_weight",
+                message=f"index_weight starts at {min_date}, missing requested start {config.start_date}.",
+                suggestion=f"python update_data.py --api index_weight --start-date {start} --end-date {min_date}",
+            )
+        return None
+
     def _income_periods_for_range(self, end_date: str) -> list[str]:
         end = normalize_date(end_date)
         year = int(end[:4])
@@ -145,6 +192,37 @@ def infer_strategy_benchmark(strategy_path) -> str | None:
             if benchmark:
                 return benchmark
     return None
+
+
+def infer_strategy_index_symbols(strategy_path) -> list[str]:
+    if not strategy_path:
+        return []
+    path = Path(strategy_path)
+    if not path.is_file():
+        return []
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
+    except SyntaxError:
+        return []
+
+    module_env: dict[str, object] = {}
+    for statement in tree.body:
+        if isinstance(statement, ast.Assign):
+            value = _evaluate_static_expression(statement.value, module_env)
+            for target in statement.targets:
+                if isinstance(target, ast.Name) and value is not _UNRESOLVED:
+                    module_env[target.id] = value
+
+    symbols = []
+    seen = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and _is_name(node.func, "get_index_stocks") and node.args):
+            continue
+        value = _evaluate_static_expression(node.args[0], module_env)
+        if isinstance(value, str) and value not in seen:
+            symbols.append(value)
+            seen.add(value)
+    return symbols
 
 
 def _benchmark_from_initialize(function: ast.FunctionDef, module_env: dict[str, object]) -> str | None:
