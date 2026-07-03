@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jq-tushare-sdk"
+version = "0.7.3"
+description = "Local JoinQuant-compatible daily backtest runtime backed by Tushare cache."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pandas",
+  "tushare",
+]
+
+[project.scripts]
+jqts = "jq_tushare_sdk.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["jq_tushare_sdk*"]

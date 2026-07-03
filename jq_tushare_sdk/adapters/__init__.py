@@ -1,0 +1,1 @@
+"""External data backend adapters."""

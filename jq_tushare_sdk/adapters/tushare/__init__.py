@@ -1,0 +1,1 @@
+"""Tushare cache backend adapter."""

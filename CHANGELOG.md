@@ -1,0 +1,150 @@
+# Changelog
+
+All notable changes to JQ Tushare SDK are documented in this file.
+
+This project follows Semantic Versioning.
+
+## [0.7.3] - 2026-07-03
+
+### Changed
+
+- Move unit tests into a dedicated tests package.
+
+## [0.7.2] - 2026-07-03
+
+### Changed
+
+- Refresh SDK version labels in historical HTML reports.
+
+## [0.7.1] - 2026-07-03
+
+### Changed
+
+- Clear stale unsupported benchmark reasons when refreshing reports.
+
+## [0.7.0] - 2026-07-03
+
+### Changed
+
+- Add historical report refresh for benchmark-dependent metrics.
+
+## [0.6.9] - 2026-07-03
+
+### Changed
+
+- Explain missing benchmark data in readiness checks and reports.
+
+## [0.6.8] - 2026-07-03
+
+### Changed
+
+- Skip SDK target-capture closures during runtime safety scans.
+
+## [0.6.7] - 2026-07-03
+
+### Changed
+
+- Mark incomplete Web console runs without generated reports.
+
+## [0.6.6] - 2026-07-03
+
+### Changed
+
+- Default Web console dates to the previous cached trading day and a one-month window.
+
+## [0.6.5] - 2026-07-03
+
+### Changed
+
+- Allow standard integer initial cash values such as 1000000 in the Web console.
+
+## [0.6.4] - 2026-07-03
+
+### Changed
+
+- Remove the repeated conclusion section from generated HTML reports.
+
+## [0.6.3] - 2026-07-03
+
+### Changed
+
+- Avoid reloading the selected Web console report during background polling.
+
+## [0.6.2] - 2026-07-03
+
+### Changed
+
+- Compact Web console run controls and move advanced paths into settings.
+
+## [0.6.1] - 2026-07-03
+
+### Changed
+
+- Refine Web console layout with top-run controls, file picker upload, and separate history view.
+
+## [0.6.0] - 2026-07-03
+
+### Added
+
+- Add local Web console for launching backtests and browsing run reports.
+
+## [0.5.1] - 2026-07-03
+
+### Changed
+
+- Add transparent data-layer optimization for batched current data snapshots.
+- Add `--no-optimize-data` for performance comparisons and compatibility diagnostics.
+
+## [0.5.0] - 2026-07-03
+
+### Changed
+
+- Add deterministic backtest re-exec and per-run data fetch caching for repeated local queries.
+
+## [0.4.2] - 2026-07-03
+
+### Changed
+
+- Show the running SDK version in generated HTML reports.
+
+## [0.4.1] - 2026-07-03
+
+### Changed
+
+- Clamp open-time data APIs to the previous trading day to avoid look-ahead bias.
+
+## [0.4.0] - 2026-07-03
+
+### Changed
+
+- Redesign the HTML report into a task-focused analysis workspace.
+
+## [0.3.0] - 2026-07-03
+
+### Changed
+
+- Add local backtest performance profiling and bottleneck guidance to HTML reports.
+
+## [0.2.1] - 2026-07-03
+
+### Changed
+
+- Polish local HTML report navigation and remove unsupported JoinQuant-only controls.
+
+## [0.2.0] - 2026-07-03
+
+### Changed
+
+- Add JoinQuant-style benchmark, excess return, alpha, and beta metrics.
+
+## [0.1.0] - 2026-07-03
+
+### Added
+
+- Initial local JoinQuant-compatible daily backtest runtime.
+- Tushare-backed SQLite cache for market data, fundamentals, index data, and trading calendars.
+- Local data readiness checks before running a backtest.
+- Order, trade, position, fee, daily performance, and log outputs.
+- Per-run output directories for reproducible report artifacts.
+- HTML backtest report with overview, transaction details, daily holdings, and logs.
+- Public README with installation, cache preparation, backtest, report, and security guidance.
