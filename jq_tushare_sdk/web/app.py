@@ -330,6 +330,15 @@ def strategy_run_warning(project_root: str | Path, strategy_path: str | Path) ->
     }
 
 
+def _prefer_project_strategy_for_stale_snapshot(project_root: Path, payload: dict) -> dict:
+    warning = strategy_run_warning(project_root, str(payload.get("strategy_path") or ""))
+    if not warning.get("should_warn") or not warning.get("project_strategy_path"):
+        return payload
+    updated = dict(payload)
+    updated["strategy_path"] = warning["project_strategy_path"]
+    return updated
+
+
 def strategy_file_metadata(project_root: str | Path, strategy_path: str | Path) -> dict:
     root = Path(project_root).resolve()
     path = Path(strategy_path)
@@ -554,6 +563,7 @@ def _handler_factory(
             try:
                 payload = self._read_payload()
                 if parsed.path == "/api/backtests":
+                    payload = _prefer_project_strategy_for_stale_snapshot(project_root, payload)
                     job = manager.start(BacktestRequest.from_payload(payload))
                     self._write_json({"job": job}, status=HTTPStatus.ACCEPTED)
                 elif parsed.path == "/api/strategy-file":

@@ -251,7 +251,7 @@ http://127.0.0.1:8787/report.html
 
 ## Versioning
 
-当前版本：`v0.10.7`
+当前版本：`v0.10.8`
 
 版本号遵循 Semantic Versioning：
 

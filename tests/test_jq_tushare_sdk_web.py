@@ -253,6 +253,66 @@ class TestWebConsole(unittest.TestCase):
         self.assertTrue(payload["should_warn"])
         self.assertEqual(payload["project_strategy_path"], "examples/alpha_strategy.py")
 
+    def test_web_handler_backtests_prefer_project_file_for_stale_uploaded_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output_dir = root / "runs"
+            cache_db = root / "data" / "cache.db"
+            self._write(root / "examples" / "alpha_strategy.py", 'VERSION = "2.0.0"\ndef initialize(context):\n    pass\n')
+            self._write(
+                root / ".jqts_web" / "strategies" / "20260705-120000_abcd_alpha_strategy.py",
+                'VERSION = "1.0.0"\ndef initialize(context):\n    pass\n',
+            )
+            captured = []
+
+            def runner(config):
+                captured.append(config)
+                run_dir = output_dir / "run-1"
+                run_dir.mkdir(parents=True)
+                return SimpleNamespace(run_id="run-1", run_dir=run_dir)
+
+            manager = BacktestJobManager(
+                project_root=root,
+                default_cache_db=cache_db,
+                output_dir=output_dir,
+                runner=runner,
+                synchronous=True,
+            )
+            handler = web_app._handler_factory(
+                project_root=root,
+                cache_db=cache_db,
+                output_dir=output_dir,
+                manager=manager,
+                run_store=RunStore(output_dir),
+            )
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                url = f"http://127.0.0.1:{server.server_address[1]}/api/backtests"
+                request = urllib.request.Request(
+                    url,
+                    data=json.dumps(
+                        {
+                            "strategy_path": ".jqts_web/strategies/20260705-120000_abcd_alpha_strategy.py",
+                            "start_date": "2026-06-01",
+                            "end_date": "2026-06-30",
+                            "initial_cash": 1000000.0,
+                        }
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=3) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+
+        self.assertEqual(payload["job"]["status"], "completed")
+        self.assertTrue(captured[0].strategy_path.endswith("examples/alpha_strategy.py"))
+        self.assertEqual(captured[0].strategy_version, "2.0.0")
+
     def test_cli_web_command_starts_console_without_backtest_dates(self):
         with mock.patch.object(cli_module, "serve_web_console", return_value=None) as serve:
             result = cli_module.main(
