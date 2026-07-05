@@ -116,6 +116,34 @@ class TestRuntime(unittest.TestCase):
 
         self.assertEqual(calls, [("daily", 1), ("weekly", 1)])
 
+    def test_scheduler_runs_weekly_on_first_trade_day_after_closed_weekday(self):
+        scheduler = Scheduler()
+        calls = []
+
+        def weekly(context):
+            calls.append(context.current_dt.date().isoformat())
+
+        scheduler.run_weekly(weekly, weekday=1, time="open")
+        context = SimpleNamespace(current_dt=datetime(2026, 5, 6, 9, 30))
+
+        callbacks = scheduler.callbacks_for(
+            context.current_dt,
+            "open",
+            previous_dt=datetime(2026, 4, 30, 9, 30),
+        )
+        for callback in callbacks:
+            callback(context)
+
+        self.assertEqual(calls, ["2026-05-06"])
+        self.assertEqual(
+            scheduler.callbacks_for(
+                datetime(2026, 5, 7, 9, 30),
+                "open",
+                previous_dt=context.current_dt,
+            ),
+            [],
+        )
+
     def test_scheduler_rejects_unsupported_kwargs(self):
         scheduler = Scheduler()
 

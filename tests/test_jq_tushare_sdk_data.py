@@ -1214,6 +1214,50 @@ def get_volatility(context):
         self.assertEqual(issues[0].update_requests[0].end_date, "20260106")
         self.assertEqual(issues[0].update_requests[1].api_name, "fund_adj")
 
+    def test_readiness_extends_fund_daily_for_attribute_history_lookback(self):
+        class AttributeHistoryBackend(FakeBackend):
+            def fetch(self, api_name, **params):
+                if api_name == "trade_cal":
+                    return pd.DataFrame(
+                        [
+                            {"exchange": "SSE", "cal_date": "20250628", "is_open": 0},
+                            {"exchange": "SSE", "cal_date": "20250630", "is_open": 1},
+                            {"exchange": "SSE", "cal_date": "20260105", "is_open": 1},
+                            {"exchange": "SSE", "cal_date": "20260106", "is_open": 1},
+                        ]
+                    )
+                if api_name == "fund_daily":
+                    return pd.DataFrame()
+                return super().fetch(api_name, **params)
+
+        with TemporaryDirectory() as tmp:
+            strategy_path = Path(tmp) / "etf_attribute_history_strategy.py"
+            strategy_path.write_text(
+                """
+LONG_WINDOW = 60
+
+def get_signal(context):
+    return attribute_history("510300.XSHG", LONG_WINDOW, fields=["close"])
+""",
+                encoding="utf-8",
+            )
+            config = BacktestConfig(
+                strategy_path=str(strategy_path),
+                start_date="2026-01-01",
+                end_date="2026-01-06",
+                initial_cash=1000000.0,
+                cache_db="/tmp/cache.db",
+            )
+
+            issues = DataReadinessCheck(AttributeHistoryBackend()).check_required(config, [])
+
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].api_name, "fund_daily")
+        self.assertEqual(issues[0].update_requests[0].api_name, "fund_daily")
+        self.assertEqual(issues[0].update_requests[0].start_date, "20250630")
+        self.assertEqual(issues[0].update_requests[0].end_date, "20260106")
+        self.assertEqual(issues[0].update_requests[1].api_name, "fund_adj")
+
     def test_update_missing_data_runs_structured_update_requests_once(self):
         calls = []
 

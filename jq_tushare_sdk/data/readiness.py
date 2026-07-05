@@ -479,19 +479,29 @@ def infer_strategy_max_price_count(strategy_path) -> int:
     context_env = _context_numeric_env(tree, module_env)
     max_count = 0
     for node in ast.walk(tree):
-        if not (isinstance(node, ast.Call) and _is_name(node.func, "get_price")):
+        if not isinstance(node, ast.Call):
             continue
-        count_node = None
-        for keyword in node.keywords:
-            if keyword.arg == "count":
-                count_node = keyword.value
-                break
+        count_node = _price_count_argument_node(node)
         if count_node is None:
             continue
         value = _evaluate_numeric_expression(count_node, module_env, context_env)
         if isinstance(value, (int, float)) and value > max_count:
             max_count = int(value)
     return max_count
+
+
+def _price_count_argument_node(node: ast.Call):
+    for keyword in node.keywords:
+        if keyword.arg == "count":
+            return keyword.value
+
+    if _is_name(node.func, "attribute_history") and len(node.args) >= 2:
+        return node.args[1]
+    if _is_name(node.func, "history") and node.args:
+        return node.args[0]
+    if _is_name(node.func, "get_price") and len(node.args) >= 4:
+        return node.args[3]
+    return None
 
 
 def _benchmark_from_initialize(function: ast.FunctionDef, module_env: dict[str, object]) -> str | None:

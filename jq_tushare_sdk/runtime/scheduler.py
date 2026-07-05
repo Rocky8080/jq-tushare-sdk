@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable
 
 
@@ -59,14 +59,36 @@ class Scheduler:
     def unschedule_all(self):
         self.entries.clear()
 
-    def callbacks_for(self, current_dt: datetime, time_label: str):
+    def callbacks_for(self, current_dt: datetime, time_label: str, previous_dt=None):
         callbacks = []
         for entry in self.entries:
             if entry.time != time_label:
                 continue
-            if entry.kind == "weekly" and current_dt.weekday() + 1 != entry.weekday:
+            if entry.kind == "weekly" and not self._matches_weekly_entry(
+                entry,
+                current_dt,
+                previous_dt,
+            ):
                 continue
             if entry.kind == "monthly" and current_dt.day != entry.monthday:
                 continue
             callbacks.append(entry.func)
         return callbacks
+
+    def _matches_weekly_entry(self, entry: ScheduledEntry, current_dt: datetime, previous_dt) -> bool:
+        if current_dt.weekday() + 1 == entry.weekday:
+            return True
+        if previous_dt is None:
+            return False
+
+        previous_date = previous_dt.date() if hasattr(previous_dt, "date") else previous_dt
+        current_date = current_dt.date()
+        if previous_date >= current_date:
+            return False
+
+        day = previous_date + timedelta(days=1)
+        while day <= current_date:
+            if day.isoweekday() == entry.weekday:
+                return True
+            day += timedelta(days=1)
+        return False

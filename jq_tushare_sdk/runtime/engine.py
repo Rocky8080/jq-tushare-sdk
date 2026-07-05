@@ -87,7 +87,11 @@ class BacktestEngine:
                     f"{trade_day} {time_text}",
                     "%Y-%m-%d %H:%M:%S",
                 )
-                for callback in scheduler.callbacks_for(context.current_dt, label):
+                for callback in scheduler.callbacks_for(
+                    context.current_dt,
+                    label,
+                    previous_dt=previous_trade_day,
+                ):
                     callback_start = profiler.now()
                     try:
                         callback(context)

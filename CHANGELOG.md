@@ -4,6 +4,12 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.9] - 2026-07-05
+
+### Changed
+
+- Fix attribute_history data readiness and holiday weekly scheduling
+
 ## [0.10.8] - 2026-07-05
 
 ### Changed
