@@ -92,6 +92,12 @@ _API_SPECS: dict[str, ApiSpec] = {
         date_column="trade_date",
         columns=("ts_code", "trade_date", "adj_factor"),
     ),
+    "fund_adj": ApiSpec(
+        table="fund_adj_factor",
+        primary_keys=("ts_code", "trade_date"),
+        date_column="trade_date",
+        columns=("ts_code", "trade_date", "adj_factor"),
+    ),
     "stock_basic": ApiSpec(
         table="stock_basic",
         primary_keys=("ts_code",),
@@ -289,7 +295,7 @@ class TushareCacheBackend:
                 for status in _STOCK_BASIC_LIST_STATUSES
             )
 
-        if api_name in {"daily", "daily_basic", "adj_factor"} and "trade_date" not in params:
+        if api_name in {"daily", "daily_basic", "adj_factor", "fund_adj"} and "trade_date" not in params and "ts_code" not in params:
             total = 0
             for trade_date in self._trade_dates_for_update(start_date, end_date):
                 total += self.update_data(api_name, trade_date=trade_date)

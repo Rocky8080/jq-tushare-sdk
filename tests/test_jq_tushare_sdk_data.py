@@ -69,6 +69,36 @@ class FakeBackend:
                     {"ts_code": "600000.SH", "trade_date": "20240103", "adj_factor": 1.0},
                 ]
             ),
+            "fund_adj": pd.DataFrame(
+                [
+                    {"ts_code": "510300.SH", "trade_date": "20240102", "adj_factor": 1.0},
+                    {"ts_code": "510300.SH", "trade_date": "20240103", "adj_factor": 1.25},
+                ]
+            ),
+            "fund_daily": pd.DataFrame(
+                [
+                    {
+                        "ts_code": "510300.SH",
+                        "trade_date": "20240102",
+                        "open": 4.0,
+                        "high": 4.1,
+                        "low": 3.9,
+                        "close": 4.0,
+                        "vol": 1000.0,
+                        "amount": 4000.0,
+                    },
+                    {
+                        "ts_code": "510300.SH",
+                        "trade_date": "20240103",
+                        "open": 5.0,
+                        "high": 5.1,
+                        "low": 4.9,
+                        "close": 5.0,
+                        "vol": 900.0,
+                        "amount": 4500.0,
+                    },
+                ]
+            ),
             "trade_cal": pd.DataFrame(
                 [
                     {"exchange": "SSE", "cal_date": "20240101", "is_open": 0},
@@ -230,6 +260,24 @@ class TestDataLayer(unittest.TestCase):
         self.assertEqual(df["open"].tolist(), [5.0, 10.6])
         self.assertEqual(df["close"].tolist(), [5.25, 10.2])
         self.assertEqual(df["money"].tolist(), [10500000.0, 9300000.0])
+
+    def test_get_price_applies_pre_adjustment_to_etf_when_requested(self):
+        portal = DataPortal(FakeBackend())
+        df = portal.get_price(
+            "510300.XSHG",
+            start_date="20240102",
+            end_date="20240103",
+            fields=["open", "close"],
+            fq="pre",
+        )
+
+        self.assertEqual(df["code"].tolist(), ["510300.XSHG", "510300.XSHG"])
+        self.assertEqual(df["open"].tolist(), [3.2, 5.0])
+        self.assertEqual(df["close"].tolist(), [3.2, 5.0])
+        self.assertIn(
+            ("fund_adj", {"ts_code": "510300.SH", "start_date": "20240102", "end_date": "20240103"}),
+            portal.backend.calls,
+        )
 
     def test_get_price_supports_security_batches_and_count_per_security(self):
         portal = DataPortal(FakeBackend())
@@ -1110,12 +1158,17 @@ def initialize(context):
         self.assertEqual(len(issues), 1)
         self.assertEqual(issues[0].api_name, "fund_daily")
         self.assertIn("510300.XSHG", issues[0].message)
-        self.assertEqual(len(issues[0].update_requests), 2)
+        self.assertEqual(len(issues[0].update_requests), 3)
         first_request = issues[0].update_requests[0]
         self.assertEqual(first_request.api_name, "fund_daily")
         self.assertEqual(first_request.start_date, "20260101")
         self.assertEqual(first_request.end_date, "20260602")
         self.assertEqual(dict(first_request.params), {"ts_code": "510300.SH"})
+        adj_request = issues[0].update_requests[2]
+        self.assertEqual(adj_request.api_name, "fund_adj")
+        self.assertEqual(adj_request.start_date, "20260101")
+        self.assertEqual(adj_request.end_date, "20260702")
+        self.assertEqual(dict(adj_request.params), {"ts_code": "510300.SH"})
 
     def test_readiness_extends_fund_daily_for_get_price_count_lookback(self):
         class LookbackFundBackend(FakeBackend):
@@ -1159,6 +1212,7 @@ def get_volatility(context):
         self.assertEqual(issues[0].api_name, "fund_daily")
         self.assertEqual(issues[0].update_requests[0].start_date, "20250630")
         self.assertEqual(issues[0].update_requests[0].end_date, "20260106")
+        self.assertEqual(issues[0].update_requests[1].api_name, "fund_adj")
 
     def test_update_missing_data_runs_structured_update_requests_once(self):
         calls = []
@@ -1398,6 +1452,42 @@ def get_volatility(context):
         self.assertEqual(count, 1)
         self.assertEqual(frame["adj_factor"].tolist(), [1.23])
         pro.adj_factor.assert_called_once_with(trade_date="20240102")
+
+    def test_cache_backend_updates_fund_adj_by_fund_code_range(self):
+        pro = Mock()
+        pro.fund_adj.return_value = pd.DataFrame(
+            [
+                {
+                    "ts_code": "510300.SH",
+                    "trade_date": "20240102",
+                    "adj_factor": 1.25,
+                }
+            ]
+        )
+
+        tushare_module = Mock()
+        tushare_module.pro_api.return_value = pro
+        with TemporaryDirectory() as tmp, patch.dict("sys.modules", {"tushare": tushare_module}):
+            backend = TushareCacheBackend(
+                str(Path(tmp) / "data" / "jq_tushare_cache.db"),
+                token="placeholder",
+                cache_mode="strict_local",
+            )
+            count = backend.update_data(
+                "fund_adj",
+                start_date="20240101",
+                end_date="20240131",
+                ts_code="510300.SH",
+            )
+            frame = backend.fetch("fund_adj", ts_code="510300.SH")
+
+        self.assertEqual(count, 1)
+        self.assertEqual(frame["adj_factor"].tolist(), [1.25])
+        pro.fund_adj.assert_called_once_with(
+            ts_code="510300.SH",
+            start_date="20240101",
+            end_date="20240131",
+        )
 
     def test_cache_backend_updates_income_by_quarter_periods_for_date_range(self):
         pro = Mock()
