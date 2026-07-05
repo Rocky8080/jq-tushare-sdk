@@ -4,6 +4,12 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.10] - 2026-07-05
+
+### Changed
+
+- Remove factor alignment example template
+
 ## [0.10.9] - 2026-07-05
 
 ### Changed
