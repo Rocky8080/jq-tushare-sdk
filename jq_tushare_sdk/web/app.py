@@ -1615,6 +1615,27 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 }
 .pill.running, .pill.queued { background: #fff2df; color: var(--amber); }
 .pill.failed { background: #fdecec; color: var(--red); }
+.job-error {
+  grid-column: 1 / -1;
+  border-top: 1px solid #efd3d3;
+  padding-top: 8px;
+  color: var(--red);
+  overflow-wrap: anywhere;
+}
+.job-error summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+.job-error pre {
+  max-height: 220px;
+  overflow: auto;
+  margin: 8px 0 0;
+  padding: 8px;
+  border-radius: 6px;
+  background: #fff6f6;
+  white-space: pre-wrap;
+  color: #7a2d2d;
+}
 .report-shell { min-height: 0; overflow: hidden; }
 #report-frame {
   width: 100%;
@@ -1803,9 +1824,28 @@ function renderJobs() {
       <span class="pill ${job.status}">${statusText(job.status)}</span>
       <span class="muted">${escapeHtml(job.start_date)} - ${escapeHtml(job.end_date)}</span>
       <span>${job.report_path ? `<a class="secondary link-button" href="/?run_id=${escapeHtml(job.run_id)}">打开</a>` : ''}</span>
+      ${renderJobError(job)}
     `;
     root.appendChild(div);
   }
+}
+
+function renderJobError(job) {
+  if (job.status !== 'failed') return '';
+  const detail = job.traceback || job.error || '';
+  if (!detail) return '';
+  return `
+    <details class="job-error" open>
+      <summary>${escapeHtml(jobErrorSummary(job))}</summary>
+      <pre>${escapeHtml(detail)}</pre>
+    </details>
+  `;
+}
+
+function jobErrorSummary(job) {
+  const raw = String(job.error || job.traceback || '任务失败，未返回错误详情。');
+  const firstLine = raw.split('\\n').map((line) => line.trim()).find(Boolean) || raw;
+  return firstLine.length > 180 ? `${firstLine.slice(0, 180)}...` : firstLine;
 }
 
 function selectRun(runId) {

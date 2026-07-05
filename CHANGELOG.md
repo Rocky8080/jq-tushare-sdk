@@ -4,6 +4,12 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.12] - 2026-07-05
+
+### Changed
+
+- Show failed backtest errors in the web console
+
 ## [0.10.11] - 2026-07-05
 
 ### Changed

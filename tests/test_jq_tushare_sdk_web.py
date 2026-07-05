@@ -700,6 +700,13 @@ class TestWebConsole(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_app_js_renders_failed_job_error_details(self):
+        script = web_app._app_js()
+
+        self.assertIn("renderJobError(job)", script)
+        self.assertIn("job.traceback", script)
+        self.assertIn('class="job-error"', script)
+
     def _write(self, path: Path, content: str = "def initialize(context):\n    pass\n") -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
