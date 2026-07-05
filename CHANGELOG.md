@@ -4,6 +4,16 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.4] - 2026-07-05
+
+### Added
+
+- Add JoinQuant factor alignment template for data comparisons.
+
+### Changed
+
+- Support ETF adjustment factors for local fund price adjustments.
+
 ## [0.10.3] - 2026-07-04
 
 ### Changed
