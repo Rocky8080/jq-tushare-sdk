@@ -19,20 +19,29 @@ class ExamplesTest(unittest.TestCase):
 
         self.assertIn("def initialize(context):", source)
         self.assertIn("def rebalance(context):", source)
+        self.assertIn("ETF_POOL", source)
+        self.assertIn("MAX_HOLDINGS", source)
         self.assertIn("attribute_history(", source)
         self.assertIn("order_target_value(", source)
+        self.assertIn("run_weekly(", source)
+        self.assertNotIn("run_daily(", source)
+        self.assertIn("close_tax=0,", source)
         self.assertNotIn("jqfactor", source)
         self.assertNotIn("calc_factors", source)
         self.assertNotIn("reference_security", source)
 
-    def test_dual_ma_momentum_baseline_does_not_rebalance_existing_long_daily(self):
+    def test_dual_ma_momentum_baseline_does_not_rebalance_existing_target(self):
         module = self._load_dual_ma_template()
         orders = []
-        module.dual_ma_signal = lambda _security: {
-            "short_ma": 2.0,
-            "long_ma": 1.0,
-            "invested": True,
-        }
+
+        module.rank_etf_pool = lambda: [
+            {
+                "security": module.ETF_POOL[0],
+                "short_ma": 2.0,
+                "long_ma": 1.0,
+                "score": 1.0,
+            }
+        ]
         module.order_target_value = lambda security, value: orders.append((security, value))
         module.record = lambda **_kwargs: None
         module.log = types.SimpleNamespace(info=lambda *_args, **_kwargs: None)
@@ -40,7 +49,7 @@ class ExamplesTest(unittest.TestCase):
             portfolio=types.SimpleNamespace(
                 total_value=100000.0,
                 positions={
-                    module.TARGET_SECURITY: types.SimpleNamespace(total_amount=20300),
+                    module.ETF_POOL[0]: types.SimpleNamespace(total_amount=20300),
                 },
             )
         )
@@ -48,6 +57,48 @@ class ExamplesTest(unittest.TestCase):
         module.rebalance(context)
 
         self.assertEqual(orders, [])
+
+    def test_dual_ma_momentum_baseline_rotates_weekly_etf_targets(self):
+        module = self._load_dual_ma_template()
+        orders = []
+
+        module.rank_etf_pool = lambda: [
+            {
+                "security": module.ETF_POOL[1],
+                "short_ma": 2.0,
+                "long_ma": 1.0,
+                "score": 1.0,
+            },
+            {
+                "security": module.ETF_POOL[0],
+                "short_ma": 1.5,
+                "long_ma": 1.0,
+                "score": 0.5,
+            },
+        ]
+        module.order_target_value = lambda security, value: orders.append((security, value))
+        module.record = lambda **_kwargs: None
+        module.log = types.SimpleNamespace(info=lambda *_args, **_kwargs: None)
+        context = types.SimpleNamespace(
+            portfolio=types.SimpleNamespace(
+                total_value=100000.0,
+                positions={
+                    module.ETF_POOL[0]: types.SimpleNamespace(total_amount=20300),
+                    module.ETF_POOL[2]: types.SimpleNamespace(total_amount=10000),
+                },
+            )
+        )
+
+        module.rebalance(context)
+
+        self.assertEqual(
+            orders,
+            [
+                (module.ETF_POOL[2], 0),
+                (module.ETF_POOL[0], 50000.0),
+                (module.ETF_POOL[1], 50000.0),
+            ],
+        )
 
     def _load_dual_ma_template(self):
         path = ROOT / "examples" / "joinquant_dual_ma_momentum_baseline.py"
@@ -59,7 +110,7 @@ class ExamplesTest(unittest.TestCase):
             "OrderCost",
             "order_target_value",
             "record",
-            "run_daily",
+            "run_weekly",
             "set_benchmark",
             "set_option",
             "set_order_cost",
@@ -71,7 +122,7 @@ class ExamplesTest(unittest.TestCase):
         jqdata.OrderCost = lambda **kwargs: kwargs
         jqdata.order_target_value = lambda *_args, **_kwargs: None
         jqdata.record = lambda **_kwargs: None
-        jqdata.run_daily = lambda *_args, **_kwargs: None
+        jqdata.run_weekly = lambda *_args, **_kwargs: None
         jqdata.set_benchmark = lambda *_args, **_kwargs: None
         jqdata.set_option = lambda *_args, **_kwargs: None
         jqdata.set_order_cost = lambda *_args, **_kwargs: None

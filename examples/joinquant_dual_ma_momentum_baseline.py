@@ -1,5 +1,5 @@
 """
-Minimal JoinQuant dual moving-average momentum baseline.
+JoinQuant dual moving-average momentum baseline for weekly ETF rotation.
 
 This template intentionally uses only common jqdata APIs so it can run both on
 JoinQuant and in the local JQ Tushare SDK. It is meant as a simple baseline for
@@ -9,13 +9,21 @@ checking data alignment before comparing more complex factor strategies.
 from jqdata import *
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 UPDATE_DATE = "2026-07-05"
 
-TARGET_SECURITY = "510300.XSHG"
 BENCHMARK = "000300.XSHG"
+ETF_POOL = (
+    "510300.XSHG",
+    "510500.XSHG",
+    "159915.XSHE",
+    "588000.XSHG",
+    "512100.XSHG",
+)
+MAX_HOLDINGS = 2
 SHORT_WINDOW = 20
 LONG_WINDOW = 60
+REBALANCE_WEEKDAY = 1
 TRADE_TIME = "open"
 
 
@@ -25,7 +33,7 @@ def initialize(context):
     set_order_cost(
         OrderCost(
             open_tax=0,
-            close_tax=0.001,
+            close_tax=0,
             open_commission=0.0003,
             close_commission=0.0003,
             close_today_commission=0,
@@ -34,34 +42,69 @@ def initialize(context):
         type="stock",
     )
     set_slippage(FixedSlippage(0.01))
-    run_daily(rebalance, time=TRADE_TIME)
+    run_weekly(rebalance, weekday=REBALANCE_WEEKDAY, time=TRADE_TIME)
 
 
 def rebalance(context):
-    signal = dual_ma_signal(TARGET_SECURITY)
-    if signal is None:
-        log.info("Not enough history for dual MA baseline.")
-        return
+    ranked = rank_etf_pool()
+    selected = ranked[:MAX_HOLDINGS]
+    selected_set = set(signal["security"] for signal in selected)
+    current_set = current_managed_position_set(context)
+    target_set_changed = selected_set != current_set
+    target_value = context.portfolio.total_value / len(selected) if selected else 0
 
-    current_amount = current_position_amount(context, TARGET_SECURITY)
-    if signal["invested"] and current_amount <= 0:
-        order_target_value(TARGET_SECURITY, context.portfolio.total_value)
-    elif not signal["invested"] and current_amount > 0:
-        order_target_value(TARGET_SECURITY, 0)
+    for security in ETF_POOL:
+        if security in selected_set:
+            continue
+        if current_position_amount(context, security) > 0:
+            order_target_value(security, 0)
+
+    if target_set_changed:
+        for security in ETF_POOL:
+            if (
+                security in selected_set
+                and current_position_amount(context, security) > 0
+            ):
+                order_target_value(security, target_value)
+
+    for signal in selected:
+        security = signal["security"]
+        if current_position_amount(context, security) <= 0:
+            order_target_value(security, target_value)
 
     record(
-        short_ma=round(signal["short_ma"], 4),
-        long_ma=round(signal["long_ma"], 4),
-        invested=1 if signal["invested"] else 0,
+        selected_count=len(selected),
+        candidate_count=len(ranked),
+        top_score=round(selected[0]["score"], 4) if selected else 0,
     )
-    log.info(
-        "dual_ma %s short=%.4f long=%.4f invested=%s"
-        % (
-            TARGET_SECURITY,
-            signal["short_ma"],
-            signal["long_ma"],
-            signal["invested"],
+    if selected:
+        log.info(
+            "dual_ma_etf selected=%s candidates=%s"
+            % (
+                ",".join(signal["security"] for signal in selected),
+                len(ranked),
+            )
         )
+    else:
+        log.info("dual_ma_etf no bullish candidates")
+
+
+def rank_etf_pool():
+    signals = []
+    for security in ETF_POOL:
+        signal = dual_ma_signal(security)
+        if signal is None or not signal["invested"]:
+            continue
+        signal["security"] = security
+        signals.append(signal)
+    return sorted(signals, key=lambda signal: signal["score"], reverse=True)
+
+
+def current_managed_position_set(context):
+    return set(
+        security
+        for security in ETF_POOL
+        if current_position_amount(context, security) > 0
     )
 
 
@@ -101,4 +144,5 @@ def dual_ma_signal(security):
         "short_ma": short_ma,
         "long_ma": long_ma,
         "invested": short_ma > long_ma,
+        "score": short_ma / long_ma - 1,
     }

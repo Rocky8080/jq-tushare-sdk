@@ -139,7 +139,7 @@ examples/joinquant_dual_ma_momentum_baseline.py
 
 因子对齐模板保留聚宽 `jqfactor.Factor` / `calc_factors` 的写法，适合作为 JoinQuant 平台端的标准测试程序。需要做本地 SDK 对齐时，先用同一回测区间和基准在聚宽端运行，再对比本地报告中的持仓、收益曲线和日志输出。
 
-双均线动量模板只依赖常见 `jqdata` API，默认使用 `510300.XSHG` 和 20/60 日均线，可直接在本地 Web 控制台或 CLI 中运行，适合作为最小可运行基线。
+双均线动量模板只依赖常见 `jqdata` API，默认使用多 ETF 池、20/60 日均线和每周调仓，按动量排名最多持有 2 只 ETF；已在目标池中的持仓不会反复按金额微调，适合作为最小可运行基线。
 
 ## Web Console
 
@@ -251,7 +251,7 @@ http://127.0.0.1:8787/report.html
 
 ## Versioning
 
-当前版本：`v0.10.5`
+当前版本：`v0.10.6`
 
 版本号遵循 Semantic Versioning：
 

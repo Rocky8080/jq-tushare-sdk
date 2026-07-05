@@ -4,6 +4,13 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.6] - 2026-07-05
+
+### Changed
+
+- Expand the dual moving-average baseline to weekly multi-ETF rotation.
+- Use zero sell tax in the ETF baseline cost model.
+
 ## [0.10.5] - 2026-07-05
 
 ### Added
