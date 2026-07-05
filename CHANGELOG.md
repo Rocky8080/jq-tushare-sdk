@@ -4,6 +4,12 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.7] - 2026-07-05
+
+### Changed
+
+- Show strategy source metadata and warn before running stale uploaded snapshots.
+
 ## [0.10.6] - 2026-07-05
 
 ### Changed

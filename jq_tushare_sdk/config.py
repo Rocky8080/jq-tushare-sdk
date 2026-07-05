@@ -13,6 +13,12 @@ class BacktestConfig:
     output_dir: str = "backtest_runs"
     strategy_name: Optional[str] = None
     strategy_version: Optional[str] = None
+    strategy_source: Optional[str] = None
+    strategy_hash: Optional[str] = None
+    project_strategy_path: Optional[str] = None
+    project_strategy_version: Optional[str] = None
+    project_strategy_hash: Optional[str] = None
+    project_strategy_is_newer: Optional[bool] = None
     git_commit: Optional[str] = None
     benchmark: str = "399006.XSHE"
     cache_mode: str = "strict_local"

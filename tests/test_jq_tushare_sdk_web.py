@@ -12,6 +12,7 @@ from unittest import mock
 
 from jq_tushare_sdk import cli as cli_module
 from jq_tushare_sdk.config import BacktestConfig
+from jq_tushare_sdk.reports.html_report import JoinQuantHtmlReport
 from jq_tushare_sdk.web import app as web_app
 from jq_tushare_sdk.web.app import BacktestJobManager, BacktestRequest, RunStore, discover_strategies
 
@@ -67,6 +68,27 @@ class TestWebConsole(unittest.TestCase):
         self.assertEqual(runs[0]["duration_seconds"], 17.0)
         self.assertEqual(runs[0]["report_path"], "20260703-110000_beta_20260601_20260630/reports/report.html")
 
+    def test_run_store_returns_strategy_reproducibility_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            self._write_run(
+                output_dir,
+                "20260703-110000_beta_20260601_20260630",
+                strategy_name="beta",
+                initial_cash=1000000.0,
+                final_value=1100000.0,
+                total_seconds=17.0,
+                strategy_version="2.0.0",
+                strategy_source="project_file",
+                strategy_hash="abc123",
+            )
+
+            runs = RunStore(output_dir).list_runs()
+
+        self.assertEqual(runs[0]["strategy_version"], "2.0.0")
+        self.assertEqual(runs[0]["strategy_source"], "project_file")
+        self.assertEqual(runs[0]["strategy_hash"], "abc123")
+
     def test_run_store_marks_runs_without_report_as_incomplete(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp)
@@ -87,7 +109,7 @@ class TestWebConsole(unittest.TestCase):
     def test_job_manager_converts_request_to_backtest_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            self._write(root / "alpha_strategy.py")
+            self._write(root / "alpha_strategy.py", 'VERSION = "1.2.0"\ndef initialize(context):\n    pass\n')
             output_dir = root / "runs"
             cache_db = root / "data" / "cache.db"
             captured = []
@@ -127,6 +149,109 @@ class TestWebConsole(unittest.TestCase):
         self.assertEqual(config.cache_db, str(cache_db))
         self.assertEqual(config.output_dir, str(output_dir))
         self.assertFalse(config.optimize_data)
+        self.assertEqual(config.strategy_version, "1.2.0")
+        self.assertEqual(config.strategy_source, "project_file")
+        self.assertRegex(config.strategy_hash or "", r"^[0-9a-f]{64}$")
+
+    def test_job_manager_marks_uploaded_snapshot_and_matches_project_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_strategy = root / "examples" / "alpha_strategy.py"
+            uploaded_strategy = root / ".jqts_web" / "strategies" / "20260705-120000_abcd_alpha_strategy.py"
+            self._write(project_strategy, 'VERSION = "2.0.0"\ndef initialize(context):\n    pass\n')
+            self._write(uploaded_strategy, 'VERSION = "1.0.0"\ndef initialize(context):\n    pass\n')
+            output_dir = root / "runs"
+            cache_db = root / "data" / "cache.db"
+
+            manager = BacktestJobManager(
+                project_root=root,
+                default_cache_db=cache_db,
+                output_dir=output_dir,
+                runner=lambda config: SimpleNamespace(run_id="run-1", run_dir=output_dir / "run-1"),
+                synchronous=True,
+            )
+
+            config = manager._config_from_request(
+                BacktestRequest(
+                    strategy_path=uploaded_strategy.relative_to(root).as_posix(),
+                    start_date="2026-06-01",
+                    end_date="2026-06-30",
+                    initial_cash=1000000.0,
+                )
+            )
+
+        self.assertEqual(config.strategy_version, "1.0.0")
+        self.assertEqual(config.strategy_source, "uploaded_snapshot")
+        self.assertEqual(config.project_strategy_path, "examples/alpha_strategy.py")
+        self.assertEqual(config.project_strategy_version, "2.0.0")
+        self.assertTrue(config.project_strategy_is_newer)
+
+    def test_strategy_warning_detects_stale_uploaded_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(root / "examples" / "alpha_strategy.py", 'VERSION = "2.0.0"\ndef initialize(context):\n    pass\n')
+            self._write(
+                root / ".jqts_web" / "strategies" / "20260705-120000_abcd_alpha_strategy.py",
+                'VERSION = "1.0.0"\ndef initialize(context):\n    pass\n',
+            )
+
+            warning = web_app.strategy_run_warning(
+                root,
+                ".jqts_web/strategies/20260705-120000_abcd_alpha_strategy.py",
+            )
+
+        self.assertTrue(warning["should_warn"])
+        self.assertEqual(warning["strategy_source"], "uploaded_snapshot")
+        self.assertEqual(warning["strategy_version"], "1.0.0")
+        self.assertEqual(warning["project_strategy_path"], "examples/alpha_strategy.py")
+        self.assertEqual(warning["project_strategy_version"], "2.0.0")
+
+    def test_web_handler_exposes_strategy_warning_api(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output_dir = root / "runs"
+            cache_db = root / "data" / "cache.db"
+            self._write(root / "examples" / "alpha_strategy.py", 'VERSION = "2.0.0"\ndef initialize(context):\n    pass\n')
+            self._write(
+                root / ".jqts_web" / "strategies" / "20260705-120000_abcd_alpha_strategy.py",
+                'VERSION = "1.0.0"\ndef initialize(context):\n    pass\n',
+            )
+            manager = BacktestJobManager(
+                project_root=root,
+                default_cache_db=cache_db,
+                output_dir=output_dir,
+                synchronous=True,
+            )
+            handler = web_app._handler_factory(
+                project_root=root,
+                cache_db=cache_db,
+                output_dir=output_dir,
+                manager=manager,
+                run_store=RunStore(output_dir),
+            )
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                url = f"http://127.0.0.1:{server.server_address[1]}/api/strategy-warning"
+                request = urllib.request.Request(
+                    url,
+                    data=json.dumps(
+                        {
+                            "strategy_path": ".jqts_web/strategies/20260705-120000_abcd_alpha_strategy.py",
+                        }
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=3) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+
+        self.assertTrue(payload["should_warn"])
+        self.assertEqual(payload["project_strategy_path"], "examples/alpha_strategy.py")
 
     def test_cli_web_command_starts_console_without_backtest_dates(self):
         with mock.patch.object(cli_module, "serve_web_console", return_value=None) as serve:
@@ -202,8 +327,22 @@ class TestWebConsole(unittest.TestCase):
         ]
 
         self.assertNotIn("runDataReadinessCheck", submit_script)
+        self.assertIn("strategy-warning", submit_script)
+        self.assertIn("confirm(", submit_script)
         self.assertIn("自动检查并补齐", submit_script)
         self.assertIn("api('/api/backtests'", submit_script)
+
+    def test_main_console_shows_current_strategy_metadata(self):
+        html = web_app._render_app_html(
+            Path("/repo"),
+            Path("data/jq_tushare_cache.db"),
+            Path("backtest_runs"),
+        )
+        script = web_app._app_js()
+
+        self.assertIn('id="strategy-meta"', html)
+        self.assertIn("策略版本", script)
+        self.assertIn("strategy_source", script)
 
     def test_main_console_uses_top_file_picker_and_report_workspace(self):
         html = web_app._render_app_html(
@@ -307,6 +446,34 @@ class TestWebConsole(unittest.TestCase):
         self.assertIn("未生成报告", script)
         self.assertIn("disabled-link", script)
         self.assertIn("incomplete", script)
+
+    def test_html_report_logs_strategy_reproducibility_metadata(self):
+        config = SimpleNamespace(
+            strategy_path="/repo/examples/alpha.py",
+            strategy_name="alpha",
+            strategy_version="2.0.0",
+            strategy_source="project_file",
+            strategy_hash="abc123",
+            start_date="2026-06-01",
+            end_date="2026-06-30",
+            initial_cash=1000000.0,
+            cache_db="/repo/data/cache.db",
+        )
+        manifest = SimpleNamespace(run_id="run-1")
+
+        html = JoinQuantHtmlReport().render(
+            config=config,
+            manifest=manifest,
+            performance_rows=[],
+            summary={},
+            trades=[],
+            position_rows=[],
+        )
+
+        self.assertIn("策略版本", html)
+        self.assertIn("2.0.0", html)
+        self.assertIn("project_file", html)
+        self.assertIn("abc123", html)
 
     def test_uploaded_strategy_file_is_copied_inside_project(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -492,6 +659,9 @@ class TestWebConsole(unittest.TestCase):
         initial_cash: float,
         final_value: float,
         total_seconds: float,
+        strategy_version: str | None = None,
+        strategy_source: str | None = None,
+        strategy_hash: str | None = None,
     ) -> None:
         run_dir = output_dir / run_id
         reports_dir = run_dir / "reports"
@@ -508,6 +678,9 @@ class TestWebConsole(unittest.TestCase):
                     "initial_cash": initial_cash,
                     "cache_db": "data/cache.db",
                     "sdk_version": "0.5.1",
+                    "strategy_version": strategy_version,
+                    "strategy_source": strategy_source,
+                    "strategy_hash": strategy_hash,
                 }
             ),
             encoding="utf-8",

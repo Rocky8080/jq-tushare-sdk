@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import calendar
+import hashlib
 import json
 import mimetypes
 import os
@@ -109,6 +111,13 @@ class RunStore:
                     "return_rate": return_rate,
                     "trade_count": summary.get("trade_count"),
                     "sdk_version": manifest.get("sdk_version"),
+                    "strategy_version": manifest.get("strategy_version"),
+                    "strategy_source": manifest.get("strategy_source"),
+                    "strategy_hash": manifest.get("strategy_hash"),
+                    "project_strategy_path": manifest.get("project_strategy_path"),
+                    "project_strategy_version": manifest.get("project_strategy_version"),
+                    "project_strategy_hash": manifest.get("project_strategy_hash"),
+                    "project_strategy_is_newer": manifest.get("project_strategy_is_newer"),
                     "duration_seconds": _to_float((profile or {}).get("total_seconds")),
                     "status": "completed" if has_report else "incomplete",
                     "report_path": f"{run_id}/reports/report.html" if has_report else None,
@@ -160,6 +169,12 @@ class BacktestJobManager:
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "strategy_name": Path(config.strategy_path).stem,
             "strategy_path": config.strategy_path,
+            "strategy_version": config.strategy_version,
+            "strategy_source": config.strategy_source,
+            "strategy_hash": config.strategy_hash,
+            "project_strategy_path": config.project_strategy_path,
+            "project_strategy_version": config.project_strategy_version,
+            "project_strategy_is_newer": config.project_strategy_is_newer,
             "start_date": config.start_date,
             "end_date": config.end_date,
             "initial_cash": config.initial_cash,
@@ -235,6 +250,7 @@ class BacktestJobManager:
             cache_db=str(cache_db),
             output_dir=str(output_dir),
             optimize_data=bool(request.optimize_data),
+            **strategy_file_metadata(self.project_root, strategy_path),
         )
 
     def _resolve_strategy_path(self, raw_path: str) -> Path:
@@ -292,7 +308,132 @@ def save_uploaded_strategy_file(project_root: str | Path, payload: dict) -> dict
         "path": str(target),
         "relative_path": relative,
         "strategy_path": relative,
+        **strategy_file_metadata(root, target),
     }
+
+
+def strategy_run_warning(project_root: str | Path, strategy_path: str | Path) -> dict:
+    root = Path(project_root).resolve()
+    resolved = _resolve_project_strategy_path(root, strategy_path)
+    metadata = strategy_file_metadata(root, resolved)
+    should_warn = bool(
+        metadata.get("strategy_source") == "uploaded_snapshot"
+        and metadata.get("project_strategy_path")
+        and (
+            metadata.get("project_strategy_is_newer")
+            or metadata.get("project_strategy_hash") != metadata.get("strategy_hash")
+        )
+    )
+    return {
+        "should_warn": should_warn,
+        **metadata,
+    }
+
+
+def strategy_file_metadata(project_root: str | Path, strategy_path: str | Path) -> dict:
+    root = Path(project_root).resolve()
+    path = Path(strategy_path)
+    if not path.is_absolute():
+        path = root / path
+    path = path.resolve()
+    if not path.exists():
+        return {
+            "strategy_source": None,
+            "strategy_version": None,
+            "strategy_hash": None,
+            "project_strategy_path": None,
+            "project_strategy_version": None,
+            "project_strategy_hash": None,
+            "project_strategy_is_newer": None,
+        }
+
+    info = _strategy_file_info(path)
+    source = "uploaded_snapshot" if _is_uploaded_strategy_snapshot(root, path) else "project_file"
+    project_info = _matching_project_strategy_info(root, path) if source == "uploaded_snapshot" else None
+    project_version = project_info["strategy_version"] if project_info else None
+    return {
+        "strategy_source": source,
+        "strategy_version": info["strategy_version"],
+        "strategy_hash": info["strategy_hash"],
+        "project_strategy_path": project_info["relative_path"] if project_info else None,
+        "project_strategy_version": project_version,
+        "project_strategy_hash": project_info["strategy_hash"] if project_info else None,
+        "project_strategy_is_newer": _is_version_newer(project_version, info["strategy_version"]),
+    }
+
+
+def _resolve_project_strategy_path(project_root: Path, strategy_path: str | Path) -> Path:
+    candidate = Path(strategy_path)
+    if not candidate.is_absolute():
+        candidate = project_root / candidate
+    candidate = candidate.resolve()
+    if not candidate.is_relative_to(project_root):
+        raise ValueError("strategy_path must be inside project_root")
+    if candidate.suffix != ".py" or not candidate.is_file():
+        raise ValueError("strategy_path must point to an existing Python file")
+    return candidate
+
+
+def _strategy_file_info(path: Path) -> dict:
+    content = path.read_bytes()
+    return {
+        "strategy_version": _extract_strategy_version(content.decode("utf-8", errors="ignore")),
+        "strategy_hash": hashlib.sha256(content).hexdigest(),
+    }
+
+
+def _extract_strategy_version(source: str) -> str | None:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == "VERSION" for target in node.targets):
+            continue
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            return node.value.value
+    return None
+
+
+def _is_uploaded_strategy_snapshot(project_root: Path, path: Path) -> bool:
+    upload_root = (project_root / ".jqts_web" / "strategies").resolve()
+    return path.is_relative_to(upload_root)
+
+
+def _matching_project_strategy_info(project_root: Path, uploaded_path: Path) -> dict | None:
+    original_name = _uploaded_original_filename(uploaded_path.name)
+    for path in sorted(project_root.rglob(original_name)):
+        rel = path.relative_to(project_root)
+        if _is_excluded_strategy_path(rel):
+            continue
+        if path.resolve() == uploaded_path.resolve():
+            continue
+        return {
+            "relative_path": rel.as_posix(),
+            **_strategy_file_info(path),
+        }
+    return None
+
+
+def _uploaded_original_filename(filename: str) -> str:
+    match = re.match(r"^\d{8}-\d{6}_[0-9a-f]+_(.+\.py)$", filename)
+    return match.group(1) if match else filename
+
+
+def _is_version_newer(candidate: str | None, current: str | None) -> bool:
+    candidate_parts = _version_parts(candidate)
+    current_parts = _version_parts(current)
+    if candidate_parts is None or current_parts is None:
+        return False
+    return candidate_parts > current_parts
+
+
+def _version_parts(version: str | None) -> tuple[int, ...] | None:
+    if not version or not re.match(r"^\d+(?:\.\d+)*$", version):
+        return None
+    return tuple(int(part) for part in version.split("."))
 
 
 def default_backtest_dates(cache_db: str | Path, *, today: date | None = None) -> dict[str, str]:
@@ -418,6 +559,13 @@ def _handler_factory(
                 elif parsed.path == "/api/strategy-file":
                     strategy = save_uploaded_strategy_file(project_root, payload)
                     self._write_json({"strategy": strategy})
+                elif parsed.path == "/api/strategy-warning":
+                    self._write_json(
+                        strategy_run_warning(
+                            project_root,
+                            str(payload.get("strategy_path") or ""),
+                        )
+                    )
                 elif parsed.path == "/api/check-data":
                     request = BacktestRequest.from_payload(payload)
                     issues = _check_data_readiness(
@@ -1170,6 +1318,7 @@ def _render_app_html(project_root: Path, cache_db: Path, output_dir: Path) -> st
         <input id="strategy-path" type="hidden">
         <button type="button" id="choose-strategy" class="secondary">选择策略文件</button>
         <div class="selected-file" id="selected-strategy">未选择策略文件</div>
+        <div class="strategy-meta" id="strategy-meta">策略版本：-- · 来源：--</div>
         <label class="date-field"><span>开始</span><input id="start-date" name="start_date" type="date" required></label>
         <label class="date-field"><span>结束</span><input id="end-date" name="end_date" type="date" required></label>
         <label><span>资金</span><input id="initial-cash" name="initial_cash" type="number" min="1" step="1" value="1000000" required></label>
@@ -1315,7 +1464,7 @@ h2 { font-size: 18px; }
 .parameter-bar { padding: 9px 10px; }
 .parameter-form.compact {
   display: grid;
-  grid-template-columns: auto minmax(120px, 1fr) 174px 174px 132px auto auto;
+  grid-template-columns: auto minmax(120px, 1fr) minmax(150px, .8fr) 174px 174px 132px auto auto;
   gap: 8px;
   align-items: center;
 }
@@ -1339,6 +1488,19 @@ input {
   border: 1px solid #d8e0e8;
   border-radius: 6px;
   background: var(--panel-soft);
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.strategy-meta {
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  border: 1px solid #d8e0e8;
+  border-radius: 6px;
+  background: #f8fbff;
   color: var(--muted);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1497,7 +1659,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .negative { color: var(--green); font-weight: 800; }
 @media (max-width: 1180px) {
   .parameter-form.compact {
-    grid-template-columns: auto minmax(120px, 1fr) 174px 174px 136px;
+    grid-template-columns: auto minmax(120px, 1fr) minmax(150px, .8fr) 174px 174px 136px;
   }
   .parameter-form.compact button { padding: 0 10px; }
   .settings-panel { grid-template-columns: 1fr 1fr; }
@@ -1517,6 +1679,7 @@ const state = {
   jobs: [],
   selectedRun: null,
   strategyPath: '',
+  strategyMetadata: null,
   autoRefreshedReports: new Set(),
   refreshingReports: new Set(),
   noticeTimer: null,
@@ -1581,12 +1744,21 @@ async function uploadSelectedStrategyFile(event) {
       body: JSON.stringify({ filename: file.name, content }),
     });
     state.strategyPath = payload.strategy.strategy_path;
+    state.strategyMetadata = payload.strategy;
     $('strategy-path').value = state.strategyPath;
     $('selected-strategy').textContent = `${file.name} -> ${state.strategyPath}`;
+    renderStrategyMeta(payload.strategy);
     setNotice('策略文件已选择。运行时会使用本项目内的本地副本，不修改原文件。');
   } catch (error) {
     setNotice(error.message, 'error');
   }
+}
+
+function renderStrategyMeta(metadata) {
+  const version = metadata?.strategy_version || '--';
+  const source = metadata?.strategy_source || '--';
+  const hash = metadata?.strategy_hash ? metadata.strategy_hash.slice(0, 12) : '--';
+  $('strategy-meta').textContent = `策略版本：${version} · 来源：${source} · Hash：${hash}`;
 }
 
 async function loadJobs() {
@@ -1688,6 +1860,27 @@ async function submitBacktest(event) {
   event.preventDefault();
   try {
     const request = requestPayload();
+    const warning = await runStrategyWarning(request);
+    if (warning.should_warn) {
+      const message = formatStrategyWarning(warning);
+      if (!confirm(message)) {
+        setNotice('已取消运行。');
+        return;
+      }
+      if (warning.project_strategy_path) {
+        request.strategy_path = warning.project_strategy_path;
+        state.strategyPath = warning.project_strategy_path;
+        state.strategyMetadata = warning;
+        $('strategy-path').value = warning.project_strategy_path;
+        $('selected-strategy').textContent = warning.project_strategy_path;
+        renderStrategyMeta({
+          ...warning,
+          strategy_source: 'project_file',
+          strategy_version: warning.project_strategy_version || warning.strategy_version,
+          strategy_hash: warning.project_strategy_hash || warning.strategy_hash,
+        });
+      }
+    }
     setNotice('正在提交任务，后端会自动检查并补齐本地缓存...');
     const payload = await api('/api/backtests', {
       method: 'POST',
@@ -1698,6 +1891,21 @@ async function submitBacktest(event) {
   } catch (error) {
     setNotice(error.message, 'error');
   }
+}
+
+async function runStrategyWarning(request = requestPayload()) {
+  return api('/api/strategy-warning', {
+    method: 'POST',
+    body: JSON.stringify(request),
+  });
+}
+
+function formatStrategyWarning(warning) {
+  return [
+    `当前选择的是上传快照：${warning.strategy_version || '--'}`,
+    `项目原文件：${warning.project_strategy_path || '--'}，版本 ${warning.project_strategy_version || '--'}`,
+    '点击“确定”将改用项目原文件运行；点击“取消”停止本次回测。',
+  ].join('\\n');
 }
 
 async function runDataReadinessCheck(request = requestPayload()) {

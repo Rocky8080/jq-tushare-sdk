@@ -480,9 +480,19 @@ class JoinQuantHtmlReport:
             ("Run ID", str(manifest.run_id)),
             ("SDK版本", f"v{SDK_VERSION}"),
             ("策略文件", Path(config.strategy_path).name),
+            ("策略版本", str(getattr(config, "strategy_version", None) or "--")),
+            ("策略来源", str(getattr(config, "strategy_source", None) or "--")),
+            ("策略Hash", str(getattr(config, "strategy_hash", None) or "--")),
             ("回测区间", f"{config.start_date} 到 {config.end_date}"),
             ("缓存库", Path(str(config.cache_db)).name),
         ]
+        if getattr(config, "project_strategy_path", None):
+            run_items.extend(
+                [
+                    ("项目原文件", str(config.project_strategy_path)),
+                    ("项目原文件版本", str(getattr(config, "project_strategy_version", None) or "--")),
+                ]
+            )
         run_info = "\n".join(
             f"""
       <div class="run-item">
