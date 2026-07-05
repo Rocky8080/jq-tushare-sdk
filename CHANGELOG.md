@@ -4,6 +4,16 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.5] - 2026-07-05
+
+### Added
+
+- Add local dual moving-average momentum baseline strategy.
+
+### Changed
+
+- Avoid repeated sub-lot rebalancing in the dual moving-average baseline while the signal is unchanged.
+
 ## [0.10.4] - 2026-07-05
 
 ### Added
