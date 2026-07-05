@@ -706,7 +706,7 @@ class DataPortal:
         return result.reset_index(drop=True)
 
     def _apply_price_adjustment(self, df: pd.DataFrame, api_name: str, fq) -> pd.DataFrame:
-        if fq != "pre" or api_name != "daily" or df.empty:
+        if fq != "pre" or api_name not in {"daily", "fund_daily"} or df.empty:
             return df
         if "ts_code" not in df.columns or "trade_date" not in df.columns:
             return df
@@ -715,9 +715,10 @@ class DataPortal:
             return df
         start_date = str(df["trade_date"].min())
         end_date = str(df["trade_date"].max())
+        factor_api_name = "fund_adj" if api_name == "fund_daily" else "adj_factor"
         try:
             factors = self._fetch(
-                "adj_factor",
+                factor_api_name,
                 ts_code=ts_codes,
                 start_date=start_date,
                 end_date=end_date,

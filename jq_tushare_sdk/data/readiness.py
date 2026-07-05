@@ -30,12 +30,13 @@ _UPDATE_PRIORITY = {
     "daily": 2,
     "daily_basic": 3,
     "adj_factor": 4,
-    "fund_daily": 5,
-    "index_daily": 6,
-    "index_weight": 7,
-    "income": 8,
+    "fund_adj": 5,
+    "fund_daily": 6,
+    "index_daily": 7,
+    "index_weight": 8,
+    "income": 9,
 }
-_MARKET_DAILY_APIS = {"daily", "daily_basic", "adj_factor", "index_daily"}
+_MARKET_DAILY_APIS = {"daily", "daily_basic", "adj_factor", "fund_adj", "index_daily"}
 _REQUIRED_STOCK_BASIC_LIST_STATUSES = {"L", "D"}
 
 
@@ -284,30 +285,14 @@ class DataReadinessCheck:
         update_requests = []
         for symbol in symbols:
             ts_code = to_tushare_code(symbol)
-            try:
-                frame = self.backend.fetch(
-                    "fund_daily",
-                    ts_code=ts_code,
-                    start_date=start,
-                    end_date=end,
-                )
-            except Exception:
-                frame = None
-            min_date, max_date = _frame_date_bounds(frame, "trade_date")
-            if min_date is None or max_date is None:
-                missing.append(f"{symbol}({ts_code})")
-                update_requests.append(_update_request("fund_daily", start, end, ts_code=ts_code))
-                continue
-            if start < min_date:
-                missing.append(f"{symbol}({ts_code}) starts at {min_date}")
-                update_requests.append(_update_request("fund_daily", start, min_date, ts_code=ts_code))
-            if end > max_date:
-                missing.append(f"{symbol}({ts_code}) ends at {max_date}")
-                update_requests.append(_update_request("fund_daily", max_date, end, ts_code=ts_code))
+            for api_name in ("fund_daily", "fund_adj"):
+                api_missing, api_requests = self._check_symbol_daily_api(api_name, symbol, ts_code, start, end)
+                missing.extend(api_missing)
+                update_requests.extend(api_requests)
         if not missing:
             return None
         commands = [
-            "python -m jq_tushare_sdk.cli update-data --api fund_daily "
+            f"python -m jq_tushare_sdk.cli update-data --api {request.api_name} "
             f"--start {request.start_date} --end {request.end_date} --cache-db <cache_db> "
             f"--ts-code {dict(request.params).get('ts_code')}"
             for request in update_requests
@@ -315,12 +300,35 @@ class DataReadinessCheck:
         return ReadinessIssue(
             api_name="fund_daily",
             message=(
-                "Local cache has incomplete fund_daily data between "
+                "Local cache has incomplete fund_daily/fund_adj data between "
                 f"{config.start_date} and {config.end_date} for ETF/fund {', '.join(missing)}."
             ),
             suggestion=" && ".join(commands),
             update_requests=tuple(update_requests),
         )
+
+    def _check_symbol_daily_api(self, api_name: str, symbol: str, ts_code: str, start: str, end: str):
+        try:
+            frame = self.backend.fetch(
+                api_name,
+                ts_code=ts_code,
+                start_date=start,
+                end_date=end,
+            )
+        except Exception:
+            frame = None
+        min_date, max_date = _frame_date_bounds(frame, "trade_date")
+        if min_date is None or max_date is None:
+            return [f"{symbol}({ts_code}) {api_name}"], [_update_request(api_name, start, end, ts_code=ts_code)]
+        missing = []
+        update_requests = []
+        if start < min_date:
+            missing.append(f"{symbol}({ts_code}) {api_name} starts at {min_date}")
+            update_requests.append(_update_request(api_name, start, min_date, ts_code=ts_code))
+        if end > max_date:
+            missing.append(f"{symbol}({ts_code}) {api_name} ends at {max_date}")
+            update_requests.append(_update_request(api_name, max_date, end, ts_code=ts_code))
+        return missing, update_requests
 
     def _income_periods_for_range(self, end_date: str) -> list[str]:
         end = normalize_date(end_date)
