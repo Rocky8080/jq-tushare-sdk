@@ -4,6 +4,14 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.13] - 2026-07-05
+
+### Changed
+
+- Run initial weekly callbacks when the first backtest day is after the scheduled weekday
+- Match JoinQuant fixed-spread slippage by applying half the spread per trade side
+- Align `order_target_value` sizing and cash checks with JoinQuant's pre-slippage price basis
+
 ## [0.10.12] - 2026-07-05
 
 ### Changed

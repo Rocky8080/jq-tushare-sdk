@@ -237,13 +237,46 @@ class TestBroker(unittest.TestCase):
         order = broker.order_target_value("000001.XSHE", 10000.0)
 
         self.assertEqual(order.status, "filled")
-        self.assertEqual(order.amount, 400)
-        self.assertEqual(order.filled, 400)
-        self.assertEqual(context.portfolio.positions["000001.XSHE"].total_amount, 900)
-        self.assertAlmostEqual(context.portfolio.available_cash, 995.0)
+        self.assertEqual(order.amount, 500)
+        self.assertEqual(order.filled, 500)
+        self.assertEqual(context.portfolio.positions["000001.XSHE"].total_amount, 1000)
+        self.assertAlmostEqual(context.portfolio.available_cash, -5.0)
         self.assertEqual(len(broker.orders), 1)
         self.assertEqual(len(broker.trades), 1)
-        self.assertEqual(broker.trades[0].amount, 400)
+        self.assertEqual(broker.trades[0].amount, 500)
+
+    def test_order_target_value_sizes_buy_with_raw_price_before_slippage(self):
+        context = Context(Portfolio(1000000.0))
+        broker = Broker(
+            context,
+            FakePortal(price=1.756),
+            CostModel(open_commission=0.0003, min_commission=5.0, slippage_fixed=0.01),
+        )
+
+        order = broker.order_target_value("588000.XSHG", 500000.0)
+
+        self.assertEqual(order.status, "filled")
+        self.assertEqual(order.amount, 284700)
+        self.assertAlmostEqual(order.price, 1.761)
+        self.assertAlmostEqual(broker.trades[-1].value, 501356.7)
+        self.assertAlmostEqual(order.commission, 150.40701)
+
+    def test_order_target_value_cash_check_uses_raw_price_before_slippage(self):
+        context = Context(Portfolio(498492.89))
+        broker = Broker(
+            context,
+            FakePortal(price=3.981),
+            CostModel(open_commission=0.0003, min_commission=5.0, slippage_fixed=0.01),
+        )
+
+        order = broker.order_target_value("159915.XSHE", 500000.0)
+
+        self.assertEqual(order.status, "filled")
+        self.assertEqual(order.amount, 125200)
+        self.assertAlmostEqual(order.price, 3.986)
+        self.assertAlmostEqual(broker.trades[-1].value, 499047.2)
+        self.assertAlmostEqual(order.commission, 149.71416)
+        self.assertAlmostEqual(context.portfolio.available_cash, -704.02416)
 
     def test_order_value_sell_uses_sell_side_slippage_price(self):
         context = Context(
@@ -301,13 +334,13 @@ class TestBroker(unittest.TestCase):
         order = broker.order_target_value("000001.XSHE", 2000.0)
 
         self.assertEqual(order.status, "filled")
-        self.assertEqual(order.amount, -200)
-        self.assertEqual(order.filled, 200)
+        self.assertEqual(order.amount, -300)
+        self.assertEqual(order.filled, 300)
         self.assertAlmostEqual(order.price, 9.0)
-        self.assertAlmostEqual(context.portfolio.available_cash, 1793.2)
-        self.assertEqual(context.portfolio.positions["000001.XSHE"].total_amount, 300)
+        self.assertAlmostEqual(context.portfolio.available_cash, 2692.3)
+        self.assertEqual(context.portfolio.positions["000001.XSHE"].total_amount, 200)
         self.assertAlmostEqual(order.commission, 5.0)
-        self.assertAlmostEqual(order.stamp_tax, 1.8)
+        self.assertAlmostEqual(order.stamp_tax, 2.7)
 
     def test_order_target_uses_total_position_but_rejects_frozen_sell_amount(self):
         context = Context(
@@ -361,8 +394,8 @@ class TestBroker(unittest.TestCase):
         order = broker.order_target_value("000001.XSHE", 4600.0)
 
         self.assertEqual(order.status, "rejected")
-        self.assertEqual(order.amount, 0)
-        self.assertIn("zero amount", order.reason)
+        self.assertEqual(order.amount, -40)
+        self.assertIn("amount below lot", order.reason)
         self.assertEqual(context.portfolio.positions["000001.XSHE"].total_amount, 500)
         self.assertEqual(context.portfolio.positions["000001.XSHE"].closeable_amount, 500)
         self.assertEqual(context.portfolio.available_cash, 0.0)
@@ -472,6 +505,27 @@ class TestBroker(unittest.TestCase):
         self.assertAlmostEqual(order.price, 10.2)
         self.assertAlmostEqual(context.portfolio.available_cash, 98975.0)
         self.assertEqual(context.portfolio.positions["000001.XSHE"].total_amount, 100)
+
+    def test_fixed_slippage_uses_half_spread_for_each_side(self):
+        context = Context(Portfolio(100000.0))
+        context.portfolio.positions["000001.XSHE"] = Position(
+            code="000001.XSHE",
+            total_amount=100,
+            closeable_amount=100,
+            avg_cost=10.0,
+            price=10.0,
+        )
+        broker = Broker(
+            context,
+            FakePortal(price=10.0),
+            CostModel(min_commission=5.0, slippage_fixed=0.02),
+        )
+
+        buy_order = broker.order("000001.XSHE", 100)
+        sell_order = broker.order("000001.XSHE", -100)
+
+        self.assertAlmostEqual(buy_order.price, 10.01)
+        self.assertAlmostEqual(sell_order.price, 9.99)
 
     def test_open_callback_market_order_uses_open_price_with_slippage(self):
         context = Context(Portfolio(100000.0), current_dt=datetime(2024, 1, 2, 9, 30))

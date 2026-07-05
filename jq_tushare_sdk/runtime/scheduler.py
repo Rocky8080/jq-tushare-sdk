@@ -79,7 +79,7 @@ class Scheduler:
         if current_dt.weekday() + 1 == entry.weekday:
             return True
         if previous_dt is None:
-            return False
+            return current_dt.isoweekday() > entry.weekday
 
         previous_date = previous_dt.date() if hasattr(previous_dt, "date") else previous_dt
         current_date = current_dt.date()

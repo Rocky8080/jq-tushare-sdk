@@ -24,7 +24,16 @@ class Broker:
         self._order_seq = 0
         self._trade_seq = 0
 
-    def order(self, security, amount, style=None, **kwargs):
+    def order(
+        self,
+        security,
+        amount,
+        style=None,
+        *,
+        cash_check_price: float | None = None,
+        cash_check_includes_costs: bool = True,
+        **kwargs,
+    ):
         self._validate_kwargs(kwargs)
         self._validate_style(style)
 
@@ -50,7 +59,13 @@ class Broker:
         if side == "sell" and abs(rounded_amount) > closeable_amount:
             return self._reject(security, rounded_amount, price, "insufficient position")
 
-        return self._fill(security, rounded_amount, price)
+        return self._fill(
+            security,
+            rounded_amount,
+            price,
+            cash_check_price=cash_check_price,
+            cash_check_includes_costs=cash_check_includes_costs,
+        )
 
     def order_value(self, security, value, style=None, **kwargs):
         self._validate_kwargs(kwargs)
@@ -61,7 +76,16 @@ class Broker:
             amount = self._cash_safe_buy_amount(security, amount, price, float(value))
         return self.order(security, amount, style=style)
 
-    def order_target(self, security, amount, style=None, **kwargs):
+    def order_target(
+        self,
+        security,
+        amount,
+        style=None,
+        *,
+        cash_check_price: float | None = None,
+        cash_check_includes_costs: bool = True,
+        **kwargs,
+    ):
         self._validate_kwargs(kwargs)
         self._validate_style(style)
         current_amount = self._total_amount(security)
@@ -69,26 +93,38 @@ class Broker:
         if target_amount < 0:
             raise NotImplementedError("Negative target inventory is unsupported")
         delta = target_amount - current_amount
-        return self.order(security, delta, style=style)
+        return self.order(
+            security,
+            delta,
+            style=style,
+            cash_check_price=cash_check_price,
+            cash_check_includes_costs=cash_check_includes_costs,
+        )
 
     def order_target_value(self, security, value, style=None, **kwargs):
         self._validate_kwargs(kwargs)
         self._validate_style(style)
         current_amount = self._total_amount(security)
-        buy_price = self._price(security, 1, style)
-        sell_price = self._price(security, -1, style)
-        buy_target_amount = int(float(value) / buy_price) if buy_price > 0 else 0
-        sell_target_amount = int(float(value) / sell_price) if sell_price > 0 else 0
+        reference_price = self._reference_price(security, style)
+        buy_target_amount = int(float(value) / reference_price) if reference_price > 0 else 0
+        sell_target_amount = int(float(value) / reference_price) if reference_price > 0 else 0
 
         if buy_target_amount > current_amount:
-            price = buy_price
-            target_amount = buy_target_amount
-            budget = max(0.0, float(value) - current_amount * price)
-            target_amount = current_amount + self._cash_safe_buy_amount(
+            requested_delta = buy_target_amount - current_amount
+            safe_delta = self._cash_safe_buy_amount(
                 security,
-                target_amount - current_amount,
-                price,
-                budget,
+                requested_delta,
+                reference_price,
+                self.context.portfolio.available_cash,
+                include_costs=False,
+            )
+            target_amount = current_amount + safe_delta
+            return self.order_target(
+                security,
+                target_amount,
+                style=style,
+                cash_check_price=reference_price,
+                cash_check_includes_costs=False,
             )
         elif sell_target_amount < current_amount:
             target_amount = sell_target_amount
@@ -99,7 +135,15 @@ class Broker:
     def capture_target_portfolio(self, signal: dict):
         self.target_portfolio_signals.append(deepcopy(dict(signal)))
 
-    def _fill(self, security: str, amount: int, price: float):
+    def _fill(
+        self,
+        security: str,
+        amount: int,
+        price: float,
+        *,
+        cash_check_price: float | None = None,
+        cash_check_includes_costs: bool = True,
+    ):
         side = "buy" if amount > 0 else "sell"
         value = abs(amount) * price
         commission = self.cost_model.commission(value, side)
@@ -107,7 +151,12 @@ class Broker:
         transfer_fee = self.cost_model.transfer_fee(value, side, security)
         total_cost = commission + stamp_tax + transfer_fee
 
-        if side == "buy" and self.context.portfolio.available_cash < value + total_cost:
+        if side == "buy" and self.context.portfolio.available_cash < self._cash_check_outlay(
+            security,
+            amount,
+            cash_check_price if cash_check_price is not None else price,
+            include_costs=cash_check_includes_costs,
+        ):
             return self._reject(security, amount, price, "insufficient cash")
 
         order = self._order(
@@ -161,6 +210,16 @@ class Broker:
         if explicit_price is not None:
             return explicit_price
 
+        raw_price = self._raw_price(security)
+        return self._slipped_price(raw_price, amount)
+
+    def _reference_price(self, security: str, style=None) -> float:
+        explicit_price = self._style_price(style)
+        if explicit_price is not None:
+            return explicit_price
+        return self._raw_price(security)
+
+    def _raw_price(self, security: str) -> float:
         frame = self._portal_call(
             "get_price",
             security,
@@ -181,13 +240,17 @@ class Broker:
             raw_price = float(frame["close"].iloc[-1])
         if raw_price <= 0:
             raise NotImplementedError(f"Non-positive local {price_field} price for {security}")
+        return raw_price
+
+    def _slipped_price(self, raw_price: float, amount: int) -> float:
+        fixed_slip = self.cost_model.slippage_fixed / 2.0
         if amount > 0:
             return round(
-                raw_price * (1 + self.cost_model.slippage_rate) + self.cost_model.slippage_fixed,
+                raw_price * (1 + self.cost_model.slippage_rate) + fixed_slip,
                 4,
             )
         return round(
-            raw_price * (1 - self.cost_model.slippage_rate) - self.cost_model.slippage_fixed,
+            raw_price * (1 - self.cost_model.slippage_rate) - fixed_slip,
             4,
         )
 
@@ -233,7 +296,15 @@ class Broker:
         }
         return method(*args, **filtered_kwargs)
 
-    def _cash_safe_buy_amount(self, security: str, requested_amount: int, price: float, budget: float) -> int:
+    def _cash_safe_buy_amount(
+        self,
+        security: str,
+        requested_amount: int,
+        price: float,
+        budget: float,
+        *,
+        include_costs: bool = True,
+    ) -> int:
         if requested_amount <= 0 or price <= 0 or budget <= 0:
             return requested_amount
 
@@ -250,13 +321,18 @@ class Broker:
         while low <= high:
             mid = (low + high) // 2
             candidate = mid * lot
-            if self._buy_total_outlay(security, candidate, price) <= max_budget:
+            if self._cash_check_outlay(security, candidate, price, include_costs=include_costs) <= max_budget:
                 best = candidate
                 low = mid + 1
             else:
                 high = mid - 1
 
         return best if best > 0 else requested_amount
+
+    def _cash_check_outlay(self, security: str, amount: int, price: float, *, include_costs: bool = True) -> float:
+        if include_costs:
+            return self._buy_total_outlay(security, amount, price)
+        return abs(amount) * price
 
     def _buy_total_outlay(self, security: str, amount: int, price: float) -> float:
         value = abs(amount) * price

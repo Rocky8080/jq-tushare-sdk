@@ -144,6 +144,38 @@ class TestRuntime(unittest.TestCase):
             [],
         )
 
+    def test_scheduler_runs_weekly_on_first_backtest_day_after_weekday(self):
+        scheduler = Scheduler()
+
+        def weekly(_context):
+            return None
+
+        scheduler.run_weekly(weekly, weekday=1, time="open")
+
+        callbacks = scheduler.callbacks_for(
+            datetime(2026, 6, 2, 9, 30),
+            "open",
+            previous_dt=None,
+        )
+
+        self.assertEqual(callbacks, [weekly])
+
+    def test_scheduler_waits_when_first_backtest_day_precedes_weekday(self):
+        scheduler = Scheduler()
+
+        def weekly(_context):
+            return None
+
+        scheduler.run_weekly(weekly, weekday=5, time="open")
+
+        callbacks = scheduler.callbacks_for(
+            datetime(2026, 6, 2, 9, 30),
+            "open",
+            previous_dt=None,
+        )
+
+        self.assertEqual(callbacks, [])
+
     def test_scheduler_rejects_unsupported_kwargs(self):
         scheduler = Scheduler()
 

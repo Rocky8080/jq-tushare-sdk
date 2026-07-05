@@ -517,8 +517,8 @@ class TestJoinQuantAPI(unittest.TestCase):
         buy_order = broker.order("000001.XSHE", 100)
         sell_order = broker.order("000001.XSHE", -100)
 
-        self.assertAlmostEqual(buy_order.price, 10.61)
-        self.assertAlmostEqual(sell_order.price, 10.59)
+        self.assertAlmostEqual(buy_order.price, 10.605)
+        self.assertAlmostEqual(sell_order.price, 10.595)
 
     def test_set_slippage_rejects_unsupported_styles(self):
         class UnsupportedSlippage:
