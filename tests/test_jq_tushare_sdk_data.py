@@ -275,7 +275,7 @@ class TestDataLayer(unittest.TestCase):
         self.assertEqual(df["open"].tolist(), [3.2, 5.0])
         self.assertEqual(df["close"].tolist(), [3.2, 5.0])
         self.assertIn(
-            ("fund_adj", {"ts_code": "510300.SH", "start_date": "20240102", "end_date": "20240103"}),
+            ("fund_adj", {"start_date": "20240102", "end_date": "20240103"}),
             portal.backend.calls,
         )
 
@@ -343,6 +343,37 @@ class TestDataLayer(unittest.TestCase):
         self.assertEqual(backend.fetch_counts["daily"], 1)
         self.assertIn("start_date", backend.calls[0][1])
 
+    def test_get_price_reuses_date_range_cache_across_securities(self):
+        class CountingBackend(FakeBackend):
+            def __init__(self):
+                super().__init__()
+                self.fetch_counts = {}
+
+            def fetch(self, api_name, **params):
+                self.fetch_counts[api_name] = self.fetch_counts.get(api_name, 0) + 1
+                return super().fetch(api_name, **params)
+
+        backend = CountingBackend()
+        portal = DataPortal(backend)
+
+        first = portal.get_price(
+            "000001.XSHE",
+            start_date="20240102",
+            end_date="20240103",
+            fields="close",
+        )
+        second = portal.get_price(
+            "600000.XSHG",
+            start_date="20240102",
+            end_date="20240103",
+            fields="close",
+        )
+
+        self.assertEqual(first["close"].tolist(), [10.5, 10.2])
+        self.assertEqual(second["close"].tolist(), [20.4, 20.8])
+        self.assertEqual(backend.fetch_counts["daily"], 1)
+        self.assertNotIn("ts_code", backend.calls[0][1])
+
     def test_get_price_reuses_pre_adjustment_fetches_and_returns_copies(self):
         class CountingBackend(FakeBackend):
             def __init__(self):
@@ -375,6 +406,70 @@ class TestDataLayer(unittest.TestCase):
         self.assertEqual(second["close"].tolist(), [5.25, 10.2])
         self.assertEqual(backend.fetch_counts["daily"], 1)
         self.assertEqual(backend.fetch_counts["adj_factor"], 1)
+
+    def test_get_price_reuses_pre_adjustment_range_cache_across_batches(self):
+        class CountingBackend(FakeBackend):
+            def __init__(self):
+                super().__init__()
+                self.fetch_counts = {}
+
+            def fetch(self, api_name, **params):
+                self.fetch_counts[api_name] = self.fetch_counts.get(api_name, 0) + 1
+                return super().fetch(api_name, **params)
+
+        backend = CountingBackend()
+        portal = DataPortal(backend)
+
+        first = portal.get_price(
+            ["000001.XSHE", "600000.XSHG"],
+            start_date="20240102",
+            end_date="20240103",
+            fields=["close"],
+            fq="pre",
+        )
+        first.loc[0, "close"] = -999.0
+        second = portal.get_price(
+            ["600000.XSHG"],
+            start_date="20240102",
+            end_date="20240103",
+            fields=["close"],
+            fq="pre",
+        )
+
+        self.assertEqual(second["close"].tolist(), [20.4, 20.8])
+        self.assertEqual(backend.fetch_counts["daily"], 1)
+        self.assertEqual(backend.fetch_counts["adj_factor"], 1)
+
+    def test_get_price_reuses_final_result_cache_and_returns_copies(self):
+        class CountingPortal(DataPortal):
+            def __init__(self, backend):
+                super().__init__(backend)
+                self.adjustment_calls = 0
+
+            def _apply_price_adjustment(self, df, api_name: str, fq):
+                self.adjustment_calls += 1
+                return super()._apply_price_adjustment(df, api_name=api_name, fq=fq)
+
+        portal = CountingPortal(FakeBackend())
+
+        first = portal.get_price(
+            "000001.XSHE",
+            start_date="20240102",
+            end_date="20240103",
+            fields=["close"],
+            fq="pre",
+        )
+        first.loc[0, "close"] = -999.0
+        second = portal.get_price(
+            "000001.XSHE",
+            start_date="20240102",
+            end_date="20240103",
+            fields=["close"],
+            fq="pre",
+        )
+
+        self.assertEqual(second["close"].tolist(), [5.25, 10.2])
+        self.assertEqual(portal.adjustment_calls, 1)
 
     def test_get_trade_days_reuses_backend_fetch_cache(self):
         class CountingBackend(FakeBackend):
@@ -419,8 +514,7 @@ class TestDataLayer(unittest.TestCase):
         df_stock = portal.get_price("000001.XSHE", start_date="20240102", end_date="20240102", fields="close")
 
         self.assertEqual(portal.backend.calls[0][0], "index_daily")
-        self.assertEqual(portal.backend.calls[1][0], "index_daily")
-        self.assertEqual(portal.backend.calls[2][0], "daily")
+        self.assertEqual(portal.backend.calls[1][0], "daily")
         self.assertEqual(df_905["code"].tolist(), ["000905.XSHG"])
         self.assertEqual(df_852["code"].tolist(), ["000852.XSHG"])
         self.assertEqual(df_stock["code"].tolist(), ["000001.XSHE"])

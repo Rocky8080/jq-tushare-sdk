@@ -4,6 +4,12 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.14] - 2026-07-06
+
+### Changed
+
+- Optimize repeated get_price reads with date-range and result caches
+
 ## [0.10.13] - 2026-07-05
 
 ### Changed

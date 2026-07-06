@@ -47,6 +47,10 @@ class DataPortal:
         self.backend = backend
         self.optimize_data = bool(optimize_data)
         self._price_count_cache = {}
+        self._price_count_group_cache = {}
+        self._date_range_cache = {}
+        self._date_range_group_cache = {}
+        self._price_result_cache = {}
         self._fetch_cache = {}
         self._security_metadata_cache = None
         self._industry_cache = None
@@ -68,9 +72,35 @@ class DataPortal:
         fields = self._normalize_fields(fields)
         securities = self._normalize_securities(security)
         api_name = self._price_api_name(securities)
-        if count is not None and start_date is None and len(securities) == 1:
-            df = self._cached_count_price_frame(api_name, end_date=end_date, count=int(count))
-            df = self._filter_price_securities(df, securities)
+        result_cache_key = self._price_result_cache_key(
+            api_name=api_name,
+            securities=securities,
+            start_date=start_date,
+            end_date=end_date,
+            count=count,
+            fields=fields,
+            frequency=frequency,
+            fq=fq,
+        )
+        cached_result = self._price_result_cache.get(result_cache_key) if self.optimize_data else None
+        if cached_result is not None:
+            return cached_result.copy()
+        if count is not None and start_date is None and self.optimize_data and (
+            end_date is not None or len(securities) == 1
+        ):
+            df = self._cached_count_price_frame_for_securities(
+                api_name,
+                end_date=end_date,
+                count=int(count),
+                securities=securities,
+            )
+        elif count is None and self._can_use_range_price_cache(start_date, end_date):
+            df = self._cached_date_range_frame_for_ts_codes(
+                api_name,
+                start_date=normalize_date(start_date),
+                end_date=normalize_date(end_date),
+                ts_codes=[to_tushare_code(item) for item in securities],
+            )
         else:
             params = {"ts_code": ",".join(to_tushare_code(item) for item in securities)}
             if start_date:
@@ -84,7 +114,10 @@ class DataPortal:
         if count is not None:
             df = self._tail_per_security(df, int(count))
         df = self._apply_price_adjustment(df, api_name=api_name, fq=fq)
-        return self._format_price_frame(df, fields)
+        result = self._format_price_frame(df, fields)
+        if self.optimize_data:
+            self._price_result_cache[result_cache_key] = result.copy()
+        return result
 
     def get_trade_days(self, start_date=None, end_date=None, count=None):
         params = {"exchange": "SSE"}
@@ -397,6 +430,34 @@ class DataPortal:
         self._fetch_cache[cache_key] = frame.copy()
         return frame.copy()
 
+    def _cached_date_range_frame(self, api_name: str, *, start_date: str, end_date: str) -> pd.DataFrame:
+        cache_key = self._ensure_date_range_cache(api_name, start_date=start_date, end_date=end_date)
+        return self._date_range_cache[cache_key].copy()
+
+    def _cached_date_range_frame_for_ts_codes(
+        self,
+        api_name: str,
+        *,
+        start_date: str,
+        end_date: str,
+        ts_codes: list[str],
+    ) -> pd.DataFrame:
+        cache_key = self._ensure_date_range_cache(api_name, start_date=start_date, end_date=end_date)
+        frame = self._date_range_cache[cache_key]
+        groups = self._date_range_group_cache.get(cache_key)
+        return self._frame_for_ts_codes(frame, groups, ts_codes)
+
+    def _ensure_date_range_cache(self, api_name: str, *, start_date: str, end_date: str) -> tuple:
+        cache_key = (str(api_name), str(start_date), str(end_date))
+        if cache_key not in self._date_range_cache:
+            frame = self._fetch(api_name, start_date=start_date, end_date=end_date)
+            self._date_range_cache[cache_key] = frame.copy()
+            self._date_range_group_cache[cache_key] = self._group_by_ts_code(frame)
+        return cache_key
+
+    def _can_use_range_price_cache(self, start_date, end_date) -> bool:
+        return self.optimize_data and start_date is not None and end_date is not None
+
     def _freeze_params(self, params: dict) -> tuple:
         return tuple(
             (str(key), self._freeze_value(value))
@@ -409,6 +470,29 @@ class DataPortal:
         if isinstance(value, set):
             return tuple(sorted(self._freeze_value(item) for item in value))
         return str(value)
+
+    def _price_result_cache_key(
+        self,
+        *,
+        api_name: str,
+        securities: list[str],
+        start_date,
+        end_date,
+        count,
+        fields: list[str],
+        frequency: str,
+        fq,
+    ) -> tuple:
+        return (
+            str(api_name),
+            tuple(str(item) for item in securities),
+            normalize_date(start_date) if start_date is not None else "",
+            normalize_date(end_date) if end_date is not None else "",
+            "" if count is None else int(count),
+            tuple(str(field) for field in fields),
+            str(frequency),
+            "" if fq is None else str(fq),
+        )
 
     def _valuation_frame(self, date) -> pd.DataFrame:
         cache_key = normalize_date(date) if date is not None else ""
@@ -653,27 +737,71 @@ class DataPortal:
 
     def _cached_count_price_frame(self, api_name: str, end_date, count: int) -> pd.DataFrame:
         normalized_end = normalize_date(end_date) if end_date is not None else ""
-        cache_key = (api_name, normalized_end, int(count))
-        cached = self._price_count_cache.get(cache_key)
-        if cached is not None:
-            return cached.copy()
+        cache_key = self._ensure_count_price_cache(api_name, normalized_end, count, end_date=end_date)
+        return self._price_count_cache[cache_key].copy()
 
-        params = {}
-        if end_date is not None:
-            params["end_date"] = normalized_end
-            params["start_date"] = self._count_start_date(normalized_end, count)
-        df = self._fetch(api_name, **params)
-        if not df.empty:
-            self._validate_price_frame(df)
-            df = self._tail_per_security(df, int(count))
-        self._price_count_cache[cache_key] = df.copy()
-        return df.copy()
+    def _cached_count_price_frame_for_securities(
+        self,
+        api_name: str,
+        *,
+        end_date,
+        count: int,
+        securities: list[str],
+    ) -> pd.DataFrame:
+        normalized_end = normalize_date(end_date) if end_date is not None else ""
+        cache_key = self._ensure_count_price_cache(api_name, normalized_end, count, end_date=end_date)
+        frame = self._price_count_cache[cache_key]
+        groups = self._price_count_group_cache.get(cache_key)
+        return self._frame_for_ts_codes(frame, groups, [to_tushare_code(item) for item in securities])
+
+    def _count_price_cache_key(self, api_name: str, normalized_end: str, count: int) -> tuple:
+        return (str(api_name), str(normalized_end), int(count))
+
+    def _ensure_count_price_cache(self, api_name: str, normalized_end: str, count: int, *, end_date) -> tuple:
+        cache_key = self._count_price_cache_key(api_name, normalized_end, count)
+        if cache_key not in self._price_count_cache:
+            params = {}
+            if end_date is not None:
+                params["end_date"] = normalized_end
+                params["start_date"] = self._count_start_date(normalized_end, count)
+            df = self._fetch(api_name, **params)
+            if not df.empty:
+                self._validate_price_frame(df)
+                df = self._tail_per_security(df, int(count))
+            self._price_count_cache[cache_key] = df.copy()
+            self._price_count_group_cache[cache_key] = self._group_by_ts_code(df)
+        return cache_key
 
     def _filter_price_securities(self, df: pd.DataFrame, securities: list[str]) -> pd.DataFrame:
         if df.empty or "ts_code" not in df.columns:
             return df.copy()
         ts_codes = [to_tushare_code(item) for item in securities]
         return df[df["ts_code"].isin(ts_codes)].reset_index(drop=True)
+
+    def _group_by_ts_code(self, df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+        if df.empty or "ts_code" not in df.columns:
+            return {}
+        return {
+            str(code): group.reset_index(drop=True)
+            for code, group in df.groupby("ts_code", sort=False)
+        }
+
+    def _frame_for_ts_codes(
+        self,
+        frame: pd.DataFrame,
+        groups: dict[str, pd.DataFrame] | None,
+        ts_codes: list[str],
+    ) -> pd.DataFrame:
+        if frame.empty or "ts_code" not in frame.columns:
+            return frame.copy()
+        if len(ts_codes) > 100:
+            return frame[frame["ts_code"].isin(ts_codes)].reset_index(drop=True)
+        if not groups:
+            return frame[frame["ts_code"].isin(ts_codes)].reset_index(drop=True)
+        parts = [groups[code] for code in ts_codes if code in groups]
+        if not parts:
+            return frame.iloc[0:0].copy()
+        return pd.concat(parts, ignore_index=True).copy()
 
     def _count_start_date(self, normalized_end: str, count: int) -> str:
         lookback_days = max(int(count) * 3 + 7, 14)
@@ -717,9 +845,9 @@ class DataPortal:
         end_date = str(df["trade_date"].max())
         factor_api_name = "fund_adj" if api_name == "fund_daily" else "adj_factor"
         try:
-            factors = self._fetch(
+            factors = self._fetch_price_adjustment_factors(
                 factor_api_name,
-                ts_code=ts_codes,
+                ts_codes=ts_codes,
                 start_date=start_date,
                 end_date=end_date,
             )
@@ -746,6 +874,28 @@ class DataPortal:
             if column in result.columns:
                 result[column] = pd.to_numeric(result[column], errors="coerce") * scale
         return result.drop(columns=["adj_factor", "_latest_adj_factor"], errors="ignore")
+
+    def _fetch_price_adjustment_factors(
+        self,
+        factor_api_name: str,
+        *,
+        ts_codes: str,
+        start_date: str,
+        end_date: str,
+    ) -> pd.DataFrame:
+        if self.optimize_data and start_date and end_date:
+            return self._cached_date_range_frame_for_ts_codes(
+                factor_api_name,
+                start_date=start_date,
+                end_date=end_date,
+                ts_codes=str(ts_codes).split(","),
+            )
+        return self._fetch(
+            factor_api_name,
+            ts_code=ts_codes,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
     def _security_name_map(self) -> dict[str, str]:
         return {code: str(payload.get("name") or "") for code, payload in self._security_metadata_map().items()}
