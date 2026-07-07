@@ -132,37 +132,7 @@ def _refresh_html_risk_section(
     log_lines: list[str],
 ) -> None:
     report = JoinQuantHtmlReport()
-    risk_section = report._risk_section(
-        report._metrics(config, performance_rows, summary, trades),
-        report._equity_svg(performance_rows),
-        report._bar_svg(
-            performance_rows,
-            "daily_return",
-            positive="#5b8c3b",
-            negative="#6f5a8f",
-            value_format="percent",
-        ),
-        report._bar_svg(
-            performance_rows,
-            "positions_value",
-            positive="#1b8ea7",
-            negative="#c46f2f",
-            value_format="money",
-        ),
-        config,
-        performance_rows,
-        summary,
-    )
-    if path.is_file():
-        html = path.read_text(encoding="utf-8")
-        start = html.find('<section id="risk"')
-        end = html.find('<section id="trades"', start)
-        if start >= 0 and end > start:
-            updated = html[:start] + risk_section + "\n" + html[end:]
-            path.write_text(_refresh_sdk_version_text(updated), encoding="utf-8")
-            return
-
-    html = report.render(
+    fresh_html = report.render(
         config=config,
         manifest=manifest,
         performance_rows=performance_rows,
@@ -172,7 +142,46 @@ def _refresh_html_risk_section(
         log_lines=log_lines,
         security_names={},
     )
-    path.write_text(_refresh_sdk_version_text(html) + "\n", encoding="utf-8")
+    risk_section = _extract_between(fresh_html, '<section id="risk"', '<section id="trades"')
+    if path.is_file():
+        html = path.read_text(encoding="utf-8")
+        start = html.find('<section id="risk"')
+        end = html.find('<section id="trades"', start)
+        if start >= 0 and end > start and risk_section:
+            updated = html[:start] + risk_section + "\n" + html[end:]
+            updated = _refresh_html_assets(updated, fresh_html)
+            path.write_text(_refresh_sdk_version_text(updated), encoding="utf-8")
+            return
+
+    path.write_text(_refresh_sdk_version_text(fresh_html) + "\n", encoding="utf-8")
+
+
+def _extract_between(html: str, start_token: str, end_token: str) -> str:
+    start = html.find(start_token)
+    end = html.find(end_token, start)
+    return html[start:end] if start >= 0 and end > start else ""
+
+
+def _refresh_html_assets(html: str, fresh_html: str) -> str:
+    updated = _replace_tag_block(html, fresh_html, "style")
+    if updated is None:
+        return fresh_html
+    updated = _replace_tag_block(updated, fresh_html, "script")
+    return fresh_html if updated is None else updated
+
+
+def _replace_tag_block(target: str, source: str, tag: str) -> str | None:
+    start_token = f"<{tag}>"
+    end_token = f"</{tag}>"
+    source_start = source.find(start_token)
+    source_end = source.find(end_token, source_start)
+    target_start = target.find(start_token)
+    target_end = target.find(end_token, target_start)
+    if min(source_start, source_end, target_start, target_end) < 0:
+        return None
+    source_end += len(end_token)
+    target_end += len(end_token)
+    return target[:target_start] + source[source_start:source_end] + target[target_end:]
 
 
 def _refresh_sdk_version_text(html: str) -> str:

@@ -1,5 +1,6 @@
 import csv
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -171,6 +172,139 @@ class TestOutputManager(unittest.TestCase):
         self.assertIn('href="#risk"', html)
         self.assertIn('id="risk"', html)
 
+    def test_html_report_risk_section_includes_sharpe_and_turnover_metrics(self):
+        config = SimpleNamespace(
+            strategy_name="demo",
+            strategy_path="/repo/demo.py",
+            start_date="2026-06-01",
+            end_date="2026-06-03",
+            initial_cash=100000.0,
+            cache_db="/repo/data/cache.db",
+        )
+        manifest = SimpleNamespace(run_id="run-1")
+        daily_returns = [0.01, -0.01, 0.02]
+        performance_rows = [
+            {
+                "date": "2026-06-01",
+                "total_value": 100000.0,
+                "daily_return": daily_returns[0],
+                "cumulative_return": 0.01,
+                "drawdown": 0.0,
+            },
+            {
+                "date": "2026-06-02",
+                "total_value": 103000.0,
+                "daily_return": daily_returns[1],
+                "cumulative_return": 0.0,
+                "drawdown": -0.01,
+            },
+            {
+                "date": "2026-06-03",
+                "total_value": 105000.0,
+                "daily_return": daily_returns[2],
+                "cumulative_return": 0.05,
+                "drawdown": 0.0,
+            },
+        ]
+        trades = [
+            SimpleNamespace(value=50000.0, side="buy", commission=5.0, stamp_tax=0.0, transfer_fee=0.0),
+            SimpleNamespace(value=-25000.0, side="sell", commission=3.0, stamp_tax=2.5, transfer_fee=0.0),
+        ]
+
+        html = JoinQuantHtmlReport().render(
+            config=config,
+            manifest=manifest,
+            performance_rows=performance_rows,
+            summary={"final_value": 105000.0, "trade_count": 2, "order_count": 2},
+            trades=trades,
+            position_rows=[],
+            log_lines=[],
+            security_names={},
+        )
+
+        mean_return = sum(daily_returns) / len(daily_returns)
+        sample_std = (
+            sum((value - mean_return) ** 2 for value in daily_returns) / (len(daily_returns) - 1)
+        ) ** 0.5
+        sharpe = mean_return / sample_std * math.sqrt(252)
+
+        self.assertIn('id="sharpe-ratio"', html)
+        self.assertIn("夏普比率", html)
+        self.assertIn(f"{sharpe:.3f}", html)
+        self.assertIn('id="capital-turnover"', html)
+        self.assertIn("资金换手率", html)
+        self.assertIn("73.05%", html)
+        self.assertIn('id="daily-turnover"', html)
+        self.assertIn("日均换手率", html)
+        self.assertIn("24.35%", html)
+        self.assertLess(html.index('id="benchmark-return"'), html.index('id="sharpe-ratio"'))
+        self.assertLess(html.index('id="volatility"'), html.index('id="capital-turnover"'))
+
+    def test_html_report_charts_expose_hover_tooltip_data(self):
+        config = SimpleNamespace(
+            strategy_name="demo",
+            strategy_path="/repo/demo.py",
+            start_date="2026-06-01",
+            end_date="2026-06-02",
+            initial_cash=100000.0,
+            cache_db="/repo/data/cache.db",
+        )
+        manifest = SimpleNamespace(run_id="run-1")
+        performance_rows = [
+            {
+                "date": "2026-06-01",
+                "total_value": 101000.0,
+                "cash": 21000.0,
+                "positions_value": 80000.0,
+                "daily_return": 0.01,
+                "cumulative_return": 0.01,
+                "benchmark_return": 0.005,
+                "excess_return": 0.005,
+                "drawdown": 0.0,
+            },
+            {
+                "date": "2026-06-02",
+                "total_value": 99000.0,
+                "cash": 19000.0,
+                "positions_value": 80000.0,
+                "daily_return": -0.019802,
+                "cumulative_return": -0.01,
+                "benchmark_return": -0.003,
+                "excess_return": -0.007,
+                "drawdown": -0.019802,
+            },
+        ]
+
+        html = JoinQuantHtmlReport().render(
+            config=config,
+            manifest=manifest,
+            performance_rows=performance_rows,
+            summary={
+                "final_value": 99000.0,
+                "benchmark_return": -0.003,
+                "excess_return": -0.007,
+                "trade_count": 0,
+                "order_count": 0,
+            },
+            trades=[],
+            position_rows=[],
+            log_lines=[],
+            security_names={},
+        )
+
+        self.assertIn('class="chart-svg interactive-chart"', html)
+        self.assertIn('data-chart-point="1"', html)
+        self.assertIn('data-tooltip-lines=', html)
+        self.assertIn("日期：2026-06-02", html)
+        self.assertIn("当日收益：-1.98%", html)
+        self.assertIn("策略收益：-1.00%", html)
+        self.assertIn("基准收益：-0.30%", html)
+        self.assertIn("总权益：99,000.00", html)
+        self.assertIn("持仓市值：80,000.00", html)
+        self.assertIn("chart-tooltip", html)
+        self.assertIn("showChartTooltip", html)
+        self.assertIn("chart-hover-line", html)
+
     def test_refresh_backtest_report_recalculates_historical_benchmark_metrics(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "run-1"
@@ -260,6 +394,9 @@ class TestOutputManager(unittest.TestCase):
         self.assertIn(f"SDK v{jq_tushare_sdk.__version__}", html)
         self.assertIn(f"<strong>v{jq_tushare_sdk.__version__}</strong>", html)
         self.assertNotIn("SDK v0.6.8", html)
+        self.assertIn("interactive-chart", html)
+        self.assertIn("chart-tooltip", html)
+        self.assertIn("showChartTooltip", html)
 
 
 if __name__ == "__main__":

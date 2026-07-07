@@ -253,7 +253,7 @@ http://127.0.0.1:8787/report.html
 
 ## Versioning
 
-当前版本：`v0.10.14`
+当前版本：`v0.10.17`
 
 版本号遵循 Semantic Versioning：
 
@@ -293,6 +293,8 @@ python -m unittest discover -s tests -p "test_*.py"
 - 本地数据库缓存
 - 回测输出目录
 - `.jqts_web/` Web 控制台临时策略副本
+- `experiments/` 本地实验目录和个人策略
+- `examples/private/`、`strategies/` 等私有策略目录
 - 大型日志、临时 CSV、下载文件
 
-建议通过环境变量传入 token，不要把 token 写进代码或配置文件。
+建议通过环境变量传入 token，不要把 token 写进代码或配置文件。个人实验策略应放在 `experiments/`、`examples/private/` 或仓库外目录；这些路径默认不会提交或发布。

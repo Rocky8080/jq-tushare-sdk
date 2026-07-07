@@ -4,6 +4,24 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.17] - 2026-07-07
+
+### Changed
+
+- Ignore local experiment strategies and document private strategy handling.
+
+## [0.10.16] - 2026-07-07
+
+### Changed
+
+- Add interactive hover tooltips for report charts.
+
+## [0.10.15] - 2026-07-07
+
+### Changed
+
+- Add Sharpe ratio and capital turnover metrics to risk report.
+
 ## [0.10.14] - 2026-07-06
 
 ### Changed

@@ -54,6 +54,7 @@ MANIFEST
 .vscode/
 
 # Private strategy/program files should live outside this SDK repository.
+experiments/
 examples/private/
 strategies/
 *.secret.*

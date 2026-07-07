@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import math
 from collections import defaultdict
 from datetime import datetime
 from html import escape
@@ -529,6 +531,11 @@ class JoinQuantHtmlReport:
         annualized = (1 + cumulative) ** (252 / day_count) - 1 if cumulative > -1 else None
         daily_returns = [self._to_float(row.get("daily_return")) for row in performance_rows]
         drawdowns = [self._to_float(row.get("drawdown")) for row in performance_rows]
+        sharpe = self._annualized_sharpe(daily_returns)
+        turnover_base = self._average_equity(performance_rows, initial_cash, final_value)
+        total_trade_value = sum(abs(float(getattr(trade, "value", 0.0) or 0.0)) for trade in trades)
+        capital_turnover = total_trade_value / turnover_base if turnover_base else None
+        daily_turnover = capital_turnover / day_count if capital_turnover is not None else None
         total_cost = sum(
             sum(float(getattr(trade, attr, 0.0) or 0.0) for attr in ("commission", "stamp_tax", "transfer_fee"))
             for trade in trades
@@ -541,14 +548,17 @@ class JoinQuantHtmlReport:
             {"anchor": "annual-return", "label": "策略年化收益", "value": self._percent(annualized), "tone": self._tone(annualized)},
             {"anchor": "excess-return", "label": "超额收益", "value": self._placeholder(summary.get("excess_return")), "tone": self._tone(self._optional_float(summary.get("excess_return")))},
             {"anchor": "benchmark-return", "label": "基准收益", "value": self._placeholder(summary.get("benchmark_return")), "tone": self._tone(self._optional_float(summary.get("benchmark_return")))},
+            {"anchor": "sharpe-ratio", "label": "夏普比率", "value": self._ratio_placeholder(sharpe), "tone": self._tone(sharpe)},
+            {"anchor": "max-drawdown", "label": "最大回撤", "value": self._percent(min(drawdowns) if drawdowns else 0.0), "tone": "negative"},
             {"anchor": "alpha", "label": "阿尔法", "value": self._placeholder(summary.get("alpha")), "tone": self._tone(self._optional_float(summary.get("alpha")))},
             {"anchor": "beta", "label": "贝塔", "value": self._ratio_placeholder(summary.get("beta")), "tone": "normal"},
+            {"anchor": "volatility", "label": "策略波动率", "value": self._percent(self._sample_std(daily_returns)), "tone": "normal"},
+            {"anchor": "capital-turnover", "label": "资金换手率", "value": self._percent(capital_turnover), "tone": "normal"},
+            {"anchor": "daily-turnover", "label": "日均换手率", "value": self._percent(daily_turnover), "tone": "normal"},
+            {"anchor": "cost", "label": "手续费税费", "value": self._money(total_cost), "tone": "normal"},
             {"anchor": "trade-count", "label": "成交次数", "value": str(summary.get("trade_count", len(trades))), "tone": "normal"},
             {"anchor": "order-count", "label": "订单次数", "value": str(summary.get("order_count", 0)), "tone": "normal"},
-            {"anchor": "max-drawdown", "label": "最大回撤", "value": self._percent(min(drawdowns) if drawdowns else 0.0), "tone": "negative"},
-            {"anchor": "cost", "label": "手续费税费", "value": self._money(total_cost), "tone": "normal"},
             {"anchor": "win-days", "label": "上涨/下跌日", "value": f"{positive_days}/{negative_days}", "tone": "normal"},
-            {"anchor": "volatility", "label": "策略波动率", "value": self._percent(self._sample_std(daily_returns)), "tone": "normal"},
         ]
 
     def _equity_svg(self, rows: list[dict]) -> str:
@@ -565,7 +575,7 @@ class JoinQuantHtmlReport:
         width = 1080
         height = 270
         pad = 42
-        return self._multi_line_svg(series, dates, width, height, pad)
+        return self._multi_line_svg(series, dates, width, height, pad, rows)
 
     def _multi_line_svg(
         self,
@@ -574,6 +584,7 @@ class JoinQuantHtmlReport:
         width: int,
         height: int,
         pad: int,
+        rows: list[dict],
     ) -> str:
         all_values = [value for _, values in series for value in values]
         if not all_values:
@@ -612,15 +623,20 @@ class JoinQuantHtmlReport:
             )
             for name, values in series
         )
+        x_positions = [x(index) for index in range(len(dates))]
+        tooltip_lines = [self._equity_tooltip_lines(row) for row in rows]
+        hit_rects = self._chart_hit_rects(x_positions, pad, height - pad, pad, width - pad, tooltip_lines)
         first_date = escape(dates[0])
         last_date = escape(dates[-1])
         return f"""
-<svg class="chart-svg" viewBox="0 0 {width} {height}" role="img" aria-label="策略收益曲线">
+<svg class="chart-svg interactive-chart" viewBox="0 0 {width} {height}" role="img" aria-label="策略收益曲线" data-chart-title="策略收益曲线">
   {grid}
   {vertical}
   <line x1="{pad}" y1="{zero_y:.1f}" x2="{width - pad}" y2="{zero_y:.1f}" class="axis-zero" />
   <polygon points="{area_points}" class="equity-area" />
   {polylines}
+  <line x1="{pad}" y1="{pad}" x2="{pad}" y2="{height - pad}" class="chart-hover-line" />
+  {hit_rects}
   <text x="{pad}" y="{height - 12}" class="axis-label">{first_date}</text>
   <text x="{width - pad - 90}" y="{height - 12}" class="axis-label">{last_date}</text>
   <text x="{width - pad + 8}" y="{y(high):.1f}" class="axis-label">{escape(self._percent(high))}</text>
@@ -669,21 +685,95 @@ class JoinQuantHtmlReport:
         mid_y = height / 2
         bar_w = max(3.0, inner_w / max(1, len(values)) * 0.36)
         bars = []
+        x_positions = []
         for index, value in enumerate(values):
             x = pad + inner_w * (index + 0.5) / len(values) - bar_w / 2
+            x_positions.append(x + bar_w / 2)
             bar_h = abs(value) / max_abs * (height / 2 - 18)
             y = mid_y - bar_h if value >= 0 else mid_y
             color = positive if value >= 0 else negative
             bars.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w:.1f}" height="{bar_h:.1f}" fill="{color}" />')
         upper_label = self._percent(max_abs) if value_format == "percent" else self._compact_money(max_abs)
         lower_label = self._percent(-max_abs) if value_format == "percent" else self._compact_money(-max_abs)
+        tooltip_lines = [self._bar_tooltip_lines(row, field, value_format) for row in rows]
+        hit_rects = self._chart_hit_rects(x_positions, 8, height - 8, pad, width - pad, tooltip_lines)
         return f"""
-<svg class="chart-svg" viewBox="0 0 {width} {height}" role="img" aria-label="{escape(field)}">
+<svg class="chart-svg interactive-chart" viewBox="0 0 {width} {height}" role="img" aria-label="{escape(field)}" data-chart-title="{escape(self._chart_field_label(field))}">
   <line x1="{pad}" y1="{mid_y:.1f}" x2="{width - pad}" y2="{mid_y:.1f}" class="axis-zero" />
   {''.join(bars)}
+  <line x1="{pad}" y1="8" x2="{pad}" y2="{height - 8}" class="chart-hover-line" />
+  {hit_rects}
   <text x="{width - pad + 8}" y="{mid_y - 8:.1f}" class="axis-label">{escape(upper_label)}</text>
   <text x="{width - pad + 8}" y="{mid_y + 18:.1f}" class="axis-label">{escape(lower_label)}</text>
 </svg>"""
+
+    def _chart_hit_rects(
+        self,
+        x_positions: list[float],
+        top: float,
+        bottom: float,
+        left_bound: float,
+        right_bound: float,
+        tooltip_lines: list[list[str]],
+    ) -> str:
+        rects = []
+        for index, point_x in enumerate(x_positions):
+            left = left_bound if index == 0 else (x_positions[index - 1] + point_x) / 2
+            right = right_bound if index == len(x_positions) - 1 else (point_x + x_positions[index + 1]) / 2
+            lines = tooltip_lines[index] if index < len(tooltip_lines) else []
+            aria_label = "，".join(lines)
+            rects.append(
+                '<rect class="chart-hit-rect" '
+                f'x="{left:.1f}" y="{top:.1f}" width="{max(1.0, right - left):.1f}" height="{max(1.0, bottom - top):.1f}" '
+                f'data-chart-point="1" data-x="{point_x:.1f}" data-tooltip-lines="{self._json_attr(lines)}" '
+                f'tabindex="0" aria-label="{escape(aria_label, quote=True)}" />'
+            )
+        return "\n  ".join(rects)
+
+    def _equity_tooltip_lines(self, row: dict) -> list[str]:
+        lines = [f"日期：{row.get('date') or '--'}"]
+        self._append_percent_line(lines, "当日收益", row.get("daily_return"))
+        self._append_percent_line(lines, "策略收益", row.get("cumulative_return"))
+        self._append_percent_line(lines, "基准收益", row.get("benchmark_return"))
+        self._append_percent_line(lines, "超额收益", row.get("excess_return"))
+        self._append_money_line(lines, "总权益", row.get("total_value"))
+        self._append_money_line(lines, "持仓市值", row.get("positions_value"))
+        return lines
+
+    def _bar_tooltip_lines(self, row: dict, field: str, value_format: str) -> list[str]:
+        lines = [f"日期：{row.get('date') or '--'}"]
+        label = self._chart_field_label(field)
+        value = row.get(field)
+        if value_format == "percent":
+            self._append_percent_line(lines, label, value)
+        else:
+            self._append_money_line(lines, label, value)
+        if field != "daily_return":
+            self._append_percent_line(lines, "当日收益", row.get("daily_return"))
+        if field != "positions_value":
+            self._append_money_line(lines, "持仓市值", row.get("positions_value"))
+        self._append_money_line(lines, "总权益", row.get("total_value"))
+        return lines
+
+    def _chart_field_label(self, field: str) -> str:
+        labels = {
+            "daily_return": "当日收益",
+            "positions_value": "持仓市值",
+            "cash": "现金",
+            "total_value": "总权益",
+        }
+        return labels.get(field, field)
+
+    def _append_percent_line(self, lines: list[str], label: str, value) -> None:
+        if self._has_metric_value(value):
+            lines.append(f"{label}：{self._percent(self._to_float(value))}")
+
+    def _append_money_line(self, lines: list[str], label: str, value) -> None:
+        if self._has_metric_value(value):
+            lines.append(f"{label}：{self._money(self._to_float(value))}")
+
+    def _json_attr(self, value) -> str:
+        return escape(json.dumps(value, ensure_ascii=False), quote=True)
 
     def _group_dicts_by_date(self, rows: list[dict]) -> dict[str, list[dict]]:
         grouped = defaultdict(list)
@@ -766,6 +856,9 @@ class JoinQuantHtmlReport:
             return None
         return self._to_float(value)
 
+    def _has_metric_value(self, value) -> bool:
+        return value not in (None, "", "unsupported_placeholder")
+
     def _number_class(self, value) -> str:
         number = self._to_float(value)
         if number > 0:
@@ -823,6 +916,26 @@ class JoinQuantHtmlReport:
         mean = sum(values) / len(values)
         variance = sum((value - mean) ** 2 for value in values) / (len(values) - 1)
         return variance ** 0.5
+
+    def _annualized_sharpe(self, daily_returns: list[float]):
+        if len(daily_returns) < 2:
+            return None
+        volatility = self._sample_std(daily_returns)
+        if volatility <= 0:
+            return None
+        return sum(daily_returns) / len(daily_returns) / volatility * math.sqrt(252)
+
+    def _average_equity(self, rows: list[dict], initial_cash: float, final_value: float) -> float:
+        values = [
+            self._to_float(row.get("total_value"))
+            for row in rows
+            if row.get("total_value") not in (None, "")
+        ]
+        positive_values = [value for value in values if value > 0]
+        if positive_values:
+            return sum(positive_values) / len(positive_values)
+        fallback_values = [value for value in (initial_cash, final_value) if value > 0]
+        return sum(fallback_values) / len(fallback_values) if fallback_values else 0.0
 
     def _duration(self, value) -> str:
         seconds = self._to_float(value)
@@ -951,6 +1064,120 @@ class JoinQuantHtmlReport:
     window.requestAnimationFrame(syncActiveFromScroll);
   }, { passive: true });
   syncActiveFromScroll();
+})();
+
+(() => {
+  const tooltip = document.createElement('div');
+  tooltip.className = 'chart-tooltip';
+  tooltip.setAttribute('role', 'status');
+  tooltip.setAttribute('aria-live', 'polite');
+  document.body.appendChild(tooltip);
+
+  const hideChartTooltip = () => {
+    tooltip.classList.remove('visible');
+    document.querySelectorAll('.chart-hover-line').forEach((line) => {
+      line.style.display = 'none';
+    });
+  };
+
+  const tooltipLines = (point) => {
+    try {
+      return JSON.parse(point.dataset.tooltipLines || '[]');
+    } catch (_error) {
+      return [];
+    }
+  };
+
+  const renderTooltip = (lines) => {
+    tooltip.replaceChildren();
+    if (!lines.length) return;
+    const title = document.createElement('div');
+    title.className = 'chart-tooltip-title';
+    title.textContent = lines[0];
+    tooltip.appendChild(title);
+    lines.slice(1).forEach((line) => {
+      const row = document.createElement('div');
+      row.className = 'chart-tooltip-row';
+      const splitAt = line.indexOf('：');
+      const label = document.createElement('span');
+      const value = document.createElement('strong');
+      if (splitAt >= 0) {
+        label.textContent = line.slice(0, splitAt);
+        value.textContent = line.slice(splitAt + 1);
+      } else {
+        label.textContent = line;
+        value.textContent = '';
+      }
+      row.append(label, value);
+      tooltip.appendChild(row);
+    });
+  };
+
+  const positionTooltip = (clientX, clientY) => {
+    const gap = 14;
+    tooltip.classList.add('visible');
+    const box = tooltip.getBoundingClientRect();
+    const left = Math.min(window.innerWidth - box.width - gap, clientX + gap);
+    const top = Math.min(window.innerHeight - box.height - gap, clientY + gap);
+    tooltip.style.left = `${Math.max(gap, left)}px`;
+    tooltip.style.top = `${Math.max(gap, top)}px`;
+  };
+
+  const showChartTooltip = (point, clientX, clientY) => {
+    const lines = tooltipLines(point);
+    if (!lines.length) {
+      hideChartTooltip();
+      return;
+    }
+    renderTooltip(lines);
+    document.querySelectorAll('.chart-hover-line').forEach((line) => {
+      line.style.display = 'none';
+    });
+    const marker = point.ownerSVGElement?.querySelector('.chart-hover-line');
+    if (marker) {
+      const x = point.dataset.x || '0';
+      marker.setAttribute('x1', x);
+      marker.setAttribute('x2', x);
+      marker.style.display = 'block';
+    }
+    positionTooltip(clientX, clientY);
+  };
+
+  const pointFromEvent = (event) => {
+    const target = event.target;
+    return target instanceof Element ? target.closest('[data-chart-point]') : null;
+  };
+
+  document.addEventListener('mousemove', (event) => {
+    const point = pointFromEvent(event);
+    if (point) {
+      showChartTooltip(point, event.clientX, event.clientY);
+    } else if (!(event.target instanceof Element && event.target.closest('.interactive-chart'))) {
+      hideChartTooltip();
+    }
+  });
+
+  document.addEventListener('focusin', (event) => {
+    const point = pointFromEvent(event);
+    if (!point) return;
+    const rect = point.getBoundingClientRect();
+    showChartTooltip(point, rect.left + rect.width / 2, rect.top + rect.height / 2);
+  });
+
+  document.addEventListener('focusout', (event) => {
+    if (pointFromEvent(event)) hideChartTooltip();
+  });
+
+  document.addEventListener('touchstart', (event) => {
+    const point = pointFromEvent(event);
+    const touch = event.touches[0];
+    if (point && touch) {
+      showChartTooltip(point, touch.clientX, touch.clientY);
+    }
+  }, { passive: true });
+
+  window.addEventListener('scroll', hideChartTooltip, { passive: true });
+  window.addEventListener('resize', hideChartTooltip);
 })();
 </script>"""
 
@@ -1122,6 +1349,58 @@ h2 { margin: 3px 0 0; color: #0c2d48; font-size: 20px; line-height: 1.25; }
 }
 .chart-caption { padding: 8px 0 6px; color: #5c6874; font-weight: 800; }
 .chart-svg { display: block; width: 100%; height: auto; overflow: visible; }
+.interactive-chart { touch-action: manipulation; }
+.chart-hit-rect {
+  fill: transparent;
+  cursor: crosshair;
+  pointer-events: all;
+}
+.chart-hit-rect:focus { outline: none; }
+.chart-hover-line {
+  display: none;
+  stroke: var(--blue);
+  stroke-width: 1.4;
+  stroke-dasharray: 4 4;
+  pointer-events: none;
+}
+.chart-tooltip {
+  position: fixed;
+  z-index: 90;
+  min-width: 190px;
+  max-width: min(280px, calc(100vw - 28px));
+  padding: 10px 12px;
+  border: 1px solid #cfd9e4;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, .98);
+  box-shadow: 0 10px 28px rgba(20, 35, 50, .16);
+  color: #263441;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(4px);
+  transition: opacity .12s ease, transform .12s ease;
+}
+.chart-tooltip.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+.chart-tooltip-title {
+  margin-bottom: 6px;
+  color: #0c2d48;
+  font-weight: 800;
+}
+.chart-tooltip-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 18px;
+  min-height: 22px;
+  color: #5d6874;
+}
+.chart-tooltip-row strong {
+  color: #22303d;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 .grid { stroke: var(--grid); stroke-width: 1; }
 .axis-zero { stroke: #30363d; stroke-width: 1.2; }
 .equity-area { fill: rgba(71, 120, 179, 0.18); }
