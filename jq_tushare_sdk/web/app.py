@@ -656,18 +656,21 @@ def _run_local_backtest(config: BacktestConfig) -> RunManifest:
         token=os.environ.get("TUSHARE_TOKEN"),
         cache_mode="strict_local",
     )
-    issues = _readiness_issues(config, backend=backend)
-    if issues:
-        from jq_tushare_sdk.data.readiness import update_missing_data
-
-        try:
-            update_missing_data(backend, issues)
-        except Exception as exc:
-            raise RuntimeError(_format_readiness_error(config, issues, f"Automatic data update failed: {exc}")) from exc
+    try:
         issues = _readiness_issues(config, backend=backend)
-    if issues:
-        raise RuntimeError(_format_readiness_error(config, issues, "Local cache is not ready after automatic update:"))
-    return BacktestEngine(config, backend=backend).run()
+        if issues:
+            from jq_tushare_sdk.data.readiness import update_missing_data
+
+            try:
+                update_missing_data(backend, issues)
+            except Exception as exc:
+                raise RuntimeError(_format_readiness_error(config, issues, f"Automatic data update failed: {exc}")) from exc
+            issues = _readiness_issues(config, backend=backend)
+        if issues:
+            raise RuntimeError(_format_readiness_error(config, issues, "Local cache is not ready after automatic update:"))
+        return BacktestEngine(config, backend=backend).run()
+    finally:
+        _close_backend(backend)
 
 
 def _check_data_readiness(config: BacktestConfig, *, backend=None) -> list[dict]:
@@ -684,6 +687,10 @@ def _readiness_issues(config: BacktestConfig, *, backend=None):
             token=os.environ.get("TUSHARE_TOKEN"),
             cache_mode="strict_local",
         )
+        try:
+            return DataReadinessCheck(backend).check_required(config, _REQUIRED_LOCAL_APIS)
+        finally:
+            _close_backend(backend)
     return DataReadinessCheck(backend).check_required(config, _REQUIRED_LOCAL_APIS)
 
 
@@ -716,7 +723,16 @@ def _refresh_report_request(run_store: RunStore, cache_db: Path, payload: dict) 
         token=os.environ.get("TUSHARE_TOKEN"),
         cache_mode="strict_local",
     )
-    return refresh_backtest_report(run_store._safe_run_dir(run_id), backend=backend)
+    try:
+        return refresh_backtest_report(run_store._safe_run_dir(run_id), backend=backend)
+    finally:
+        _close_backend(backend)
+
+
+def _close_backend(backend) -> None:
+    close = getattr(backend, "close", None)
+    if close is not None:
+        close()
 
 
 def _render_app_html(project_root: Path, cache_db: Path, output_dir: Path) -> str:

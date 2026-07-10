@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -212,6 +213,8 @@ class TushareCacheBackend:
         self.request_interval = float(request_interval)
         self._pro = None
         self._last_request_ts = 0.0
+        self._read_conn = None
+        self._read_lock = threading.RLock()
         self._ensure_schema()
 
     @classmethod
@@ -377,7 +380,16 @@ class TushareCacheBackend:
                     conn.execute(
                         f"CREATE INDEX IF NOT EXISTS idx_{spec.table}_{key} ON {spec.table}({key})"
                     )
+                table_columns = self._table_columns(conn, spec.table)
+                if {"trade_date", "ts_code"}.issubset(table_columns):
+                    conn.execute(
+                        f"CREATE INDEX IF NOT EXISTS idx_{spec.table}_trade_date_ts_code "
+                        f"ON {spec.table}(trade_date, ts_code)"
+                    )
             conn.commit()
+
+    def _table_columns(self, conn: sqlite3.Connection, table: str) -> set[str]:
+        return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
     def _create_table_sql(self, spec: ApiSpec) -> str:
         column_defs = []
@@ -528,8 +540,27 @@ class TushareCacheBackend:
         self._last_request_ts = time.time()
 
     def _read_sql(self, sql: str, params: list) -> pd.DataFrame:
-        with self._connect() as conn:
+        with self._read_lock:
+            conn = self._reader()
             return pd.read_sql_query(sql, conn, params=params)
+
+    def _reader(self):
+        with self._read_lock:
+            if self._read_conn is None:
+                uri = Path(self.cache_db).resolve().as_uri() + "?mode=ro"
+                conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+                conn.execute("PRAGMA query_only=ON")
+                conn.execute("PRAGMA temp_store=MEMORY")
+                conn.execute("PRAGMA cache_size=-131072")
+                conn.execute("PRAGMA mmap_size=268435456")
+                self._read_conn = conn
+            return self._read_conn
+
+    def close(self) -> None:
+        with self._read_lock:
+            if self._read_conn is not None:
+                self._read_conn.close()
+                self._read_conn = None
 
     def _table_exists(self, table: str) -> bool:
         with self._connect() as conn:

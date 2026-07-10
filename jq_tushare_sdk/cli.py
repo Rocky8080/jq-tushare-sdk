@@ -77,22 +77,25 @@ def main(argv=None):
             token=os.environ.get("TUSHARE_TOKEN"),
             cache_mode="api_first",
         )
-        if args.ts_code:
-            apis = args.apis or ["index_daily"]
-            counts = {
-                api_name: backend.update_data(
-                    api_name,
-                    start_date=args.start,
-                    end_date=args.end,
-                    ts_code=args.ts_code,
-                )
-                for api_name in apis
-            }
-        else:
-            counts = backend.update_range(args.start, args.end, apis=args.apis)
-        for api_name, count in counts.items():
-            print(f"{api_name}: {count} rows")
-        return 0
+        try:
+            if args.ts_code:
+                apis = args.apis or ["index_daily"]
+                counts = {
+                    api_name: backend.update_data(
+                        api_name,
+                        start_date=args.start,
+                        end_date=args.end,
+                        ts_code=args.ts_code,
+                    )
+                    for api_name in apis
+                }
+            else:
+                counts = backend.update_range(args.start, args.end, apis=args.apis)
+            for api_name, count in counts.items():
+                print(f"{api_name}: {count} rows")
+            return 0
+        finally:
+            _close_backend(backend)
 
     if args.command == "refresh-report":
         backend = TushareCacheBackend(
@@ -100,12 +103,15 @@ def main(argv=None):
             token=os.environ.get("TUSHARE_TOKEN"),
             cache_mode="strict_local",
         )
-        result = refresh_backtest_report(args.run_dir, backend=backend)
-        if result.get("updated"):
-            print(f"Report refreshed: {result.get('report_path')}")
-        else:
-            print(f"Report still has unsupported metrics: {result.get('reason')}")
-        return 0 if result.get("updated") else 1
+        try:
+            result = refresh_backtest_report(args.run_dir, backend=backend)
+            if result.get("updated"):
+                print(f"Report refreshed: {result.get('report_path')}")
+            else:
+                print(f"Report still has unsupported metrics: {result.get('reason')}")
+            return 0 if result.get("updated") else 1
+        finally:
+            _close_backend(backend)
 
     strategy_path = args.strategy or args.strategy_option
     if not strategy_path:
@@ -127,19 +133,22 @@ def main(argv=None):
         cache_mode="strict_local",
     )
 
-    if args.command == "check-data":
-        issues = _check_local_readiness(config, backend)
+    try:
+        if args.command == "check-data":
+            issues = _check_local_readiness(config, backend)
+            if issues:
+                return 1
+            print("Data readiness check passed")
+            return 0
+
+        issues = _ensure_local_readiness(config, backend)
         if issues:
             return 1
-        print("Data readiness check passed")
+        manifest = BacktestEngine(config, backend=backend).run()
+        print(f"Backtest complete: {manifest.run_dir}")
         return 0
-
-    issues = _ensure_local_readiness(config, backend)
-    if issues:
-        return 1
-    manifest = BacktestEngine(config, backend=backend).run()
-    print(f"Backtest complete: {manifest.run_dir}")
-    return 0
+    finally:
+        _close_backend(backend)
 
 
 def _add_shared_args(parser):
@@ -198,6 +207,12 @@ def _print_readiness_issues(config, issues):
         print(f"  {issue.suggestion}")
     print(f"  Local cache DB: {config.cache_db}")
     print("  Populate the missing local cache data before rerunning.")
+
+
+def _close_backend(backend) -> None:
+    close = getattr(backend, "close", None)
+    if close is not None:
+        close()
 
 
 def _maybe_reexec_for_deterministic_backtest(args, argv=None) -> None:
