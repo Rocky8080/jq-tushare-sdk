@@ -92,10 +92,7 @@ class CanonicalPriceStore:
                 result = self._adjusted_source(
                     api_name,
                     factor_api_name,
-                    requested_codes,
                     result,
-                    requested_start,
-                    requested_end,
                 )
             return result.copy().reset_index(drop=True)
         finally:
@@ -111,8 +108,11 @@ class CanonicalPriceStore:
         ts_codes: list[str],
         requested_start,
         requested_end,
+        *,
+        use_configured_start: bool = True,
     ) -> None:
-        load_start = min(self.start_date, normalize_date(requested_start))
+        normalized_start = normalize_date(requested_start)
+        load_start = min(self.start_date, normalized_start) if use_configured_start else normalized_start
         load_end = normalize_date(requested_end)
         requested_codes = self._unique_codes(ts_codes)
         states = self._raw.setdefault(api_name, {})
@@ -204,11 +204,19 @@ class CanonicalPriceStore:
         ts_codes: list[str],
         requested_start,
         requested_end,
+        *,
+        use_configured_start: bool = True,
     ) -> pd.DataFrame:
         start = normalize_date(requested_start)
         end = normalize_date(requested_end)
         requested_codes = self._unique_codes(ts_codes)
-        self._ensure_raw(api_name, requested_codes, start, end)
+        self._ensure_raw(
+            api_name,
+            requested_codes,
+            start,
+            end,
+            use_configured_start=use_configured_start,
+        )
         states = self._raw.get(api_name, {})
         parts = []
         template = None
@@ -227,43 +235,46 @@ class CanonicalPriceStore:
             if template is not None:
                 return template.iloc[0:0].copy()
             return pd.DataFrame(columns=["ts_code", "trade_date"])
-        return pd.concat(parts, ignore_index=True).copy()
+        return (
+            pd.concat(parts, ignore_index=True)
+            .sort_values(["trade_date", "ts_code"], kind="mergesort")
+            .reset_index(drop=True)
+        )
 
     def _adjusted_source(
         self,
         api_name: str,
         factor_api_name: str,
-        ts_codes: list[str],
         price: pd.DataFrame,
-        requested_start,
-        end_date,
     ) -> pd.DataFrame:
-        normalized_start = normalize_date(requested_start)
-        normalized_end = normalize_date(end_date)
-        requested_codes = self._unique_codes(ts_codes)
+        factor_start = normalize_date(price["trade_date"].min())
+        factor_end = normalize_date(price["trade_date"].max())
+        factor_codes = self._unique_codes(price["ts_code"].tolist())
+        cache_key = (
+            api_name,
+            factor_api_name,
+            factor_start,
+            factor_end,
+            tuple(sorted(factor_codes)),
+        )
+        latest_by_code = self._adjusted.get(cache_key)
         started = perf_counter()
         try:
+            if latest_by_code is None:
+                self._stats.adjusted_misses += 1
             factors = self._raw_source(
                 factor_api_name,
-                requested_codes,
-                normalized_start,
-                normalized_end,
+                factor_codes,
+                factor_start,
+                factor_end,
+                use_configured_start=False,
             )
             if factors.empty or "adj_factor" not in factors.columns:
                 return price
 
             factor_frame = factors[["ts_code", "trade_date", "adj_factor"]].copy()
             factor_frame["adj_factor"] = pd.to_numeric(factor_frame["adj_factor"], errors="coerce")
-            cache_key = (
-                api_name,
-                factor_api_name,
-                normalized_start,
-                normalized_end,
-                tuple(sorted(requested_codes)),
-            )
-            latest_by_code = self._adjusted.get(cache_key)
             if latest_by_code is None:
-                self._stats.adjusted_misses += 1
                 latest = (
                     factor_frame.dropna(subset=["adj_factor"])
                     .sort_values(["ts_code", "trade_date"], kind="mergesort")
