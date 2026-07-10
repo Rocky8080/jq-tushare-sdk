@@ -69,7 +69,7 @@ class CanonicalPriceStore:
                 source = self._adjusted_source(
                     api_name,
                     factor_api_name,
-                    self.start_date,
+                    requested_start,
                     requested_end,
                 )
             else:
@@ -143,6 +143,8 @@ class CanonicalPriceStore:
         end_date,
     ) -> pd.DataFrame:
         normalized_end = normalize_date(end_date)
+        self._ensure_raw(api_name, requested_start, normalized_end)
+        self._ensure_raw(factor_api_name, requested_start, normalized_end)
         cache_key = (api_name, factor_api_name, normalized_end)
         cached = self._adjusted.get(cache_key)
         if cached is not None:
@@ -153,8 +155,12 @@ class CanonicalPriceStore:
         started = perf_counter()
         self._stats.adjusted_misses += 1
         try:
-            price = self._raw_source(api_name, requested_start, normalized_end)
-            factors = self._raw_source(factor_api_name, requested_start, normalized_end)
+            snapshot_start = min(
+                self._raw[api_name].start_date,
+                self._raw[factor_api_name].start_date,
+            )
+            price = self._raw_source(api_name, snapshot_start, normalized_end)
+            factors = self._raw_source(factor_api_name, snapshot_start, normalized_end)
             if "adj_factor" not in factors.columns:
                 raise CanonicalPriceStoreError(
                     "Canonical adjustment data is missing required column: adj_factor"
