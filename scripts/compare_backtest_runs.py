@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 DYNAMIC_ORDER_FIELDS = {"entrust_id"}
-DYNAMIC_SIGNAL_FIELDS = {"run_id", "run_dir"}
+DYNAMIC_SIGNAL_FIELDS = {"portfolio_seq", "run_id", "run_dir"}
 
 
 def normalized_csv(path: Path, ignored: set[str] | None = None) -> list[dict]:
