@@ -384,6 +384,45 @@ class JoinQuantHtmlReport:
             ],
             formatters={"seconds": self._duration},
         )
+        portal = profile.get("data_portal") or {}
+        public_calls = portal.get("public_calls") or []
+        cache = portal.get("canonical_cache") or {}
+        cache_rows = [
+            {"metric": "主缓存加载", "value": cache.get("loads", 0)},
+            {"metric": "主缓存扩展", "value": cache.get("extensions", 0)},
+            {"metric": "加载行数", "value": cache.get("loaded_rows", 0)},
+            {"metric": "前复权命中", "value": cache.get("adjusted_hits", 0)},
+            {"metric": "前复权未命中", "value": cache.get("adjusted_misses", 0)},
+        ]
+        public_call_rows = self._performance_table_rows(
+            public_calls,
+            columns=[
+                ("api", "接口"),
+                ("count", "次数"),
+                ("seconds", "耗时"),
+            ],
+            formatters={"seconds": self._duration},
+        )
+        cache_metric_rows = self._performance_table_rows(
+            cache_rows,
+            columns=[
+                ("metric", "指标"),
+                ("value", "数值"),
+            ],
+        )
+        transformation_rows = self._performance_table_rows(
+            [
+                {"metric": "主缓存加载", "seconds": cache.get("load_seconds", 0)},
+                {"metric": "股票切片", "seconds": cache.get("slice_seconds", 0)},
+                {"metric": "前复权", "seconds": cache.get("adjustment_seconds", 0)},
+                {"metric": "结果格式转换", "seconds": portal.get("format_seconds", 0)},
+            ],
+            columns=[
+                ("metric", "转换"),
+                ("seconds", "耗时"),
+            ],
+            formatters={"seconds": self._duration},
+        )
         api_rows = self._performance_table_rows(
             profile.get("data_api_calls") or [],
             columns=[
@@ -446,7 +485,34 @@ class JoinQuantHtmlReport:
     </div>
   </details>
   <details class="detail-block">
-    <summary>数据接口耗时</summary>
+    <summary>聚宽公开 API</summary>
+    <div class="table-wrap">
+      <table class="report-table perf-table">
+        <thead><tr><th>接口</th><th>次数</th><th>耗时</th></tr></thead>
+        <tbody>{public_call_rows}</tbody>
+      </table>
+    </div>
+  </details>
+  <details class="detail-block">
+    <summary>主缓存</summary>
+    <div class="table-wrap">
+      <table class="report-table perf-table">
+        <thead><tr><th>指标</th><th>数值</th></tr></thead>
+        <tbody>{cache_metric_rows}</tbody>
+      </table>
+    </div>
+  </details>
+  <details class="detail-block">
+    <summary>数据转换</summary>
+    <div class="table-wrap">
+      <table class="report-table perf-table">
+        <thead><tr><th>转换</th><th>耗时</th></tr></thead>
+        <tbody>{transformation_rows}</tbody>
+      </table>
+    </div>
+  </details>
+  <details class="detail-block">
+    <summary>SQLite 后端读取</summary>
     <div class="table-wrap">
       <table class="report-table perf-table">
         <thead><tr><th>接口</th><th>次数</th><th>耗时</th></tr></thead>
@@ -977,8 +1043,27 @@ class JoinQuantHtmlReport:
         percent = self._percent_number(top_phase.get("percent"))
         if str(top_phase.get("name")) == "mark_to_market":
             return f"当前最耗时环节是{label}（{seconds}，占 {percent}）。优先检查持仓数量和每日估值读取 close 价的次数。"
-        if str(top_phase.get("name")) == "callback":
-            return f"当前最耗时环节是{label}（{seconds}，占 {percent}）。优先检查策略回调中的逐股循环和重复因子计算。"
+        if str(top_phase.get("name")) == "callbacks":
+            details = []
+            portal = profile.get("data_portal") or {}
+            public_calls = portal.get("public_calls") or []
+            get_price_calls = next(
+                (item for item in public_calls if item.get("api") == "get_price"),
+                {},
+            )
+            if get_price_calls:
+                details.append(f"公开 get_price 调用 {int(self._to_float(get_price_calls.get('count')))} 次")
+            cache = portal.get("canonical_cache") or {}
+            adjusted_hits = self._to_float(cache.get("adjusted_hits"))
+            adjusted_misses = self._to_float(cache.get("adjusted_misses"))
+            if adjusted_hits + adjusted_misses:
+                hit_rate = adjusted_hits / (adjusted_hits + adjusted_misses) * 100
+                details.append(f"前复权缓存命中率 {hit_rate:.2f}%")
+            suffix = f"；{'，'.join(details)}。" if details else "。"
+            return (
+                f"当前最耗时环节是{label}（{seconds}，占 {percent}）。"
+                f"优先检查策略回调中的逐股循环和重复因子计算{suffix}"
+            )
         return f"当前最耗时环节是{label}（{seconds}，占 {percent}）。建议先从该环节的调用次数和数据读取模式入手。"
 
     def _performance_recommendations(self, profile: dict) -> list[str]:
