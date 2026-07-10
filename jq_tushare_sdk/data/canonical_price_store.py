@@ -250,6 +250,15 @@ class CanonicalPriceStore:
         factor_start = normalize_date(price["trade_date"].min())
         factor_end = normalize_date(price["trade_date"].max())
         factor_codes = self._unique_codes(price["ts_code"].tolist())
+        if len(factor_codes) == 1:
+            return self._adjust_single_symbol_source(
+                api_name,
+                factor_api_name,
+                price,
+                factor_start,
+                factor_end,
+                factor_codes[0],
+            )
         cache_key = (
             api_name,
             factor_api_name,
@@ -302,6 +311,86 @@ class CanonicalPriceStore:
             return result.drop(columns=["adj_factor"], errors="ignore")
         finally:
             self._stats.adjustment_seconds += perf_counter() - started
+
+    def _adjust_single_symbol_source(
+        self,
+        api_name: str,
+        factor_api_name: str,
+        price: pd.DataFrame,
+        factor_start: str,
+        factor_end: str,
+        factor_code: str,
+    ) -> pd.DataFrame:
+        cache_key = (
+            api_name,
+            factor_api_name,
+            factor_start,
+            factor_end,
+            (factor_code,),
+        )
+        latest_by_code = self._adjusted.get(cache_key)
+        started = perf_counter()
+        try:
+            if latest_by_code is None:
+                self._stats.adjusted_misses += 1
+            factors = self._single_code_raw_source(
+                factor_api_name,
+                factor_code,
+                factor_start,
+                factor_end,
+            )
+            if factors.empty or "adj_factor" not in factors.columns:
+                return price.copy()
+
+            factor_frame = factors[["trade_date", "adj_factor"]].copy()
+            factor_frame["adj_factor"] = pd.to_numeric(factor_frame["adj_factor"], errors="coerce")
+            if latest_by_code is None:
+                latest = factor_frame["adj_factor"].dropna()
+                latest_by_code = {factor_code: float(latest.iloc[-1])} if not latest.empty else {}
+                self._adjusted[cache_key] = latest_by_code
+                self._adjusted.move_to_end(cache_key)
+                while len(self._adjusted) > self.adjusted_capacity:
+                    self._adjusted.popitem(last=False)
+            else:
+                self._stats.adjusted_hits += 1
+                self._adjusted.move_to_end(cache_key)
+
+            result = price.copy()
+            factor_by_date = factor_frame.set_index("trade_date")["adj_factor"]
+            scale = result["trade_date"].map(factor_by_date) / latest_by_code.get(
+                factor_code, float("nan")
+            )
+            scale = scale.where(scale.notna() & (scale > 0), 1.0)
+            for column in ("open", "high", "low", "close", "pre_close"):
+                if column in result.columns:
+                    result[column] = pd.to_numeric(result[column], errors="coerce") * scale
+            return result
+        finally:
+            self._stats.adjustment_seconds += perf_counter() - started
+
+    def _single_code_raw_source(
+        self,
+        api_name: str,
+        ts_code: str,
+        requested_start: str,
+        requested_end: str,
+    ) -> pd.DataFrame:
+        start = normalize_date(requested_start)
+        end = normalize_date(requested_end)
+        self._ensure_raw(
+            api_name,
+            [ts_code],
+            start,
+            end,
+            use_configured_start=False,
+        )
+        current = self._raw.get(api_name, {}).get(ts_code)
+        if current is None:
+            return pd.DataFrame(columns=["ts_code", "trade_date"])
+        return current.frame[
+            (current.frame["trade_date"] >= start)
+            & (current.frame["trade_date"] <= end)
+        ]
 
     def _chunked(self, values: list[str]) -> list[list[str]]:
         return [
