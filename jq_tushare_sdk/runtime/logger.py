@@ -5,15 +5,21 @@ from pathlib import Path
 
 
 _SENSITIVE_ASSIGNMENT = re.compile(
-    r"(?i)(['\"]?(?:password|passwd|token|secret|api[_-]?key|authorization)['\"]?\s*[:=]\s*)(['\"]?)([^,'\"}\]\s]+)(\2)"
+    r"""(?ix)
+    (?P<prefix>['\"]?(?:password|passwd|token|secret|api[_-]?key|authorization)['\"]?\s*[:=]\s*)
+    (?:
+        (?P<quote>['\"])(?P<quoted>(?:\\.|(?!(?P=quote)).)*)(?P=quote)
+        | (?P<bare>[^,'\"}\]\s]+)
+    )
+    """
 )
-_CREDENTIAL_URL = re.compile(r"(?i)([a-z][a-z0-9+.-]*://[^:/\s]+:)([^@/\s]+)(@)")
+_CREDENTIAL_URL = re.compile(r"(?i)([a-z][a-z0-9+.-]*://[^:/\s]*:)([^@/\s]+)(@)")
 
 
 def _redact_sensitive_text(value) -> str:
     text = str(value)
     text = _SENSITIVE_ASSIGNMENT.sub(
-        lambda match: f"{match.group(1)}{match.group(2)}******{match.group(4)}",
+        lambda match: f"{match.group('prefix')}{match.group('quote') or ''}******{match.group('quote') or ''}",
         text,
     )
     return _CREDENTIAL_URL.sub(r"\1******\3", text)
