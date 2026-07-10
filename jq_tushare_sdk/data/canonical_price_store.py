@@ -113,7 +113,7 @@ class CanonicalPriceStore:
     ) -> None:
         normalized_start = normalize_date(requested_start)
         load_start = min(self.start_date, normalized_start) if use_configured_start else normalized_start
-        load_end = normalize_date(requested_end)
+        load_end = max(self.end_date, normalize_date(requested_end))
         requested_codes = self._unique_codes(ts_codes)
         states = self._raw.setdefault(api_name, {})
         loads: dict[tuple[str, str], list[str]] = {}
