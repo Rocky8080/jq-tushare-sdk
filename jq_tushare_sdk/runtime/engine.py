@@ -8,6 +8,7 @@ from datetime import datetime, time
 from jq_tushare_sdk.broker.broker import Broker
 from jq_tushare_sdk.config import BacktestConfig, RunManifest
 from jq_tushare_sdk.data.portal import DataPortal
+from jq_tushare_sdk.data.readiness import infer_strategy_price_lookback_start
 from jq_tushare_sdk.reports.joinquant_formatter import JoinQuantOutputFormatter
 from jq_tushare_sdk.reports.metrics import performance_row
 from jq_tushare_sdk.reports.output_manager import OutputManager
@@ -41,9 +42,15 @@ class BacktestEngine:
         profiler = _PerformanceProfiler()
         output = self.output_manager.create_run(self.config)
         logger = RuntimeLogger(output.logs_dir / "backtest.log")
+        price_cache_start = infer_strategy_price_lookback_start(
+            self.config.strategy_path,
+            self.config.start_date,
+        )
         portal = DataPortal(
             _ProfilingBackend(self.backend, profiler),
             optimize_data=self.config.optimize_data,
+            price_cache_start=price_cache_start,
+            price_cache_end=self.config.end_date,
         )
         scheduler = Scheduler()
         context = Context(Portfolio(self.config.initial_cash))
@@ -161,7 +168,10 @@ class BacktestEngine:
             state=state,
             benchmark=benchmark,
             benchmark_issue=benchmark_issue,
-            performance_profile=profiler.snapshot(trade_days=len(trade_days)),
+            performance_profile=profiler.snapshot(
+                trade_days=len(trade_days),
+                data_portal=portal.performance_snapshot(),
+            ),
         )
         formatter.write_summary(output.reports_dir / "summary.json", summary)
         formatter.write_html_report(
@@ -524,7 +534,7 @@ class _PerformanceProfiler:
             }
         )
 
-    def snapshot(self, *, trade_days: int) -> dict:
+    def snapshot(self, *, trade_days: int, data_portal: dict | None = None) -> dict:
         total_seconds = self.elapsed(self._started_at)
         phase_timings = [
             {
@@ -567,4 +577,5 @@ class _PerformanceProfiler:
                 reverse=True,
             )[:10],
             "data_api_calls": data_calls,
+            "data_portal": data_portal or {},
         }

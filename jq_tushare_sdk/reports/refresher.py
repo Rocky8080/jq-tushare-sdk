@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from jq_tushare_sdk import __version__ as SDK_VERSION
 from jq_tushare_sdk.config import BacktestConfig
 from jq_tushare_sdk.data.portal import DataPortal
+from jq_tushare_sdk.data.readiness import infer_strategy_price_lookback_start
 from jq_tushare_sdk.reports.html_report import JoinQuantHtmlReport
 from jq_tushare_sdk.reports.joinquant_formatter import JoinQuantOutputFormatter
 from jq_tushare_sdk.runtime.engine import BacktestEngine
@@ -33,7 +34,16 @@ def refresh_backtest_report(run_dir: str | Path, *, backend) -> dict:
 
     engine = BacktestEngine(config, backend=backend)
     trade_days = [str(row.get("date")) for row in rows if row.get("date")]
-    portal = DataPortal(backend, optimize_data=getattr(config, "optimize_data", True))
+    price_cache_start = infer_strategy_price_lookback_start(
+        config.strategy_path,
+        config.start_date,
+    )
+    portal = DataPortal(
+        backend,
+        optimize_data=getattr(config, "optimize_data", True),
+        price_cache_start=price_cache_start,
+        price_cache_end=config.end_date,
+    )
     benchmark_closes = engine._benchmark_closes(portal, benchmark, trade_days)
     benchmark_issue = None if benchmark_closes else engine._benchmark_missing_reason(benchmark)
     engine._apply_benchmark_returns(rows, benchmark_closes)
