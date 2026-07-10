@@ -53,6 +53,9 @@ MANIFEST
 .idea/
 .vscode/
 
+# Local Git worktrees
+.worktrees/
+
 # Private strategy/program files should live outside this SDK repository.
 experiments/
 examples/private/
