@@ -1,9 +1,14 @@
+import time
 from datetime import date, datetime
 from types import SimpleNamespace
 from typing import Iterable
 
 import pandas as pd
 
+from jq_tushare_sdk.data.canonical_price_store import (
+    CanonicalPriceStore,
+    CanonicalPriceStoreError,
+)
 from jq_tushare_sdk.data.code_map import (
     is_tushare_fund_code,
     joinquant_date,
@@ -43,7 +48,14 @@ class DataPortal:
     INDEX_CODE_PREFIXES = ("399",)
     SH_INDEX_CODES = {"000016", "000300", "000688", "000852", "000905", "000906", "000985"}
 
-    def __init__(self, backend, optimize_data: bool = True):
+    def __init__(
+        self,
+        backend,
+        optimize_data: bool = True,
+        *,
+        price_cache_start: str | None = None,
+        price_cache_end: str | None = None,
+    ):
         self.backend = backend
         self.optimize_data = bool(optimize_data)
         self._price_count_cache = {}
@@ -55,8 +67,50 @@ class DataPortal:
         self._security_metadata_cache = None
         self._industry_cache = None
         self._valuation_cache = {}
+        self._portal_calls = {"get_price": {"count": 0, "seconds": 0.0}}
+        self._result_cache_hits = 0
+        self._result_cache_misses = 0
+        self._canonical_fallbacks = 0
+        self._format_seconds = 0.0
+        self._canonical_price_store = (
+            CanonicalPriceStore(self.backend.fetch, price_cache_start, price_cache_end)
+            if self.optimize_data
+            and price_cache_start is not None
+            and price_cache_end is not None
+            else None
+        )
 
     def get_price(
+        self,
+        security,
+        start_date=None,
+        end_date=None,
+        count=None,
+        fields=None,
+        frequency="daily",
+        panel=False,
+        fq=None,
+        **kwargs,
+    ):
+        started = time.perf_counter()
+        try:
+            return self._get_price_impl(
+                security,
+                start_date=start_date,
+                end_date=end_date,
+                count=count,
+                fields=fields,
+                frequency=frequency,
+                panel=panel,
+                fq=fq,
+                **kwargs,
+            )
+        finally:
+            payload = self._portal_calls["get_price"]
+            payload["count"] += 1
+            payload["seconds"] += time.perf_counter() - started
+
+    def _get_price_impl(
         self,
         security,
         start_date=None,
@@ -84,7 +138,75 @@ class DataPortal:
         )
         cached_result = self._price_result_cache.get(result_cache_key) if self.optimize_data else None
         if cached_result is not None:
+            self._result_cache_hits += 1
             return cached_result.copy()
+        if self.optimize_data:
+            self._result_cache_misses += 1
+
+        canonical_selected = False
+        already_adjusted = False
+        if self._canonical_price_store is not None and end_date is not None:
+            factor_api = (
+                "fund_adj"
+                if api_name == "fund_daily"
+                else "adj_factor"
+                if api_name == "daily"
+                else None
+            )
+            try:
+                df = self._canonical_price_store.select(
+                    api_name,
+                    ts_codes=[to_tushare_code(item) for item in securities],
+                    start_date=normalize_date(start_date) if start_date is not None else None,
+                    end_date=normalize_date(end_date),
+                    count=int(count) if count is not None else None,
+                    fq=fq,
+                    factor_api_name=factor_api,
+                )
+                canonical_selected = True
+                already_adjusted = fq == "pre" and factor_api is not None
+            except (MemoryError, CanonicalPriceStoreError):
+                self._canonical_fallbacks += 1
+                self._canonical_price_store = None
+                df = self._legacy_price_frame(
+                    api_name,
+                    securities,
+                    start_date,
+                    end_date,
+                    count,
+                )
+        else:
+            df = self._legacy_price_frame(
+                api_name,
+                securities,
+                start_date,
+                end_date,
+                count,
+            )
+        if df.empty:
+            return pd.DataFrame(columns=["time", "code"] + fields)
+        self._validate_price_frame(df)
+        if count is not None and not canonical_selected:
+            df = self._tail_per_security(df, int(count))
+        if not already_adjusted:
+            df = self._apply_price_adjustment(df, api_name=api_name, fq=fq)
+        format_started = time.perf_counter()
+        try:
+            result = self._format_price_frame(df, fields)
+        finally:
+            self._format_seconds += time.perf_counter() - format_started
+        if self.optimize_data:
+            self._price_result_cache[result_cache_key] = result.copy()
+        return result
+
+    def _legacy_price_frame(
+        self,
+        api_name: str,
+        securities: list[str],
+        start_date,
+        end_date,
+        count,
+    ) -> pd.DataFrame:
         if count is not None and start_date is None and self.optimize_data and (
             end_date is not None or len(securities) == 1
         ):
@@ -107,17 +229,27 @@ class DataPortal:
                 params["start_date"] = normalize_date(start_date)
             if end_date:
                 params["end_date"] = normalize_date(end_date)
-            df = self._fetch(api_name, **params)
-        if df.empty:
-            return pd.DataFrame(columns=["time", "code"] + fields)
-        self._validate_price_frame(df)
-        if count is not None:
-            df = self._tail_per_security(df, int(count))
-        df = self._apply_price_adjustment(df, api_name=api_name, fq=fq)
-        result = self._format_price_frame(df, fields)
-        if self.optimize_data:
-            self._price_result_cache[result_cache_key] = result.copy()
-        return result
+            return self._fetch(api_name, **params)
+        return df
+
+    def performance_snapshot(self) -> dict:
+        return {
+            "public_calls": [
+                {"api": name, "count": value["count"], "seconds": round(value["seconds"], 6)}
+                for name, value in sorted(self._portal_calls.items())
+            ],
+            "result_cache": {
+                "hits": self._result_cache_hits,
+                "misses": self._result_cache_misses,
+            },
+            "canonical_fallbacks": self._canonical_fallbacks,
+            "canonical_cache": (
+                self._canonical_price_store.snapshot()
+                if self._canonical_price_store
+                else {}
+            ),
+            "format_seconds": round(self._format_seconds, 6),
+        }
 
     def get_trade_days(self, start_date=None, end_date=None, count=None):
         params = {"exchange": "SSE"}
