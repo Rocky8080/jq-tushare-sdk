@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from jq_tushare_sdk.data.code_map import is_tushare_fund_code
+from jq_tushare_sdk.data.code_map import is_tushare_index_code
 from jq_tushare_sdk.data.code_map import normalize_date
 from jq_tushare_sdk.data.code_map import to_tushare_code
 
@@ -490,6 +491,41 @@ def infer_strategy_max_price_count(strategy_path) -> int:
     return max_count
 
 
+def infer_strategy_index_price_requirements(strategy_path) -> dict[str, int]:
+    if not strategy_path:
+        return {}
+    path = Path(strategy_path)
+    if not path.is_file():
+        return {}
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
+    except SyntaxError:
+        return {}
+
+    module_env = _module_static_env(tree)
+    context_env = _context_numeric_env(tree, module_env)
+    loop_bindings = _static_loop_bindings(tree, module_env)
+    requirements: dict[str, int] = {}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and _is_name(node.func, "get_price") and node.args):
+            continue
+        symbol_value = _evaluate_static_expression(node.args[0], module_env)
+        symbols = [symbol_value] if isinstance(symbol_value, str) else []
+        if isinstance(node.args[0], ast.Name):
+            symbols.extend(loop_bindings.get(node.args[0].id, ()))
+        count_node = _price_count_argument_node(node)
+        if count_node is None:
+            continue
+        count = _evaluate_numeric_expression(count_node, module_env, context_env)
+        if not isinstance(count, (int, float)) or count <= 0:
+            continue
+        count = int(count)
+        for symbol in symbols:
+            if is_tushare_index_code(symbol):
+                requirements[symbol] = max(requirements.get(symbol, 0), count)
+    return requirements
+
+
 def _price_count_argument_node(node: ast.Call):
     for keyword in node.keywords:
         if keyword.arg == "count":
@@ -532,6 +568,20 @@ def _module_static_env(tree: ast.AST) -> dict[str, object]:
                 if isinstance(target, ast.Name) and value is not _UNRESOLVED:
                     module_env[target.id] = value
     return module_env
+
+
+def _static_loop_bindings(tree: ast.AST, module_env: dict[str, object]) -> dict[str, tuple[str, ...]]:
+    bindings: dict[str, list[str]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.For) or not isinstance(node.target, ast.Name):
+            continue
+        values = _evaluate_static_expression(node.iter, module_env)
+        if not isinstance(values, (list, tuple, set)):
+            continue
+        strings = [str(value) for value in values if isinstance(value, str)]
+        if strings:
+            bindings.setdefault(node.target.id, []).extend(strings)
+    return {name: tuple(dict.fromkeys(values)) for name, values in bindings.items()}
 
 
 def _context_numeric_env(tree: ast.AST, module_env: dict[str, object]) -> dict[str, float]:
@@ -584,6 +634,15 @@ def _evaluate_static_expression(node: ast.AST, env: dict[str, object]):
         return ast.literal_eval(node)
     except Exception:
         pass
+    if isinstance(node, ast.List):
+        values = [_evaluate_static_expression(element, env) for element in node.elts]
+        return values if all(value is not _UNRESOLVED for value in values) else _UNRESOLVED
+    if isinstance(node, ast.Tuple):
+        values = tuple(_evaluate_static_expression(element, env) for element in node.elts)
+        return values if all(value is not _UNRESOLVED for value in values) else _UNRESOLVED
+    if isinstance(node, ast.Set):
+        values = {_evaluate_static_expression(element, env) for element in node.elts}
+        return values if _UNRESOLVED not in values else _UNRESOLVED
     if isinstance(node, ast.Name):
         return env.get(node.id, _UNRESOLVED)
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get":
