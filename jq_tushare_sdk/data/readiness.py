@@ -504,22 +504,11 @@ def infer_strategy_index_price_requirements(strategy_path) -> dict[str, int]:
 
     module_env = _module_static_env(tree)
     context_env = _context_numeric_env(tree, module_env)
-    loop_bindings = _static_loop_bindings(tree, module_env)
+    visitor = _IndexPriceCallVisitor(module_env, context_env)
+    visitor.visit(tree)
     requirements: dict[str, int] = {}
-    for node in ast.walk(tree):
-        if not (isinstance(node, ast.Call) and _is_name(node.func, "get_price") and node.args):
-            continue
-        symbol_value = _evaluate_static_expression(node.args[0], module_env)
-        symbols = [symbol_value] if isinstance(symbol_value, str) else []
-        if isinstance(node.args[0], ast.Name):
-            symbols.extend(loop_bindings.get(node.args[0].id, ()))
-        count_node = _price_count_argument_node(node)
-        if count_node is None:
-            continue
-        count = _evaluate_numeric_expression(count_node, module_env, context_env)
-        if not isinstance(count, (int, float)) or count <= 0:
-            continue
-        count = int(count)
+    calls = sorted(visitor.calls, key=lambda item: item[:2])
+    for _, _, symbols, count in calls:
         for symbol in symbols:
             if is_tushare_index_code(symbol):
                 requirements[symbol] = max(requirements.get(symbol, 0), count)
@@ -570,18 +559,58 @@ def _module_static_env(tree: ast.AST) -> dict[str, object]:
     return module_env
 
 
-def _static_loop_bindings(tree: ast.AST, module_env: dict[str, object]) -> dict[str, tuple[str, ...]]:
-    bindings: dict[str, list[str]] = {}
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.For) or not isinstance(node.target, ast.Name):
-            continue
-        values = _evaluate_static_expression(node.iter, module_env)
-        if not isinstance(values, (list, tuple, set)):
-            continue
-        strings = [str(value) for value in values if isinstance(value, str)]
-        if strings:
-            bindings.setdefault(node.target.id, []).extend(strings)
-    return {name: tuple(dict.fromkeys(values)) for name, values in bindings.items()}
+class _IndexPriceCallVisitor(ast.NodeVisitor):
+    def __init__(self, module_env: dict[str, object], context_env: dict[str, float]):
+        self.module_env = module_env
+        self.context_env = context_env
+        self.loop_bindings: list[dict[str, tuple[str, ...] | None]] = []
+        self.calls: list[tuple[int, int, tuple[str, ...], int]] = []
+
+    def visit_For(self, node: ast.For):
+        self.visit(node.iter)
+        bindings = {}
+        if isinstance(node.target, ast.Name):
+            bindings[node.target.id] = _static_loop_string_values(node.iter, self.module_env)
+        self.loop_bindings.append(bindings)
+        for statement in node.body:
+            self.visit(statement)
+        self.loop_bindings.pop()
+        for statement in node.orelse:
+            self.visit(statement)
+
+    def visit_Call(self, node: ast.Call):
+        if _is_name(node.func, "get_price") and node.args:
+            count_node = _price_count_argument_node(node)
+            if count_node is not None:
+                count = _evaluate_numeric_expression(count_node, self.module_env, self.context_env)
+                if isinstance(count, (int, float)) and count > 0:
+                    symbols = self._resolve_symbols(node.args[0])
+                    if symbols:
+                        self.calls.append(
+                            (
+                                getattr(node, "lineno", -1),
+                                getattr(node, "col_offset", -1),
+                                symbols,
+                                int(count),
+                            )
+                        )
+        self.generic_visit(node)
+
+    def _resolve_symbols(self, node: ast.AST) -> tuple[str, ...]:
+        if isinstance(node, ast.Name):
+            for bindings in reversed(self.loop_bindings):
+                if node.id in bindings:
+                    return bindings[node.id] or ()
+        value = _evaluate_static_expression(node, self.module_env)
+        return (value,) if isinstance(value, str) else ()
+
+
+def _static_loop_string_values(node: ast.AST, module_env: dict[str, object]) -> tuple[str, ...] | None:
+    values = _evaluate_static_expression(node, module_env)
+    if not isinstance(values, (list, tuple, set)):
+        return None
+    strings = [value for value in values if isinstance(value, str)]
+    return tuple(dict.fromkeys(strings))
 
 
 def _context_numeric_env(tree: ast.AST, module_env: dict[str, object]) -> dict[str, float]:
