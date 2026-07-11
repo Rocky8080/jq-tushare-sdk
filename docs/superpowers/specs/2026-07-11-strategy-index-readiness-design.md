@@ -21,6 +21,8 @@ to Rotation before stock selection began.
 - Infer the maximum requested `count` for each index, including loop variables
   bound to module-level index lists.
 - Validate and automatically backfill each required index before a backtest.
+- Route every inferred supported index, including `000001.XSHG`, through
+  `index_daily` when the strategy calls `get_price()`.
 - Keep benchmark validation and existing strategy compatibility intact.
 - Report the exact incomplete index and required date range when readiness still
   fails after an update.
@@ -51,6 +53,10 @@ environment. It will resolve:
 Only codes recognized as indexes by the SDK's existing code conventions are
 included: Shenzhen `399xxx` codes and the supported Shanghai index code set.
 Unresolved symbols are ignored rather than causing readiness to fail.
+
+The supported Shanghai index set must include `000001.XSHG`. The data portal's
+price routing and readiness inference will share the same recognition helper so
+an index cannot be inferred and filled but later queried from the stock table.
 
 ### Required history range
 
@@ -110,6 +116,7 @@ Follow a red-green workflow with existing real-code test infrastructure:
 
 - The 5.8.1 strategy yields six inferred index-price requirements, with a
   70-observation requirement for every `REGIME_INDEXES` member.
+- `get_price("000001.XSHG", ...)` reads `index_daily`, not `daily`.
 - Readiness fails when any required index lacks the inferred lookback even when
   the benchmark is complete.
 - Automatic update requests include the correct `ts_code`, start date, and end
