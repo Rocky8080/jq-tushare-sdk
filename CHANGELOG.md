@@ -4,6 +4,14 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.20] - 2026-07-11
+
+### Changed
+
+- Align 09:30 partial daily bars and weekly trading-day scheduling with JoinQuant.
+- Fill paused price rows without leaking future daily data.
+- Keep explicit income quarters exact while preserving latest-visible defaults.
+
 ## [0.10.19] - 2026-07-11
 
 ### Changed

@@ -120,10 +120,22 @@ class DataPortal:
         fq=None,
         **kwargs,
     ):
+        skip_paused = bool(kwargs.pop("skip_paused", False))
+        fill_paused = bool(kwargs.pop("fill_paused", False))
         self._validate_price_options(frequency=frequency, panel=panel, fq=fq, kwargs=kwargs)
         fields = self._normalize_fields(fields)
         securities = self._normalize_securities(security)
         api_name = self._price_api_name(securities)
+        source_start_date = start_date
+        source_count = count
+        direct_active_count = (
+            skip_paused
+            and count is not None
+            and start_date is None
+            and end_date is not None
+        )
+        if direct_active_count:
+            source_count = None
         result_cache_key = self._price_result_cache_key(
             api_name=api_name,
             securities=securities,
@@ -133,6 +145,8 @@ class DataPortal:
             fields=fields,
             frequency=frequency,
             fq=fq,
+            skip_paused=skip_paused,
+            fill_paused=fill_paused,
         )
         cached_result = self._price_result_cache.get(result_cache_key) if self.optimize_data else None
         if cached_result is not None:
@@ -143,7 +157,15 @@ class DataPortal:
 
         canonical_selected = False
         already_adjusted = False
-        if self._canonical_price_store is not None and end_date is not None:
+        if direct_active_count:
+            df = self._fetch(
+                api_name,
+                ts_code=",".join(to_tushare_code(item) for item in securities),
+                end_date=normalize_date(end_date),
+                positive_volume=True,
+                limit_per_code=int(count),
+            )
+        elif self._canonical_price_store is not None and end_date is not None:
             factor_api = (
                 "fund_adj"
                 if api_name == "fund_daily"
@@ -155,9 +177,13 @@ class DataPortal:
                 df = self._canonical_price_store.select(
                     api_name,
                     ts_codes=[to_tushare_code(item) for item in securities],
-                    start_date=normalize_date(start_date) if start_date is not None else None,
+                    start_date=(
+                        normalize_date(source_start_date)
+                        if source_start_date is not None
+                        else None
+                    ),
                     end_date=normalize_date(end_date),
-                    count=int(count) if count is not None else None,
+                    count=int(source_count) if source_count is not None else None,
                     fq=fq,
                     factor_api_name=factor_api,
                 )
@@ -169,25 +195,53 @@ class DataPortal:
                 df = self._legacy_price_frame(
                     api_name,
                     securities,
-                    start_date,
+                    source_start_date,
                     end_date,
-                    count,
+                    source_count,
                 )
         else:
             df = self._legacy_price_frame(
                 api_name,
                 securities,
-                start_date,
+                source_start_date,
                 end_date,
-                count,
+                source_count,
+            )
+        if fill_paused and not skip_paused:
+            df = self._ensure_paused_price_seed(
+                df,
+                api_name=api_name,
+                securities=securities,
+                start_date=start_date,
+                end_date=end_date,
+                count=count,
+                fq=fq,
+                adjust_seed=already_adjusted,
             )
         if df.empty:
             return pd.DataFrame(columns=["time", "code"] + fields)
         self._validate_price_frame(df)
-        if count is not None and not canonical_selected:
-            df = self._tail_per_security(df, int(count))
+        if source_count is not None and not canonical_selected:
+            df = self._tail_per_security(df, int(source_count))
         if not already_adjusted:
-            df = self._apply_price_adjustment(df, api_name=api_name, fq=fq)
+            df = self._apply_price_adjustment(
+                df,
+                api_name=api_name,
+                fq=fq,
+                adjustment_end_date=end_date,
+            )
+        if skip_paused and "vol" in df.columns:
+            volume = pd.to_numeric(df["vol"], errors="coerce").fillna(0.0)
+            df = df[volume > 0].reset_index(drop=True)
+            if count is not None:
+                df = self._tail_per_security(df, int(count))
+        if fill_paused and not skip_paused:
+            df = self._fill_paused_trade_days(
+                df,
+                start_date=start_date,
+                end_date=end_date,
+                count=count,
+            )
         format_started = time.perf_counter()
         try:
             result = self._format_price_frame(df, fields)
@@ -358,7 +412,9 @@ class DataPortal:
                 last_price = self._float_value(row.get("close"), 0.0)
                 day_open = self._float_value(row.get("open"), last_price)
                 volume = self._float_value(row.get("volume"), 0.0)
-                paused = volume <= 0
+                row_date = normalize_date(row.get("time")) if row.get("time") else ""
+                requested_date = normalize_date(date) if date is not None else row_date
+                paused = row_date != requested_date or volume <= 0
             is_st = self._is_st_name(name)
             limit_ratio = self._limit_ratio(code, is_st)
             current[code] = SimpleNamespace(
@@ -602,6 +658,8 @@ class DataPortal:
         fields: list[str],
         frequency: str,
         fq,
+        skip_paused: bool,
+        fill_paused: bool,
     ) -> tuple:
         return (
             str(api_name),
@@ -612,7 +670,175 @@ class DataPortal:
             tuple(str(field) for field in fields),
             str(frequency),
             "" if fq is None else str(fq),
+            bool(skip_paused),
+            bool(fill_paused),
         )
+
+    def _price_trade_calendar(self, *, start_date, end_date, count):
+        if end_date is None:
+            return []
+        if start_date is not None:
+            days = self.get_trade_days(start_date=start_date, end_date=end_date)
+        elif count is not None:
+            days = self.get_trade_days(end_date=end_date, count=int(count))
+        else:
+            return []
+        return [normalize_date(day) for day in days]
+
+    def _ensure_paused_price_seed(
+        self,
+        df,
+        *,
+        api_name,
+        securities,
+        start_date,
+        end_date,
+        count,
+        fq,
+        adjust_seed,
+    ):
+        calendar = self._price_trade_calendar(
+            start_date=start_date,
+            end_date=end_date,
+            count=count,
+        )
+        if not calendar:
+            return df
+        boundary = calendar[0]
+        requested_codes = [to_tushare_code(code) for code in securities]
+        available_codes = set()
+        if not df.empty and {"ts_code", "trade_date"}.issubset(df.columns):
+            visible = df[df["trade_date"].map(normalize_date) <= boundary]
+            available_codes = set(visible["ts_code"].astype(str).tolist())
+        missing_codes = [code for code in requested_codes if code not in available_codes]
+        if not missing_codes:
+            return df
+        seed_end = (
+            datetime.strptime(boundary, "%Y%m%d") - pd.Timedelta(days=1)
+        ).strftime("%Y%m%d")
+        seed = self._fetch(
+            api_name,
+            ts_code=",".join(missing_codes),
+            end_date=seed_end,
+            latest_per_code=True,
+        )
+        if seed.empty:
+            return df
+        seed = self._tail_per_security(seed, 1)
+        if adjust_seed and fq == "pre":
+            seed = self._adjust_price_seed_to_end(seed, api_name=api_name, end_date=end_date)
+        return pd.concat([seed, df], ignore_index=True).drop_duplicates(
+            ["ts_code", "trade_date"],
+            keep="last",
+        )
+
+    def _adjust_price_seed_to_end(self, seed, *, api_name, end_date):
+        factor_api = (
+            "fund_adj"
+            if api_name == "fund_daily"
+            else "adj_factor"
+            if api_name == "daily"
+            else None
+        )
+        if factor_api is None or seed.empty or end_date is None:
+            return seed
+        codes = seed["ts_code"].astype(str).drop_duplicates().tolist()
+        latest = self._fetch(
+            factor_api,
+            ts_code=",".join(codes),
+            end_date=normalize_date(end_date),
+            latest_per_code=True,
+        )
+        latest = self._tail_per_security(latest, 1)
+        seed_factor_parts = []
+        for seed_date, rows in seed.groupby("trade_date", sort=False):
+            seed_codes = rows["ts_code"].astype(str).drop_duplicates().tolist()
+            factors = self._fetch(
+                factor_api,
+                ts_code=",".join(seed_codes),
+                end_date=normalize_date(seed_date),
+                latest_per_code=True,
+            )
+            if not factors.empty:
+                seed_factor_parts.append(self._tail_per_security(factors, 1))
+        at_seed = (
+            pd.concat(seed_factor_parts, ignore_index=True)
+            if seed_factor_parts
+            else pd.DataFrame()
+        )
+        if latest.empty or at_seed.empty or "adj_factor" not in latest.columns:
+            return seed
+        latest_by_code = latest.set_index("ts_code")["adj_factor"]
+        seed_by_code = at_seed.set_index("ts_code")["adj_factor"]
+        scale = seed["ts_code"].map(seed_by_code) / seed["ts_code"].map(latest_by_code)
+        scale = pd.to_numeric(scale, errors="coerce").where(lambda values: values > 0, 1.0)
+        result = seed.copy()
+        for column in ("open", "high", "low", "close", "pre_close"):
+            if column in result.columns:
+                result[column] = pd.to_numeric(result[column], errors="coerce") * scale
+        return result
+
+    def _fill_paused_trade_days(self, df, *, start_date, end_date, count):
+        if df.empty or "trade_date" not in df.columns or "ts_code" not in df.columns:
+            return df
+        effective_end = end_date or df["trade_date"].max()
+        calendar = self._price_trade_calendar(
+            start_date=start_date,
+            end_date=effective_end,
+            count=count,
+        )
+        if not calendar:
+            trade_days = self.get_trade_days(
+                start_date=df["trade_date"].min(),
+                end_date=effective_end,
+            )
+            calendar = [normalize_date(day) for day in trade_days]
+        if not calendar:
+            return df
+
+        ordered = df.copy()
+        ordered["trade_date"] = ordered["trade_date"].map(normalize_date)
+        ordered = ordered.sort_values(["ts_code", "trade_date"]).drop_duplicates(
+            ["ts_code", "trade_date"],
+            keep="last",
+        )
+        target_rows = ordered[ordered["trade_date"].isin(calendar)].copy()
+        observed_counts = target_rows.groupby("ts_code")["trade_date"].nunique()
+        complete_codes = set(observed_counts[observed_counts == len(calendar)].index)
+        complete = target_rows[target_rows["ts_code"].isin(complete_codes)]
+        incomplete = ordered[~ordered["ts_code"].isin(complete_codes)].copy()
+        if incomplete.empty:
+            result = complete
+            if count is not None:
+                result = self._tail_per_security(result, int(count))
+            return result.sort_values(["trade_date", "ts_code"]).reset_index(drop=True)
+
+        ordered = incomplete
+        ordered["_observed"] = True
+        codes = ordered["ts_code"].astype(str).drop_duplicates().tolist()
+        all_days = sorted(set(calendar) | set(ordered["trade_date"].tolist()))
+        grid = pd.MultiIndex.from_product(
+            [codes, all_days],
+            names=["ts_code", "trade_date"],
+        )
+        indexed = ordered.set_index(["ts_code", "trade_date"]).reindex(grid)
+        missing = indexed["_observed"].isna()
+        previous_close = pd.to_numeric(indexed["close"], errors="coerce").groupby(level=0).ffill()
+        for column in ("open", "high", "low", "close"):
+            if column in indexed.columns:
+                indexed.loc[missing, column] = previous_close.loc[missing]
+        for column in ("vol", "amount", "change", "pct_chg"):
+            if column in indexed.columns:
+                indexed.loc[missing, column] = 0.0
+        if "pre_close" in indexed.columns:
+            indexed.loc[missing, "pre_close"] = previous_close.loc[missing]
+        filled = indexed.reset_index()
+        filled = filled[filled["trade_date"].isin(calendar)]
+        filled = filled[filled["close"].notna()].drop(columns=["_observed"], errors="ignore")
+        result = pd.concat([complete, filled], ignore_index=True)
+        if count is not None:
+            result = self._tail_per_security(result, int(count))
+        return result.sort_values(["trade_date", "ts_code"]).reset_index(drop=True)
 
     def _valuation_frame(self, date) -> pd.DataFrame:
         cache_key = normalize_date(date) if date is not None else ""
@@ -655,16 +881,8 @@ class DataPortal:
         if period is None:
             return self._filter_income_asof(self._fetch("income", period=stat_date), date), stat_date
 
-        current = period
-        for _ in range(12):
-            frame = self._filter_income_asof(self._fetch("income", period=current), date)
-            if not frame.empty:
-                return frame, current
-            previous = self._previous_calendar_income_period(current)
-            if previous is None:
-                break
-            current = previous
-        return pd.DataFrame(), period
+        frame = self._filter_income_asof(self._fetch("income", period=period), date)
+        return frame, period
 
     def _filter_income_asof(self, income_df: pd.DataFrame, date=None) -> pd.DataFrame:
         if income_df.empty or date is None:
@@ -728,15 +946,6 @@ class DataPortal:
         year, quarter = parsed
         if quarter <= 1:
             return None
-        return f"{year}q{quarter - 1}"
-
-    def _previous_calendar_income_period(self, stat_date) -> str | None:
-        parsed = self._parse_income_period(stat_date)
-        if parsed is None:
-            return None
-        year, quarter = parsed
-        if quarter <= 1:
-            return f"{year - 1}q4"
         return f"{year}q{quarter - 1}"
 
     def _normalize_income_period(self, stat_date) -> str | None:
@@ -953,7 +1162,13 @@ class DataPortal:
                 result[field] = df[source].values
         return result.reset_index(drop=True)
 
-    def _apply_price_adjustment(self, df: pd.DataFrame, api_name: str, fq) -> pd.DataFrame:
+    def _apply_price_adjustment(
+        self,
+        df: pd.DataFrame,
+        api_name: str,
+        fq,
+        adjustment_end_date=None,
+    ) -> pd.DataFrame:
         if fq != "pre" or api_name not in {"daily", "fund_daily"} or df.empty:
             return df
         if "ts_code" not in df.columns or "trade_date" not in df.columns:
@@ -962,7 +1177,11 @@ class DataPortal:
         if not ts_codes:
             return df
         start_date = str(df["trade_date"].min())
-        end_date = str(df["trade_date"].max())
+        end_date = (
+            normalize_date(adjustment_end_date)
+            if adjustment_end_date is not None
+            else str(df["trade_date"].max())
+        )
         factor_api_name = "fund_adj" if api_name == "fund_daily" else "adj_factor"
         try:
             factors = self._fetch_price_adjustment_factors(

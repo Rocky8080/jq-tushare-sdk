@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Callable
 
 
@@ -16,6 +16,8 @@ class Scheduler:
     def __init__(self):
         self.entries: list[ScheduledEntry] = []
         self._callback_wrapper: Callable[[Callable[..., Any]], Callable[..., Any]] = lambda func: func
+        self._week_key = None
+        self._week_trade_days = []
 
     def set_callback_wrapper(
         self, wrapper: Callable[[Callable[..., Any]], Callable[..., Any]] | None
@@ -58,37 +60,50 @@ class Scheduler:
 
     def unschedule_all(self):
         self.entries.clear()
+        self._week_key = None
+        self._week_trade_days.clear()
 
     def callbacks_for(self, current_dt: datetime, time_label: str, previous_dt=None):
         callbacks = []
+        has_weekly_entries = any(entry.kind == "weekly" for entry in self.entries)
+        week_trade_day = (
+            self._week_trade_day(current_dt)
+            if has_weekly_entries and current_dt is not None
+            else None
+        )
         for entry in self.entries:
             if entry.time != time_label:
                 continue
-            if entry.kind == "weekly" and not self._matches_weekly_entry(
-                entry,
-                current_dt,
-                previous_dt,
-            ):
-                continue
+            if entry.kind == "weekly":
+                if week_trade_day is None:
+                    continue
+                if not self._matches_weekly_entry(
+                    entry,
+                    current_dt,
+                    previous_dt,
+                    week_trade_day,
+                ):
+                    continue
             if entry.kind == "monthly" and current_dt.day != entry.monthday:
                 continue
             callbacks.append(entry.func)
         return callbacks
 
-    def _matches_weekly_entry(self, entry: ScheduledEntry, current_dt: datetime, previous_dt) -> bool:
-        if current_dt.weekday() + 1 == entry.weekday:
-            return True
-        if previous_dt is None:
-            return current_dt.isoweekday() > entry.weekday
-
-        previous_date = previous_dt.date() if hasattr(previous_dt, "date") else previous_dt
+    def _week_trade_day(self, current_dt: datetime) -> int:
         current_date = current_dt.date()
-        if previous_date >= current_date:
-            return False
+        week_key = current_date.isocalendar()[:2]
+        if week_key != self._week_key:
+            self._week_key = week_key
+            self._week_trade_days = [current_date]
+        elif current_date not in self._week_trade_days:
+            self._week_trade_days.append(current_date)
+        return self._week_trade_days.index(current_date) + 1
 
-        day = previous_date + timedelta(days=1)
-        while day <= current_date:
-            if day.isoweekday() == entry.weekday:
-                return True
-            day += timedelta(days=1)
-        return False
+    def _matches_weekly_entry(
+        self,
+        entry: ScheduledEntry,
+        current_dt: datetime,
+        previous_dt,
+        week_trade_day: int,
+    ) -> bool:
+        return week_trade_day == entry.weekday

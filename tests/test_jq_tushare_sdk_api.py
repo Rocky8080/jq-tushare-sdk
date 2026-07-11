@@ -254,7 +254,137 @@ class TestJoinQuantAPI(unittest.TestCase):
 
         self.assertEqual(df["close"].tolist(), [10.2])
 
-    def test_get_price_at_open_clamps_context_end_date_to_previous_trade_day(self):
+    def test_get_price_fills_paused_trade_days_with_previous_close(self):
+        set_runtime_state(RuntimeState(data_portal=DataPortal(APIPortalBackend())))
+
+        df = get_price(
+            "000001.XSHE",
+            end_date="2024-01-05",
+            count=4,
+            fields=["open", "close", "high", "low", "volume", "money"],
+            panel=False,
+            skip_paused=False,
+            fill_paused=True,
+        )
+
+        paused = df[df["time"] == "2024-01-04"].iloc[0]
+        self.assertEqual(df["time"].tolist(), ["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"])
+        self.assertEqual(paused["open"], 10.2)
+        self.assertEqual(paused["close"], 10.2)
+        self.assertEqual(paused["high"], 10.2)
+        self.assertEqual(paused["low"], 10.2)
+        self.assertEqual(paused["volume"], 0.0)
+        self.assertEqual(paused["money"], 0.0)
+
+    def test_get_price_skip_paused_keeps_sparse_trade_history(self):
+        set_runtime_state(RuntimeState(data_portal=DataPortal(APIPortalBackend())))
+
+        df = get_price(
+            "000001.XSHE",
+            end_date="2024-01-05",
+            count=4,
+            fields="close",
+            panel=False,
+            skip_paused=True,
+            fill_paused=True,
+        )
+
+        self.assertEqual(df["time"].tolist(), ["2024-01-02", "2024-01-03", "2024-01-05"])
+
+    def test_get_price_seeds_paused_fill_before_requested_start(self):
+        set_runtime_state(RuntimeState(data_portal=DataPortal(APIPortalBackend())))
+
+        df = get_price(
+            "000001.XSHE",
+            start_date="2024-01-04",
+            end_date="2024-01-05",
+            fields=["open", "close", "volume", "money"],
+            panel=False,
+            skip_paused=False,
+            fill_paused=True,
+        )
+
+        self.assertEqual(df["time"].tolist(), ["2024-01-04", "2024-01-05"])
+        self.assertEqual(df["close"].tolist(), [10.2, 10.9])
+        self.assertEqual(df["volume"].tolist(), [0.0, 950.0])
+
+    def test_get_price_fills_from_last_close_before_long_suspension(self):
+        backend = APIPortalBackend()
+        backend.frames["daily"] = pd.DataFrame(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": "20231101",
+                    "open": 9.8,
+                    "high": 10.1,
+                    "low": 9.7,
+                    "close": 10.0,
+                    "vol": 1000.0,
+                    "amount": 10000.0,
+                }
+            ]
+        )
+        set_runtime_state(RuntimeState(data_portal=DataPortal(backend)))
+
+        df = get_price(
+            "000001.XSHE",
+            start_date="2024-01-02",
+            end_date="2024-01-03",
+            fields=["close", "volume"],
+            panel=False,
+            skip_paused=False,
+            fill_paused=True,
+        )
+
+        self.assertEqual(df["time"].tolist(), ["2024-01-02", "2024-01-03"])
+        self.assertEqual(df["close"].tolist(), [10.0, 10.0])
+        self.assertEqual(df["volume"].tolist(), [0.0, 0.0])
+
+    def test_get_price_skip_paused_removes_explicit_zero_volume_rows(self):
+        backend = APIPortalBackend()
+        backend.frames["daily"].loc[
+            backend.frames["daily"]["trade_date"] == "20240103",
+            "vol",
+        ] = 0.0
+        set_runtime_state(RuntimeState(data_portal=DataPortal(backend)))
+
+        df = get_price(
+            "000001.XSHE",
+            start_date="2024-01-02",
+            end_date="2024-01-03",
+            fields="close",
+            panel=False,
+            skip_paused=True,
+            fill_paused=True,
+        )
+
+        self.assertEqual(df["time"].tolist(), ["2024-01-02"])
+
+    def test_get_price_skip_paused_count_reaches_past_long_zero_volume_tail(self):
+        backend = APIPortalBackend()
+        backend.frames["daily"] = pd.DataFrame(
+            [
+                {"ts_code": "000001.SZ", "trade_date": "20231001", "close": 9.8, "vol": 100.0},
+                {"ts_code": "000001.SZ", "trade_date": "20231002", "close": 10.0, "vol": 200.0},
+                {"ts_code": "000001.SZ", "trade_date": "20240102", "close": 10.0, "vol": 0.0},
+                {"ts_code": "000001.SZ", "trade_date": "20240103", "close": 10.0, "vol": 0.0},
+            ]
+        )
+        set_runtime_state(RuntimeState(data_portal=DataPortal(backend)))
+
+        df = get_price(
+            "000001.XSHE",
+            end_date="2024-01-03",
+            count=2,
+            fields="close",
+            panel=False,
+            skip_paused=True,
+            fill_paused=True,
+        )
+
+        self.assertEqual(df["time"].tolist(), ["2023-10-01", "2023-10-02"])
+
+    def test_get_price_at_open_exposes_only_current_open_in_partial_daily_bar(self):
         set_runtime_state(
             RuntimeState(
                 data_portal=DataPortal(APIPortalBackend()),
@@ -266,7 +396,7 @@ class TestJoinQuantAPI(unittest.TestCase):
             "000001.XSHE",
             end_date=pd.Timestamp("2024-01-03 09:30:00"),
             count=1,
-            fields="close",
+            fields=["open", "close", "high", "low", "volume", "money"],
             panel=False,
         )
         future_df = get_price(
@@ -277,10 +407,15 @@ class TestJoinQuantAPI(unittest.TestCase):
             panel=False,
         )
 
-        self.assertEqual(df["time"].tolist(), ["2024-01-02"])
-        self.assertEqual(df["close"].tolist(), [10.5])
-        self.assertEqual(future_df["time"].tolist(), ["2024-01-02"])
-        self.assertEqual(future_df["close"].tolist(), [10.5])
+        self.assertEqual(df["time"].tolist(), ["2024-01-03"])
+        self.assertEqual(df["open"].tolist(), [10.6])
+        self.assertEqual(df["close"].tolist(), [10.6])
+        self.assertEqual(df["high"].tolist(), [10.6])
+        self.assertEqual(df["low"].tolist(), [10.6])
+        self.assertEqual(df["volume"].tolist(), [0.0])
+        self.assertEqual(df["money"].tolist(), [0.0])
+        self.assertEqual(future_df["time"].tolist(), ["2024-01-03"])
+        self.assertEqual(future_df["close"].tolist(), [10.6])
 
     def test_get_fundamentals_at_open_clamps_context_date_to_previous_trade_day(self):
         set_runtime_state(

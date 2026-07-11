@@ -37,17 +37,24 @@ def get_price(
         fq=fq,
         fill_paused=fill_paused,
     )
-    effective_end_date = _context_data_date(end_date)
-    return runtime_state().data_portal.get_price(
+    partial_bar_date = _partial_daily_bar_date(end_date, frequency)
+    effective_end_date = partial_bar_date or _context_data_date(end_date)
+    portal_fields = _price_fields_with_open(fields) if partial_bar_date is not None else fields
+    frame = runtime_state().data_portal.get_price(
         security,
         start_date=start_date,
         end_date=effective_end_date,
         count=count,
         frequency=frequency,
-        fields=fields,
+        fields=portal_fields,
         panel=panel,
         fq=fq,
+        skip_paused=skip_paused,
+        fill_paused=fill_paused,
     )
+    if partial_bar_date is None:
+        return frame
+    return _mask_partial_daily_bar(frame, partial_bar_date, fields)
 
 
 def attribute_history(
@@ -238,6 +245,48 @@ def _context_current_date():
     if context is None:
         return None
     return getattr(context, "current_dt", None)
+
+
+def _partial_daily_bar_date(requested_date, frequency):
+    if requested_date is None or frequency not in {"daily", "1d"}:
+        return None
+    current_dt = _context_current_date()
+    if current_dt is None or not hasattr(current_dt, "time"):
+        return None
+    current_time = current_dt.time()
+    if current_time < time(9, 30) or current_time >= time(9, 31):
+        return None
+    if _date_key(requested_date) < _date_key(current_dt):
+        return None
+    return current_dt
+
+
+def _price_fields_with_open(fields):
+    if fields is None:
+        return None
+    requested = [fields] if isinstance(fields, str) else list(fields)
+    return requested if "open" in requested else [*requested, "open"]
+
+
+def _mask_partial_daily_bar(frame, partial_bar_date, requested_fields):
+    if frame.empty or "time" not in frame.columns or "open" not in frame.columns:
+        return frame
+    result = frame.copy()
+    current_key = _date_key(partial_bar_date)
+    partial_rows = result["time"].map(_date_key) == current_key
+    if partial_rows.any():
+        opening_prices = result.loc[partial_rows, "open"]
+        for field in ("close", "high", "low"):
+            if field in result.columns:
+                result.loc[partial_rows, field] = opening_prices
+        for field in ("volume", "money"):
+            if field in result.columns:
+                result.loc[partial_rows, field] = 0.0
+    if requested_fields is not None:
+        requested = [requested_fields] if isinstance(requested_fields, str) else list(requested_fields)
+        keep = [name for name in ("time", "code", *requested) if name in result.columns]
+        result = result[keep]
+    return result
 
 
 def _context_data_date(requested_date=None):

@@ -108,6 +108,7 @@ class TestRuntime(unittest.TestCase):
 
         scheduler.run_daily(daily, time="open")
         scheduler.run_weekly(weekly, weekday=2, time="open")
+        scheduler.callbacks_for(datetime(2024, 1, 1, 9, 0), "before_open")
         context = SimpleNamespace(current_dt=datetime(2024, 1, 2, 9, 30))
 
         callbacks = scheduler.callbacks_for(context.current_dt, "open")
@@ -115,6 +116,39 @@ class TestRuntime(unittest.TestCase):
             callback(context)
 
         self.assertEqual(calls, [("daily", 1), ("weekly", 1)])
+
+    def test_scheduler_counts_weekly_days_from_midweek_backtest_start(self):
+        scheduler = Scheduler()
+
+        def second_day(_context):
+            return None
+
+        def fourth_day(_context):
+            return None
+
+        scheduler.run_weekly(second_day, weekday=2, time="open")
+        scheduler.run_weekly(fourth_day, weekday=4, time="open")
+
+        first = scheduler.callbacks_for(datetime(2026, 7, 7, 9, 30), "open")
+        second = scheduler.callbacks_for(
+            datetime(2026, 7, 8, 9, 30),
+            "open",
+            previous_dt=datetime(2026, 7, 7),
+        )
+        scheduler.callbacks_for(
+            datetime(2026, 7, 9, 9, 30),
+            "open",
+            previous_dt=datetime(2026, 7, 8),
+        )
+        fourth = scheduler.callbacks_for(
+            datetime(2026, 7, 10, 9, 30),
+            "open",
+            previous_dt=datetime(2026, 7, 9),
+        )
+
+        self.assertEqual(first, [])
+        self.assertEqual(second, [second_day])
+        self.assertEqual(fourth, [fourth_day])
 
     def test_scheduler_runs_weekly_on_first_trade_day_after_closed_weekday(self):
         scheduler = Scheduler()

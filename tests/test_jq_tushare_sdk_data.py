@@ -446,9 +446,20 @@ class TestDataLayer(unittest.TestCase):
                 super().__init__(backend)
                 self.adjustment_calls = 0
 
-            def _apply_price_adjustment(self, df, api_name: str, fq):
+            def _apply_price_adjustment(
+                self,
+                df,
+                api_name: str,
+                fq,
+                adjustment_end_date=None,
+            ):
                 self.adjustment_calls += 1
-                return super()._apply_price_adjustment(df, api_name=api_name, fq=fq)
+                return super()._apply_price_adjustment(
+                    df,
+                    api_name=api_name,
+                    fq=fq,
+                    adjustment_end_date=adjustment_end_date,
+                )
 
         portal = CountingPortal(FakeBackend())
 
@@ -564,7 +575,7 @@ class TestDataLayer(unittest.TestCase):
         portal = DataPortal(FakeBackend())
 
         with self.assertRaises(NotImplementedError):
-            portal.get_price("000001.XSHE", start_date="20240102", end_date="20240103", skip_paused=True)
+            portal.get_price("000001.XSHE", start_date="20240102", end_date="20240103", unsupported=True)
 
     def test_get_price_rejects_unsupported_frequency(self):
         portal = DataPortal(FakeBackend())
@@ -727,6 +738,29 @@ class TestDataLayer(unittest.TestCase):
         self.assertTrue(current["000002.XSHE"].paused)
         self.assertEqual(current["000002.XSHE"].last_price, 8.0)
         self.assertEqual(current["000002.XSHE"].day_open, 8.0)
+
+    def test_get_current_data_marks_stale_price_as_paused(self):
+        backend = FakeBackend()
+        backend.frames["daily"] = pd.DataFrame(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": "20240102",
+                    "open": 10.0,
+                    "high": 10.5,
+                    "low": 9.8,
+                    "close": 10.2,
+                    "vol": 1000.0,
+                    "amount": 10200.0,
+                }
+            ]
+        )
+        portal = DataPortal(backend)
+
+        current = portal.get_current_data(["000001.XSHE"], date="2024-01-03")
+
+        self.assertTrue(current["000001.XSHE"].paused)
+        self.assertEqual(current["000001.XSHE"].last_price, 10.2)
 
     def test_get_current_data_reuses_stock_basic_metadata_cache(self):
         class CountingBackend(FakeBackend):
@@ -919,7 +953,7 @@ class TestDataLayer(unittest.TestCase):
         self.assertEqual(df["total_operating_revenue"].tolist(), [160.0])
         self.assertEqual(df["np_parent_company_owners"].tolist(), [25.0])
 
-    def test_get_fundamentals_falls_back_to_latest_announced_income_period(self):
+    def test_get_fundamentals_returns_empty_when_requested_income_period_is_not_announced(self):
         from jq_tushare_sdk.api.finance_tables import income
         from jq_tushare_sdk.api.query import query
 
@@ -972,9 +1006,11 @@ class TestDataLayer(unittest.TestCase):
             statDate="2025q4",
         )
 
-        self.assertEqual(df["code"].tolist(), ["000001.XSHE"])
-        self.assertEqual(df["total_operating_revenue"].tolist(), [150.0])
-        self.assertEqual(df["np_parent_company_owners"].tolist(), [25.0])
+        self.assertEqual(
+            df.columns.tolist(),
+            ["code", "total_operating_revenue", "np_parent_company_owners"],
+        )
+        self.assertTrue(df.empty)
 
     def test_get_fundamentals_uses_requested_income_period_after_announcement(self):
         from jq_tushare_sdk.api.finance_tables import income
@@ -1500,6 +1536,119 @@ def get_signal(context):
             frame = backend.fetch("stock_basic")
 
         self.assertEqual(frame["ts_code"].tolist(), ["000001.SZ", "600000.SH"])
+
+    def test_cache_backend_fetches_latest_price_per_security(self):
+        with TemporaryDirectory() as tmp:
+            backend = TushareCacheBackend(str(Path(tmp) / "data" / "jq_tushare_cache.db"))
+            backend.cache_data(
+                "daily",
+                pd.DataFrame(
+                    [
+                        {"ts_code": "000001.SZ", "trade_date": "20240102", "close": 10.0},
+                        {"ts_code": "000001.SZ", "trade_date": "20240103", "close": 10.2},
+                        {"ts_code": "600000.SH", "trade_date": "20240102", "close": 8.0},
+                        {"ts_code": "600000.SH", "trade_date": "20240104", "close": 8.3},
+                    ]
+                ),
+            )
+
+            frame = backend.fetch(
+                "daily",
+                ts_code="000001.SZ,600000.SH",
+                end_date="20240103",
+                latest_per_code=True,
+            )
+
+        self.assertEqual(
+            frame[["ts_code", "trade_date", "close"]].to_dict("records"),
+            [
+                {"ts_code": "600000.SH", "trade_date": "20240102", "close": 8.0},
+                {"ts_code": "000001.SZ", "trade_date": "20240103", "close": 10.2},
+            ],
+        )
+
+    def test_cache_backend_fetches_latest_active_prices_per_security(self):
+        with TemporaryDirectory() as tmp:
+            backend = TushareCacheBackend(str(Path(tmp) / "data" / "jq_tushare_cache.db"))
+            backend.cache_data(
+                "daily",
+                pd.DataFrame(
+                    [
+                        {"ts_code": "000001.SZ", "trade_date": "20240101", "close": 9.8, "vol": 100.0},
+                        {"ts_code": "000001.SZ", "trade_date": "20240102", "close": 10.0, "vol": 200.0},
+                        {"ts_code": "000001.SZ", "trade_date": "20240103", "close": 10.0, "vol": 0.0},
+                        {"ts_code": "000001.SZ", "trade_date": "20240104", "close": 10.0, "vol": 0.0},
+                    ]
+                ),
+            )
+
+            frame = backend.fetch(
+                "daily",
+                ts_code="000001.SZ",
+                end_date="20240104",
+                positive_volume=True,
+                limit_per_code=2,
+            )
+
+        self.assertEqual(frame["trade_date"].tolist(), ["20240101", "20240102"])
+
+    def test_skip_paused_count_adjusts_to_requested_end_factor(self):
+        with TemporaryDirectory() as tmp:
+            backend = TushareCacheBackend(str(Path(tmp) / "data" / "jq_tushare_cache.db"))
+            backend.cache_data(
+                "daily",
+                pd.DataFrame(
+                    [
+                        {"ts_code": "000001.SZ", "trade_date": "20240101", "close": 10.0, "vol": 100.0},
+                        {"ts_code": "000001.SZ", "trade_date": "20240103", "close": 10.0, "vol": 0.0},
+                    ]
+                ),
+            )
+            backend.cache_data(
+                "adj_factor",
+                pd.DataFrame(
+                    [
+                        {"ts_code": "000001.SZ", "trade_date": "20240101", "adj_factor": 1.0},
+                        {"ts_code": "000001.SZ", "trade_date": "20240103", "adj_factor": 2.0},
+                    ]
+                ),
+            )
+            portal = DataPortal(backend)
+
+            frame = portal.get_price(
+                "000001.XSHE",
+                end_date="20240103",
+                count=1,
+                fields="close",
+                fq="pre",
+                skip_paused=True,
+                fill_paused=True,
+            )
+
+        self.assertEqual(frame["close"].tolist(), [5.0])
+
+    def test_price_seed_adjustment_uses_each_security_seed_date(self):
+        backend = FakeBackend()
+        backend.frames["adj_factor"] = pd.DataFrame(
+            [
+                {"ts_code": "000001.SZ", "trade_date": "20240101", "adj_factor": 1.0},
+                {"ts_code": "000001.SZ", "trade_date": "20240103", "adj_factor": 2.0},
+                {"ts_code": "000001.SZ", "trade_date": "20240105", "adj_factor": 4.0},
+                {"ts_code": "600000.SH", "trade_date": "20240103", "adj_factor": 3.0},
+                {"ts_code": "600000.SH", "trade_date": "20240105", "adj_factor": 6.0},
+            ]
+        )
+        portal = DataPortal(backend)
+        seed = pd.DataFrame(
+            [
+                {"ts_code": "000001.SZ", "trade_date": "20240101", "close": 10.0},
+                {"ts_code": "600000.SH", "trade_date": "20240103", "close": 20.0},
+            ]
+        )
+
+        adjusted = portal._adjust_price_seed_to_end(seed, api_name="daily", end_date="20240105")
+
+        self.assertEqual(adjusted["close"].tolist(), [2.5, 10.0])
 
     def test_cache_backend_update_data_fetches_all_stock_basic_statuses(self):
         pro = Mock()

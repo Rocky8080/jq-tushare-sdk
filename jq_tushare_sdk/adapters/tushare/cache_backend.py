@@ -227,7 +227,22 @@ class TushareCacheBackend:
     def fetch(self, api_name: str, **params) -> pd.DataFrame:
         spec = self._spec(api_name)
         where_sql, sql_params = self._where_clause(api_name, spec, params)
-        sql = f"SELECT * FROM {spec.table}{where_sql}"
+        latest_per_code = bool(params.get("latest_per_code", False))
+        positive_volume = bool(params.get("positive_volume", False))
+        limit_per_code = params.get("limit_per_code")
+        if positive_volume and "vol" in spec.columns:
+            where_sql += " AND vol > 0" if where_sql else " WHERE vol > 0"
+        row_limit = 1 if latest_per_code else int(limit_per_code) if limit_per_code else None
+        if row_limit and "ts_code" in spec.primary_keys and spec.date_column:
+            sql = (
+                "SELECT * FROM ("
+                f"SELECT *, ROW_NUMBER() OVER (PARTITION BY ts_code ORDER BY {spec.date_column} DESC) AS _row_number "
+                f"FROM {spec.table}{where_sql}"
+                ") WHERE _row_number <= ?"
+            )
+            sql_params = [*sql_params, row_limit]
+        else:
+            sql = f"SELECT * FROM {spec.table}{where_sql}"
         order_columns = []
         if spec.date_column:
             order_columns.append(spec.date_column)
@@ -238,6 +253,7 @@ class TushareCacheBackend:
         if order_columns:
             sql += " ORDER BY " + ", ".join(order_columns)
         frame = self._read_sql(sql, sql_params)
+        frame = frame.drop(columns=["_row_number"], errors="ignore")
         return self._project_fields(frame, params.get("fields"))
 
     def status(self, api_name: str) -> dict:
