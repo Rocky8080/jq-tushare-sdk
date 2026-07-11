@@ -143,28 +143,41 @@ PY
 
 Expected: FAIL because the function does not exist.
 
-- [ ] **Step 2: Build loop bindings from static module iterables**
+- [ ] **Step 2: Resolve loop bindings within lexical scope**
 
-Add a helper that walks `ast.For` nodes, evaluates each iterable with the existing module environment, and records string values for simple name targets:
+Use an AST visitor with a loop-binding stack. When entering a `for` body,
+evaluate its iterable with the existing module environment and push bindings
+for a simple name target. Pop that binding after visiting the body so a
+same-named variable outside the loop cannot inherit index values. Nested loops
+use the innermost active binding.
 
 ```python
-def _static_loop_bindings(tree: ast.AST, module_env: dict[str, object]) -> dict[str, tuple[str, ...]]:
-    bindings: dict[str, list[str]] = {}
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.For) or not isinstance(node.target, ast.Name):
-            continue
-        values = _evaluate_static_expression(node.iter, module_env)
-        if not isinstance(values, (list, tuple, set)):
-            continue
-        strings = [str(value) for value in values if isinstance(value, str)]
-        if strings:
-            bindings.setdefault(node.target.id, []).extend(strings)
-    return {name: tuple(dict.fromkeys(values)) for name, values in bindings.items()}
+class _IndexPriceCallVisitor(ast.NodeVisitor):
+    def __init__(self, module_env):
+        self.module_env = module_env
+        self.loop_bindings = []
+        self.calls = []
+
+    def visit_For(self, node):
+        values = _evaluate_static_expression(node.iter, self.module_env)
+        binding = _loop_binding(node.target, values)
+        self.loop_bindings.append(binding)
+        for statement in node.body:
+            self.visit(statement)
+        self.loop_bindings.pop()
+        for statement in node.orelse:
+            self.visit(statement)
 ```
 
 - [ ] **Step 3: Implement call-aware requirement inference**
 
-For every `get_price` call, resolve its first positional argument from either the module environment or loop bindings. Evaluate its `count` with `_price_count_argument_node` and `_evaluate_numeric_expression`. Keep only positive counts and symbols accepted by `is_tushare_index_code`; retain the maximum count per symbol in first-seen order.
+For every `get_price` call, resolve its first positional argument from either
+the module environment or the currently active lexical loop bindings. Evaluate
+its `count` with `_price_count_argument_node` and
+`_evaluate_numeric_expression`. Sort discovered calls by `lineno` and
+`col_offset` before building the result. Keep only positive counts and symbols
+accepted by `is_tushare_index_code`; retain the maximum count per symbol in
+first-seen source order.
 
 The public function must return `{}` for a missing file or syntax error and must not raise for unresolved calls.
 
