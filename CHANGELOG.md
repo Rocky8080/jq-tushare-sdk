@@ -4,6 +4,12 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.18] - 2026-07-11
+
+### Changed
+
+- Add transparent canonical price caching, layered performance metrics, SQLite read optimization, and sensitive log redaction.
+
 ## [0.10.17] - 2026-07-07
 
 ### Changed
