@@ -1,5 +1,9 @@
 _SH_FUND_PREFIXES = ("510", "511", "512", "513", "515", "516", "517", "518", "560", "561", "562", "563", "588", "589")
 _SZ_FUND_PREFIXES = ("159", "160", "161", "162", "163", "164", "165", "166", "167", "168", "169")
+_SH_INDEX_CODES = {
+    "000001", "000016", "000300", "000688", "000852",
+    "000905", "000906", "000985",
+}
 
 
 def to_tushare_code(code: str) -> str:
@@ -42,6 +46,16 @@ def is_tushare_fund_code(code: str) -> bool:
     if exchange == "SZ":
         return symbol.startswith(_SZ_FUND_PREFIXES)
     return False
+
+
+def is_tushare_index_code(code: str) -> bool:
+    raw = to_tushare_code(code)
+    if "." not in raw:
+        return False
+    symbol, exchange = raw.split(".", 1)
+    if exchange == "SZ":
+        return symbol.startswith("399")
+    return exchange == "SH" and symbol in _SH_INDEX_CODES
 
 
 def normalize_date(value) -> str:

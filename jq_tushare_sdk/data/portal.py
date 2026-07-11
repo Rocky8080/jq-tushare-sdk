@@ -11,6 +11,7 @@ from jq_tushare_sdk.data.canonical_price_store import (
 )
 from jq_tushare_sdk.data.code_map import (
     is_tushare_fund_code,
+    is_tushare_index_code,
     joinquant_date,
     normalize_date,
     to_joinquant_code,
@@ -45,9 +46,6 @@ class ContinuousFundamentalsResult:
 
 
 class DataPortal:
-    INDEX_CODE_PREFIXES = ("399",)
-    SH_INDEX_CODES = {"000016", "000300", "000688", "000852", "000905", "000906", "000985"}
-
     def __init__(
         self,
         backend,
@@ -521,21 +519,11 @@ class DataPortal:
 
     def _single_price_api_name(self, security) -> str:
         code = to_tushare_code(security)
-        if self._is_index_code(code):
+        if is_tushare_index_code(code):
             return "index_daily"
         if is_tushare_fund_code(code):
             return "fund_daily"
         return "daily"
-
-    def _is_index_code(self, code: str) -> bool:
-        if "." not in code:
-            return False
-        raw_code, exchange = code.split(".", 1)
-        if exchange == "SZ" and raw_code.startswith(self.INDEX_CODE_PREFIXES):
-            return True
-        if exchange == "SH" and raw_code in self.SH_INDEX_CODES:
-            return True
-        return False
 
     def _normalize_fields(self, fields) -> list[str]:
         if fields is None:
