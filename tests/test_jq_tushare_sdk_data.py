@@ -1175,7 +1175,7 @@ def initialize(context):
         self.assertEqual(len(issues), 1)
         self.assertEqual(issues[0].api_name, "index_daily")
         self.assertIn("000985.XSHG", issues[0].message)
-        self.assertIn("ts_code 000985.SH", issues[0].suggestion)
+        self.assertIn("--ts-code 000985.SH", issues[0].suggestion)
         self.assertEqual(issues[0].update_requests[0].api_name, "index_daily")
         self.assertEqual(dict(issues[0].update_requests[0].params), {"ts_code": "000985.SH"})
 
