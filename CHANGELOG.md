@@ -4,6 +4,12 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.19] - 2026-07-11
+
+### Changed
+
+- Infer, validate, and backfill strategy index price dependencies, including Shanghai Composite routing.
+
 ## [0.10.18] - 2026-07-11
 
 ### Changed
