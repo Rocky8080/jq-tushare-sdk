@@ -86,10 +86,10 @@ class DataReadinessCheck:
             issues.append(fund_issue)
         for api_name in apis:
             if api_name == "index_daily":
-                issue = self._check_benchmark_index(config, price_market_start, price_market_end)
+                issue = self._check_required_indexes(config, price_market_start, price_market_end)
                 if issue is not None:
                     issues.append(issue)
-                    continue
+                continue
             if api_name == "index_weight":
                 issue = self._check_index_weight(config, start, end)
                 if issue is not None:
@@ -168,43 +168,72 @@ class DataReadinessCheck:
             update_requests=(_update_request("stock_basic"),),
         )
 
-    def _check_benchmark_index(self, config, start: str, end: str) -> ReadinessIssue | None:
+    def _check_required_indexes(self, config, start: str, end: str) -> ReadinessIssue | None:
         benchmark = infer_strategy_benchmark(getattr(config, "strategy_path", None)) or getattr(config, "benchmark", None)
-        if not benchmark:
-            return None
-        ts_code = to_tushare_code(str(benchmark))
-        try:
-            frame = self.backend.fetch(
-                "index_daily",
-                ts_code=ts_code,
-                start_date=start,
-                end_date=end,
-            )
-        except Exception:
-            frame = None
-        min_date, max_date = _frame_date_bounds(frame, "trade_date")
-        if min_date is not None and max_date is not None and start >= min_date and end <= max_date:
-            return None
+        requirements: dict[str, tuple[str, str]] = {}
+
+        def add_requirement(symbol, required_start: str) -> None:
+            ts_code = to_tushare_code(str(symbol))
+            current = requirements.get(ts_code)
+            if current is None or required_start < current[1]:
+                requirements[ts_code] = (str(symbol), required_start)
+
+        if benchmark:
+            add_requirement(benchmark, start)
+        for symbol, count in infer_strategy_index_price_requirements(getattr(config, "strategy_path", None)).items():
+            lookback_days = max(int(count) * 3 + 7, 14)
+            required_start = (
+                datetime.strptime(normalize_date(config.start_date), "%Y%m%d")
+                - timedelta(days=lookback_days)
+            ).strftime("%Y%m%d")
+            add_requirement(symbol, required_start)
+
+        incomplete = []
         update_requests = []
-        if min_date is None or max_date is None:
-            update_requests.append(_update_request("index_daily", start, end, ts_code=ts_code))
-            message = (
-                f"Local cache has no index_daily data for benchmark {benchmark} "
-                f"between {config.start_date} and {config.end_date}."
+        for ts_code, (symbol, required_start) in requirements.items():
+            try:
+                frame = self.backend.fetch(
+                    "index_daily",
+                    ts_code=ts_code,
+                    start_date=required_start,
+                    end_date=end,
+                )
+            except Exception:
+                frame = None
+            min_date, max_date = _frame_date_bounds(frame, "trade_date")
+            if min_date is not None and max_date is not None and required_start >= min_date and end <= max_date:
+                continue
+
+            if min_date is None or max_date is None:
+                missing_start, missing_end = required_start, end
+                detail = "has no local data"
+            else:
+                missing = []
+                if required_start < min_date:
+                    missing.append(f"starts at {min_date}, missing requested start {required_start}")
+                    missing_start, missing_end = required_start, min_date
+                else:
+                    missing_start, missing_end = max_date, end
+                if end > max_date:
+                    missing.append(f"ends at {max_date}, missing requested end {end}")
+                    missing_start, missing_end = missing_start, end
+                detail = ", ".join(missing)
+            incomplete.append(f"{symbol}({ts_code}) {detail}")
+            update_requests.append(
+                _update_request("index_daily", missing_start, missing_end, ts_code=ts_code)
             )
-        else:
-            missing = []
-            if start < min_date:
-                missing.append(f"starts at {min_date}, missing requested start {config.start_date}")
-                update_requests.append(_update_request("index_daily", start, min_date, ts_code=ts_code))
-            if end > max_date:
-                missing.append(f"ends at {max_date}, missing requested end {config.end_date}")
-                update_requests.append(_update_request("index_daily", max_date, end, ts_code=ts_code))
-            message = f"index_daily for benchmark {benchmark} is incomplete: {', '.join(missing)}."
+
+        if not incomplete:
+            return None
+        suggestion = " && ".join(
+            f"python update_data.py --api index_daily --start-date {request.start_date} "
+            f"--end-date {request.end_date} --ts_code {dict(request.params)['ts_code']}"
+            for request in update_requests
+        )
         return ReadinessIssue(
             api_name="index_daily",
-            message=message,
-            suggestion=f"python update_data.py --api index_daily --start-date {start} --end-date {end} --ts_code {ts_code}",
+            message=f"index_daily is incomplete for required indexes: {', '.join(incomplete)}.",
+            suggestion=suggestion,
             update_requests=tuple(update_requests),
         )
 
