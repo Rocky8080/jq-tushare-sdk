@@ -4,6 +4,7 @@ import time as time_module
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, time
+from typing import Callable
 
 from jq_tushare_sdk.broker.broker import Broker
 from jq_tushare_sdk.config import BacktestConfig, RunManifest
@@ -33,14 +34,19 @@ class BacktestEngine:
         config: BacktestConfig,
         backend,
         output_manager: OutputManager | None = None,
+        progress_callback: Callable[[float, str, str | None], None] | None = None,
     ):
         self.config = config
         self.backend = backend
         self.output_manager = output_manager or OutputManager()
+        self.progress_callback = progress_callback
+        self.active_run_dir = None
 
     def run(self) -> RunManifest:
+        self._report_progress(0.0, "初始化策略")
         profiler = _PerformanceProfiler()
         output = self.output_manager.create_run(self.config)
+        self.active_run_dir = output.run_dir
         logger = RuntimeLogger(output.logs_dir / "backtest.log")
         price_cache_start = infer_strategy_price_lookback_start(
             self.config.strategy_path,
@@ -72,6 +78,7 @@ class BacktestEngine:
             security_names = self._security_names(portal)
             benchmark = getattr(state, "benchmark", None) or self.config.benchmark
             trade_days = list(portal.get_trade_days(self.config.start_date, self.config.end_date))
+        self._report_progress(0.04, "准备行情数据", f"共 {len(trade_days)} 个交易日")
         with profiler.measure_phase("benchmark", "基准数据读取"):
             benchmark_closes = self._benchmark_closes(portal, benchmark, trade_days)
             benchmark_issue = None
@@ -83,7 +90,8 @@ class BacktestEngine:
         previous_total = None
         peak_value = float(context.portfolio.total_value)
         previous_trade_day = None
-        for trade_day in trade_days:
+        total_trade_days = len(trade_days)
+        for day_index, trade_day in enumerate(trade_days, start=1):
             day_start = profiler.now()
             day_callback_seconds = 0.0
             day_mark_seconds = 0.0
@@ -140,10 +148,18 @@ class BacktestEngine:
                 mark_to_market_seconds=day_mark_seconds,
                 callback_count=day_callback_count,
             )
+            day_progress = day_index / total_trade_days if total_trade_days else 1.0
+            self._report_progress(
+                0.05 + day_progress * 0.88,
+                "执行策略回调",
+                f"{trade_day}（{day_index}/{total_trade_days}）",
+            )
+        self._report_progress(0.95, "计算收益指标")
         with profiler.measure_phase("risk_metrics", "收益指标计算"):
             self._apply_benchmark_returns(rows, benchmark_closes)
 
         formatter = JoinQuantOutputFormatter()
+        self._report_progress(0.97, "生成回测报告")
         with profiler.measure_phase("output", "结果文件写入"):
             formatter.write_transactions(
                 output.trades_dir / "transactions.csv",
@@ -185,7 +201,13 @@ class BacktestEngine:
             log_lines=self._read_log_lines(output.logs_dir / "backtest.log"),
             security_names=security_names,
         )
+        self._report_progress(1.0, "回测完成")
         return output
+
+    def _report_progress(self, value: float, stage: str, detail: str | None = None) -> None:
+        if self.progress_callback is None:
+            return
+        self.progress_callback(max(0.0, min(1.0, float(value))), stage, detail)
 
     def _summary(
         self,

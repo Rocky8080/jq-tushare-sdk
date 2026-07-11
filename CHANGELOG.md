@@ -4,6 +4,12 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.21] - 2026-07-11
+
+### Changed
+
+- Add live backtest progress, elapsed timing, and cooperative cancellation to the Web console.
+
 ## [0.10.20] - 2026-07-11
 
 ### Changed

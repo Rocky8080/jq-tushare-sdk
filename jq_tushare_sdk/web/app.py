@@ -7,6 +7,7 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import sqlite3
 import threading
 import traceback
@@ -52,6 +53,10 @@ _EXCLUDED_STRATEGY_DIRS = {
 }
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+class BacktestCancelled(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -156,9 +161,11 @@ class BacktestJobManager:
         self.default_cache_db = Path(default_cache_db)
         self.output_dir = Path(output_dir)
         self.runner = runner or _run_local_backtest
+        self._uses_default_runner = runner is None
         self.synchronous = synchronous
         self._lock = threading.Lock()
         self._jobs: dict[str, dict] = {}
+        self._cancel_events: dict[str, threading.Event] = {}
 
     def start(self, request: BacktestRequest) -> dict:
         config = self._config_from_request(request)
@@ -166,6 +173,9 @@ class BacktestJobManager:
         job = {
             "job_id": job_id,
             "status": "queued",
+            "progress_percent": 0,
+            "progress_stage": "排队等待",
+            "progress_detail": None,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "strategy_name": Path(config.strategy_path).stem,
             "strategy_path": config.strategy_path,
@@ -188,6 +198,7 @@ class BacktestJobManager:
         }
         with self._lock:
             self._jobs[job_id] = job
+            self._cancel_events[job_id] = threading.Event()
 
         if self.synchronous:
             self._run_job(job_id, config)
@@ -206,31 +217,109 @@ class BacktestJobManager:
                 raise KeyError(job_id)
             return dict(self._jobs[job_id])
 
+    def cancel(self, job_id: str) -> dict:
+        with self._lock:
+            if job_id not in self._jobs:
+                raise KeyError(job_id)
+            job = self._jobs[job_id]
+            if job["status"] not in {"queued", "running", "cancelling"}:
+                return dict(job)
+            self._cancel_events[job_id].set()
+            job.update(
+                status="cancelling",
+                progress_stage="正在安全取消",
+                progress_detail="将在当前数据请求或交易日处理结束后停止",
+            )
+            return dict(job)
+
     def _run_job(self, job_id: str, config: BacktestConfig) -> None:
-        self._update(job_id, status="running", started_at=datetime.now().isoformat(timespec="seconds"))
+        cancel_event = self._cancel_events[job_id]
+        if cancel_event.is_set():
+            self._mark_cancelled(job_id)
+            return
+        self._update(
+            job_id,
+            status="running",
+            started_at=datetime.now().isoformat(timespec="seconds"),
+            progress_percent=1,
+            progress_stage="启动任务",
+        )
         try:
-            manifest = self.runner(config)
+            if self._uses_default_runner:
+                manifest = self.runner(
+                    config,
+                    progress_callback=lambda percent, stage, detail=None: self._handle_progress(
+                        job_id, cancel_event, percent, stage, detail
+                    ),
+                )
+            else:
+                manifest = self.runner(config)
+        except BacktestCancelled:
+            self._mark_cancelled(job_id)
+            return
         except Exception as exc:
             self._update(
                 job_id,
                 status="failed",
                 finished_at=datetime.now().isoformat(timespec="seconds"),
+                progress_stage="运行失败",
                 error=str(exc),
                 traceback=traceback.format_exc(limit=20),
             )
+            return
+        if cancel_event.is_set():
+            self._mark_cancelled(job_id)
             return
         self._update(
             job_id,
             status="completed",
             finished_at=datetime.now().isoformat(timespec="seconds"),
+            progress_percent=100,
+            progress_stage="回测完成",
+            progress_detail=None,
             run_id=manifest.run_id,
             run_dir=str(manifest.run_dir),
             report_path=f"{manifest.run_id}/reports/report.html",
         )
 
+    def _handle_progress(
+        self,
+        job_id: str,
+        cancel_event: threading.Event,
+        percent: float,
+        stage: str,
+        detail: str | None = None,
+    ) -> None:
+        if cancel_event.is_set():
+            raise BacktestCancelled("backtest cancelled by user")
+        self._update_progress(job_id, percent, stage, detail)
+
+    def _mark_cancelled(self, job_id: str) -> None:
+        self._update(
+            job_id,
+            status="cancelled",
+            finished_at=datetime.now().isoformat(timespec="seconds"),
+            progress_stage="已取消",
+            progress_detail=None,
+        )
+
     def _update(self, job_id: str, **changes) -> None:
         with self._lock:
             self._jobs[job_id].update(changes)
+
+    def _update_progress(
+        self,
+        job_id: str,
+        percent: float,
+        stage: str,
+        detail: str | None = None,
+    ) -> None:
+        self._update(
+            job_id,
+            progress_percent=max(0, min(100, int(round(percent)))),
+            progress_stage=str(stage),
+            progress_detail=str(detail) if detail else None,
+        )
 
     def _config_from_request(self, request: BacktestRequest) -> BacktestConfig:
         if not request.strategy_path:
@@ -566,6 +655,9 @@ def _handler_factory(
                     payload = _prefer_project_strategy_for_stale_snapshot(project_root, payload)
                     job = manager.start(BacktestRequest.from_payload(payload))
                     self._write_json({"job": job}, status=HTTPStatus.ACCEPTED)
+                elif parsed.path.startswith("/api/jobs/") and parsed.path.endswith("/cancel"):
+                    job_id = Path(parsed.path[: -len("/cancel")]).name
+                    self._write_json({"job": manager.cancel(job_id)})
                 elif parsed.path == "/api/strategy-file":
                     strategy = save_uploaded_strategy_file(project_root, payload)
                     self._write_json({"strategy": strategy})
@@ -647,7 +739,10 @@ def _handler_factory(
     return WebConsoleHandler
 
 
-def _run_local_backtest(config: BacktestConfig) -> RunManifest:
+def _run_local_backtest(
+    config: BacktestConfig,
+    progress_callback: Callable[[float, str, str | None], None] | None = None,
+) -> RunManifest:
     from jq_tushare_sdk.adapters.tushare.cache_backend import TushareCacheBackend
     from jq_tushare_sdk.runtime.engine import BacktestEngine
 
@@ -656,21 +751,59 @@ def _run_local_backtest(config: BacktestConfig) -> RunManifest:
         token=os.environ.get("TUSHARE_TOKEN"),
         cache_mode="strict_local",
     )
+    def report(percent: float, stage: str, detail: str | None = None) -> None:
+        if progress_callback is not None:
+            progress_callback(percent, stage, detail)
+
     try:
+        report(4, "检查本地数据")
         issues = _readiness_issues(config, backend=backend)
         if issues:
             from jq_tushare_sdk.data.readiness import update_missing_data
 
             try:
+                report(10, "自动补齐数据", f"发现 {len(issues)} 个数据缺口")
                 update_missing_data(backend, issues)
             except Exception as exc:
                 raise RuntimeError(_format_readiness_error(config, issues, f"Automatic data update failed: {exc}")) from exc
+            report(25, "复查本地数据")
             issues = _readiness_issues(config, backend=backend)
         if issues:
             raise RuntimeError(_format_readiness_error(config, issues, "Local cache is not ready after automatic update:"))
-        return BacktestEngine(config, backend=backend).run()
+        report(30, "准备回测引擎")
+
+        def report_engine(value: float, stage: str, detail: str | None = None) -> None:
+            report(30 + value * 68, stage, detail)
+
+        output_root = Path(config.output_dir)
+        latest_path = output_root / "latest"
+        previous_latest = latest_path.read_text(encoding="utf-8").strip() if latest_path.exists() else None
+        engine = BacktestEngine(
+            config,
+            backend=backend,
+            progress_callback=report_engine,
+        )
+        try:
+            return engine.run()
+        except BacktestCancelled:
+            _cleanup_cancelled_run(engine.active_run_dir, output_root, previous_latest)
+            raise
     finally:
         _close_backend(backend)
+
+
+def _cleanup_cancelled_run(run_dir, output_root: Path, previous_latest: str | None) -> None:
+    if run_dir is not None:
+        resolved_root = output_root.resolve()
+        resolved_run = Path(run_dir).resolve()
+        if resolved_run.is_relative_to(resolved_root) and resolved_run.is_dir():
+            shutil.rmtree(resolved_run)
+
+    latest_path = output_root / "latest"
+    if previous_latest and (output_root / previous_latest).is_dir():
+        latest_path.write_text(previous_latest + "\n", encoding="utf-8")
+    elif latest_path.exists():
+        latest_path.unlink()
 
 
 def _check_data_readiness(config: BacktestConfig, *, backend=None) -> list[dict]:
@@ -988,7 +1121,6 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   color: var(--green);
 }
 .pill.running, .pill.queued { background: #fff2df; color: var(--amber); }
-.pill.failed { background: #fdecec; color: var(--red); }
 .results-layout {
   display: grid;
   grid-template-columns: minmax(0, 1.45fr) minmax(300px, .75fr);
@@ -1588,6 +1720,7 @@ button {
 button:disabled { opacity: .5; cursor: not-allowed; }
 .primary { background: var(--blue); color: white; }
 .secondary { background: var(--blue-soft); color: var(--blue); border-color: #c6d8eb; }
+.danger { background: #fff4f4; color: var(--red); border-color: #efcaca; }
 .notice {
   margin-top: 10px;
   padding: 9px 10px;
@@ -1619,6 +1752,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   border: 1px solid #e2e8ef;
   border-radius: 6px;
 }
+.job-item > strong { min-width: 0; overflow-wrap: anywhere; }
 .pill {
   display: inline-flex;
   justify-content: center;
@@ -1629,8 +1763,42 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   background: #e8f5ed;
   color: var(--green);
 }
-.pill.running, .pill.queued { background: #fff2df; color: var(--amber); }
-.pill.failed { background: #fdecec; color: var(--red); }
+.pill.running, .pill.queued, .pill.cancelling { background: #fff2df; color: var(--amber); }
+.pill.failed, .pill.cancelled { background: #fdecec; color: var(--red); }
+.job-progress {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px 10px;
+  align-items: center;
+  min-width: 0;
+}
+.job-progress-copy {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.job-progress-copy strong { color: var(--text); }
+.job-progress-detail { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.job-progress-track {
+  grid-column: 1 / -1;
+  height: 7px;
+  overflow: hidden;
+  border-radius: 4px;
+  background: #dfe7ef;
+}
+.job-progress-bar {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--blue);
+  transition: width .3s ease;
+}
+.job-item.failed .job-progress-bar, .job-item.cancelled .job-progress-bar { background: var(--red); }
+.job-cancel { height: 30px; padding: 0 10px; font-size: 12px; }
 .job-error {
   grid-column: 1 / -1;
   border-top: 1px solid #efd3d3;
@@ -1714,6 +1882,8 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 @media (max-width: 760px) {
   .topbar { align-items: flex-start; flex-direction: column; }
   .parameter-form.compact, .settings-panel, .history-row, .job-item { display: grid; grid-template-columns: 1fr; }
+  .job-progress { grid-template-columns: minmax(0, 1fr); }
+  .job-progress > span { justify-self: start; }
   #report-frame { min-height: 560px; }
 }
 """
@@ -1829,20 +1999,81 @@ async function loadRuns() {
 function renderJobs() {
   const root = $('jobs');
   root.innerHTML = '';
-  const visibleJobs = state.jobs.filter((job) => ['queued', 'running', 'failed'].includes(job.status));
+  const visibleJobs = state.jobs.filter((job) => ['queued', 'running', 'cancelling', 'failed', 'cancelled'].includes(job.status));
   root.hidden = visibleJobs.length === 0;
   if (!visibleJobs.length) return;
   for (const job of visibleJobs.slice(0, 3)) {
     const div = document.createElement('div');
-    div.className = 'job-item';
+    div.className = `job-item ${job.status}`;
     div.innerHTML = `
       <strong>${escapeHtml(job.strategy_name || 'unknown')}</strong>
       <span class="pill ${job.status}">${statusText(job.status)}</span>
       <span class="muted">${escapeHtml(job.start_date)} - ${escapeHtml(job.end_date)}</span>
-      <span>${job.report_path ? `<a class="secondary link-button" href="/?run_id=${escapeHtml(job.run_id)}">打开</a>` : ''}</span>
+      <span>${renderJobAction(job)}</span>
+      ${renderJobProgress(job)}
       ${renderJobError(job)}
     `;
     root.appendChild(div);
+  }
+  updateJobTimers();
+}
+
+function renderJobAction(job) {
+  if (['queued', 'running'].includes(job.status)) {
+    return `<button type="button" class="danger job-cancel" data-cancel-job="${escapeHtml(job.job_id)}">取消回测</button>`;
+  }
+  if (job.status === 'cancelling') {
+    return '<button type="button" class="danger job-cancel" disabled>正在取消</button>';
+  }
+  return job.report_path ? `<a class="secondary link-button" href="/?run_id=${escapeHtml(job.run_id)}">打开</a>` : '';
+}
+
+function renderJobProgress(job) {
+  const percent = Math.max(0, Math.min(100, Number(job.progress_percent) || 0));
+  const detail = job.progress_detail ? `<span class="job-progress-detail">${escapeHtml(job.progress_detail)}</span>` : '';
+  return `
+    <div class="job-progress" role="progressbar" aria-label="回测进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}">
+      <div class="job-progress-copy">
+        <strong>${escapeHtml(job.progress_stage || statusText(job.status))}</strong>
+        ${detail}
+      </div>
+      <span><strong>${percent}%</strong> · <span data-job-timer="${escapeHtml(job.job_id)}">${formatElapsed(job)}</span></span>
+      <div class="job-progress-track"><span class="job-progress-bar" style="width:${percent}%"></span></div>
+    </div>
+  `;
+}
+
+function formatElapsed(job) {
+  const start = Date.parse(job.started_at || job.created_at || '');
+  if (!Number.isFinite(start)) return '00:00';
+  const finish = Date.parse(job.finished_at || '');
+  const elapsedSeconds = Math.max(0, Math.floor(((Number.isFinite(finish) ? finish : Date.now()) - start) / 1000));
+  const hours = Math.floor(elapsedSeconds / 3600);
+  const minutes = Math.floor((elapsedSeconds % 3600) / 60);
+  const secondsPart = elapsedSeconds % 60;
+  const clock = `${String(minutes).padStart(2, '0')}:${String(secondsPart).padStart(2, '0')}`;
+  return hours ? `${String(hours).padStart(2, '0')}:${clock}` : clock;
+}
+
+function updateJobTimers() {
+  for (const job of state.jobs) {
+    const timer = document.querySelector(`[data-job-timer="${CSS.escape(job.job_id)}"]`);
+    if (timer) timer.textContent = formatElapsed(job);
+  }
+}
+
+async function cancelBacktest(jobId) {
+  try {
+    const payload = await api(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
+      method: 'POST',
+      body: '{}',
+    });
+    const index = state.jobs.findIndex((job) => job.job_id === jobId);
+    if (index >= 0) state.jobs[index] = payload.job;
+    renderJobs();
+    setNotice('已请求取消回测，正在安全停止。');
+  } catch (error) {
+    setNotice(`取消失败：${error.message}`, 'error');
   }
 }
 
@@ -1911,6 +2142,8 @@ function statusText(status) {
   if (status === 'completed') return '完成';
   if (status === 'running') return '运行中';
   if (status === 'queued') return '排队中';
+  if (status === 'cancelling') return '取消中';
+  if (status === 'cancelled') return '已取消';
   if (status === 'failed') return '失败';
   if (status === 'incomplete') return '未生成报告';
   return status || '未知';
@@ -2102,9 +2335,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   $('check-data').addEventListener('click', checkData);
   $('refresh-report').addEventListener('click', refreshSelectedReport);
   $('settings-toggle').addEventListener('click', toggleSettingsPanel);
+  $('jobs').addEventListener('click', (event) => {
+    const button = event.target.closest('[data-cancel-job]');
+    if (button) cancelBacktest(button.dataset.cancelJob);
+  });
   try {
     await refreshAll();
     setInterval(refreshAll, 3000);
+    setInterval(updateJobTimers, 1000);
   } catch (error) {
     setNotice(error.message, 'error');
   }
