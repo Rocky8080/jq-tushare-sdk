@@ -182,10 +182,11 @@ class DataReadinessCheck:
             add_requirement(benchmark, start)
         for symbol, count in infer_strategy_index_price_requirements(getattr(config, "strategy_path", None)).items():
             lookback_days = max(int(count) * 3 + 7, 14)
-            required_start = (
+            calendar_required_start = (
                 datetime.strptime(normalize_date(config.start_date), "%Y%m%d")
                 - timedelta(days=lookback_days)
             ).strftime("%Y%m%d")
+            required_start, _ = self._market_date_bounds(calendar_required_start, end)
             add_requirement(symbol, required_start)
 
         incomplete = []
@@ -226,8 +227,9 @@ class DataReadinessCheck:
         if not incomplete:
             return None
         suggestion = " && ".join(
-            f"python update_data.py --api index_daily --start-date {request.start_date} "
-            f"--end-date {request.end_date} --ts_code {dict(request.params)['ts_code']}"
+            f"python -m jq_tushare_sdk.cli update-data --api index_daily "
+            f"--start {request.start_date} --end {request.end_date} --cache-db <cache_db> "
+            f"--ts-code {dict(request.params)['ts_code']}"
             for request in update_requests
         )
         return ReadinessIssue(
@@ -631,7 +633,13 @@ class _IndexPriceCallVisitor(ast.NodeVisitor):
                 if node.id in bindings:
                     return bindings[node.id] or ()
         value = _evaluate_static_expression(node, self.module_env)
-        return (value,) if isinstance(value, str) else ()
+        if isinstance(value, str):
+            return (value,)
+        if isinstance(value, (list, tuple)):
+            return tuple(item for item in value if isinstance(item, str))
+        if isinstance(value, set):
+            return tuple(sorted(item for item in value if isinstance(item, str)))
+        return ()
 
 
 def _static_loop_string_values(node: ast.AST, module_env: dict[str, object]) -> tuple[str, ...] | None:
