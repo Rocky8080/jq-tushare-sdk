@@ -8,11 +8,15 @@ _SH_INDEX_CODES = {
 
 def to_tushare_code(code: str) -> str:
     raw = str(code).strip()
+    if raw == "000985.XSHG":
+        return "000985.CSI"
+    if raw.endswith(".XSHG") and raw.split(".", 1)[0].startswith("801"):
+        return raw.replace(".XSHG", ".SI")
     if raw.endswith(".XSHE"):
         return raw.replace(".XSHE", ".SZ")
     if raw.endswith(".XSHG"):
         return raw.replace(".XSHG", ".SH")
-    if raw.endswith(".SZ") or raw.endswith(".SH"):
+    if raw.endswith((".SZ", ".SH", ".SI", ".CSI")):
         return raw
     if raw.startswith(("0", "3")):
         return f"{raw}.SZ"
@@ -23,6 +27,10 @@ def to_tushare_code(code: str) -> str:
 
 def to_joinquant_code(code: str) -> str:
     raw = str(code).strip()
+    if raw == "000985.CSI":
+        return "000985.XSHG"
+    if raw.endswith(".SI") and raw.split(".", 1)[0].startswith("801"):
+        return raw.replace(".SI", ".XSHG")
     if raw.endswith(".SZ"):
         return raw.replace(".SZ", ".XSHE")
     if raw.endswith(".SH"):
@@ -50,12 +58,24 @@ def is_tushare_fund_code(code: str) -> bool:
 
 def is_tushare_index_code(code: str) -> bool:
     raw = to_tushare_code(code)
+    if is_tushare_sw_index_code(raw):
+        return True
     if "." not in raw:
         return False
     symbol, exchange = raw.split(".", 1)
+    if exchange == "CSI" and symbol == "000985":
+        return True
     if exchange == "SZ":
         return symbol.startswith("399")
     return exchange == "SH" and symbol in _SH_INDEX_CODES
+
+
+def is_tushare_sw_index_code(code: str) -> bool:
+    raw = to_tushare_code(code)
+    if "." not in raw:
+        return False
+    symbol, exchange = raw.split(".", 1)
+    return exchange == "SI" and len(symbol) == 6 and symbol.startswith("801")
 
 
 def normalize_date(value) -> str:

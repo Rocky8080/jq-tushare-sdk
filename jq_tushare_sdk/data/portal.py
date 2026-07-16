@@ -12,6 +12,7 @@ from jq_tushare_sdk.data.canonical_price_store import (
 from jq_tushare_sdk.data.code_map import (
     is_tushare_fund_code,
     is_tushare_index_code,
+    is_tushare_sw_index_code,
     joinquant_date,
     normalize_date,
     to_joinquant_code,
@@ -575,6 +576,8 @@ class DataPortal:
 
     def _single_price_api_name(self, security) -> str:
         code = to_tushare_code(security)
+        if is_tushare_sw_index_code(code):
+            return "sw_daily"
         if is_tushare_index_code(code):
             return "index_daily"
         if is_tushare_fund_code(code):

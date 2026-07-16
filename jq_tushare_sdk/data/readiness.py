@@ -5,6 +5,7 @@ from pathlib import Path
 
 from jq_tushare_sdk.data.code_map import is_tushare_fund_code
 from jq_tushare_sdk.data.code_map import is_tushare_index_code
+from jq_tushare_sdk.data.code_map import is_tushare_sw_index_code
 from jq_tushare_sdk.data.code_map import normalize_date
 from jq_tushare_sdk.data.code_map import to_tushare_code
 
@@ -34,8 +35,9 @@ _UPDATE_PRIORITY = {
     "fund_adj": 5,
     "fund_daily": 6,
     "index_daily": 7,
-    "index_weight": 8,
-    "income": 9,
+    "sw_daily": 8,
+    "index_weight": 9,
+    "income": 10,
 }
 _MARKET_DAILY_APIS = {"daily", "daily_basic", "adj_factor", "fund_adj", "index_daily"}
 _REQUIRED_STOCK_BASIC_LIST_STATUSES = {"L", "D"}
@@ -191,10 +193,12 @@ class DataReadinessCheck:
 
         incomplete = []
         update_requests = []
+        missing_api_names = set()
         for ts_code, (symbol, required_start) in requirements.items():
+            api_name = "sw_daily" if is_tushare_sw_index_code(ts_code) else "index_daily"
             try:
                 frame = self.backend.fetch(
-                    "index_daily",
+                    api_name,
                     ts_code=ts_code,
                     start_date=required_start,
                     end_date=end,
@@ -220,21 +224,23 @@ class DataReadinessCheck:
                     missing_start, missing_end = missing_start, end
                 detail = ", ".join(missing)
             incomplete.append(f"{symbol}({ts_code}) {detail}")
+            missing_api_names.add(api_name)
             update_requests.append(
-                _update_request("index_daily", missing_start, missing_end, ts_code=ts_code)
+                _update_request(api_name, missing_start, missing_end, ts_code=ts_code)
             )
 
         if not incomplete:
             return None
         suggestion = " && ".join(
-            f"python -m jq_tushare_sdk.cli update-data --api index_daily "
+            f"python -m jq_tushare_sdk.cli update-data --api {request.api_name} "
             f"--start {request.start_date} --end {request.end_date} --cache-db <cache_db> "
             f"--ts-code {dict(request.params)['ts_code']}"
             for request in update_requests
         )
+        issue_api_name = next(iter(missing_api_names)) if len(missing_api_names) == 1 else "index_daily"
         return ReadinessIssue(
-            api_name="index_daily",
-            message=f"index_daily is incomplete for required indexes: {', '.join(incomplete)}.",
+            api_name=issue_api_name,
+            message=f"{issue_api_name} is incomplete for required indexes: {', '.join(incomplete)}.",
             suggestion=suggestion,
             update_requests=tuple(update_requests),
         )

@@ -131,6 +131,30 @@ class FakeBackend:
                     },
                 ]
             ),
+            "sw_daily": pd.DataFrame(
+                [
+                    {
+                        "ts_code": "801010.SI",
+                        "trade_date": "20240102",
+                        "open": 3000.0,
+                        "high": 3030.0,
+                        "low": 2980.0,
+                        "close": 3020.0,
+                        "vol": 80000.0,
+                        "amount": 241600000.0,
+                    },
+                    {
+                        "ts_code": "801010.SI",
+                        "trade_date": "20240103",
+                        "open": 3020.0,
+                        "high": 3060.0,
+                        "low": 3010.0,
+                        "close": 3050.0,
+                        "vol": 85000.0,
+                        "amount": 259250000.0,
+                    },
+                ]
+            ),
             "index_weight": pd.DataFrame(
                 [
                     {"index_code": "000905.SH", "con_code": "000001.SZ", "trade_date": "20240102"},
@@ -223,15 +247,20 @@ class TestDataLayer(unittest.TestCase):
         backend.update_data("index_daily", start_date="20260601", end_date="20260630")
 
         requested_codes = [params["ts_code"] for _, params in backend.calls]
-        self.assertIn("000985.SH", requested_codes)
+        self.assertIn("000985.CSI", requested_codes)
 
     def test_code_conversion(self):
         self.assertEqual(to_tushare_code("000001.XSHE"), "000001.SZ")
         self.assertEqual(to_tushare_code("600000.XSHG"), "600000.SH")
         self.assertEqual(to_tushare_code("399006.XSHE"), "399006.SZ")
         self.assertEqual(to_tushare_code("000688.XSHG"), "000688.SH")
+        self.assertEqual(to_tushare_code("000985.XSHG"), "000985.CSI")
+        self.assertEqual(to_tushare_code("000985.CSI"), "000985.CSI")
         self.assertEqual(to_joinquant_code("000001.SZ"), "000001.XSHE")
         self.assertEqual(to_joinquant_code("600000.SH"), "600000.XSHG")
+        self.assertEqual(to_joinquant_code("000985.CSI"), "000985.XSHG")
+        self.assertEqual(to_tushare_code("801010.XSHG"), "801010.SI")
+        self.assertEqual(to_joinquant_code("801010.SI"), "801010.XSHG")
 
     def test_get_price_returns_joinquant_codes_and_fields(self):
         portal = DataPortal(FakeBackend())
@@ -529,6 +558,48 @@ class TestDataLayer(unittest.TestCase):
         self.assertEqual(df_905["code"].tolist(), ["000905.XSHG"])
         self.assertEqual(df_852["code"].tolist(), ["000852.XSHG"])
         self.assertEqual(df_stock["code"].tolist(), ["000001.XSHE"])
+
+    def test_get_price_routes_csi_benchmark_to_index_daily(self):
+        backend = FakeBackend()
+        backend.frames["index_daily"] = pd.DataFrame(
+            [
+                {
+                    "ts_code": "000985.CSI",
+                    "trade_date": "20240102",
+                    "open": 6000.0,
+                    "high": 6060.0,
+                    "low": 5980.0,
+                    "close": 6040.0,
+                    "vol": 120000.0,
+                    "amount": 724800000.0,
+                }
+            ]
+        )
+        portal = DataPortal(backend)
+
+        frame = portal.get_price(
+            "000985.XSHG",
+            start_date="20240102",
+            end_date="20240102",
+            fields="close",
+        )
+
+        self.assertEqual(backend.calls[0][0], "index_daily")
+        self.assertEqual(frame["code"].tolist(), ["000985.XSHG"])
+
+    def test_get_price_routes_sw_industry_indexes_to_sw_daily(self):
+        portal = DataPortal(FakeBackend())
+
+        frame = portal.get_price(
+            "801010.XSHG",
+            start_date="20240102",
+            end_date="20240103",
+            fields="close",
+        )
+
+        self.assertEqual(portal.backend.calls[0][0], "sw_daily")
+        self.assertEqual(frame["code"].tolist(), ["801010.XSHG", "801010.XSHG"])
+        self.assertEqual(frame["close"].tolist(), [3020.0, 3050.0])
 
     def test_get_index_stocks_returns_joinquant_constituents(self):
         portal = DataPortal(FakeBackend())
@@ -1211,9 +1282,58 @@ def initialize(context):
         self.assertEqual(len(issues), 1)
         self.assertEqual(issues[0].api_name, "index_daily")
         self.assertIn("000985.XSHG", issues[0].message)
-        self.assertIn("--ts-code 000985.SH", issues[0].suggestion)
+        self.assertIn("--ts-code 000985.CSI", issues[0].suggestion)
         self.assertEqual(issues[0].update_requests[0].api_name, "index_daily")
-        self.assertEqual(dict(issues[0].update_requests[0].params), {"ts_code": "000985.SH"})
+        self.assertEqual(dict(issues[0].update_requests[0].params), {"ts_code": "000985.CSI"})
+
+    def test_readiness_reports_missing_sw_industry_daily_history(self):
+        class MissingOneSwIndexBackend(FakeBackend):
+            def fetch(self, api_name, **params):
+                if api_name == "index_daily":
+                    return pd.DataFrame(
+                        [
+                            {"ts_code": params.get("ts_code"), "trade_date": "20230101"},
+                            {"ts_code": params.get("ts_code"), "trade_date": "20241231"},
+                        ]
+                    )
+                if api_name == "sw_daily":
+                    if params.get("ts_code") == "801010.SI":
+                        return pd.DataFrame(
+                            [
+                                {"ts_code": "801010.SI", "trade_date": "20230101"},
+                                {"ts_code": "801010.SI", "trade_date": "20241231"},
+                            ]
+                        )
+                    return pd.DataFrame()
+                return super().fetch(api_name, **params)
+
+        with TemporaryDirectory() as tmp:
+            strategy_path = Path(tmp) / "sw_strategy.py"
+            strategy_path.write_text(
+                '''
+SW_INDEXES = ("801010.XSHG", "801030.XSHG")
+
+def score_industries(context):
+    return get_price(SW_INDEXES, end_date=context.current_dt, count=45, fields=["close"], panel=False)
+''',
+                encoding="utf-8",
+            )
+            config = BacktestConfig(
+                strategy_path=str(strategy_path),
+                start_date="2024-01-02",
+                end_date="2024-01-03",
+                initial_cash=1000000.0,
+                cache_db="/tmp/cache.db",
+            )
+
+            issues = DataReadinessCheck(MissingOneSwIndexBackend()).check_required(config, ["index_daily"])
+
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].api_name, "sw_daily")
+        self.assertIn("801030.XSHG", issues[0].message)
+        requests = issues[0].update_requests
+        self.assertTrue(all(request.api_name == "sw_daily" for request in requests))
+        self.assertIn({"ts_code": "801030.SI"}, [dict(request.params) for request in requests])
 
     def test_readiness_looks_back_for_missing_start_index_weight_snapshot(self):
         class MissingStartIndexWeightBackend(FakeBackend):

@@ -38,6 +38,8 @@ class TestWebConsole(unittest.TestCase):
         )
         self.assertEqual(strategies[0]["name"], "alpha_strategy")
         self.assertTrue(strategies[0]["path"].endswith("alpha_strategy.py"))
+        self.assertEqual(strategies[0]["strategy_source"], "project_file")
+        self.assertTrue(strategies[0]["strategy_hash"])
 
     def test_run_store_lists_runs_with_summary_metrics_newest_first(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -413,11 +415,17 @@ class TestWebConsole(unittest.TestCase):
 
         self.assertIn('id="strategy-file"', html)
         self.assertIn('id="choose-strategy"', html)
+        self.assertIn('id="strategy-dialog"', html)
+        self.assertIn('id="strategy-list"', html)
         self.assertIn('id="report-frame"', html)
         self.assertIn('id="history-link"', html)
         self.assertNotIn('id="strategy-select"', html)
         self.assertNotIn('class="launch-panel"', html)
         self.assertNotIn('id="runs-list"', html)
+
+        script = web_app._app_js()
+        self.assertIn("api('/api/strategies'", script)
+        self.assertIn('selectProjectStrategy', script)
 
     def test_main_console_keeps_quick_run_controls_compact(self):
         html = web_app._render_app_html(

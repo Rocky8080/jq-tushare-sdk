@@ -147,6 +147,24 @@ _API_SPECS: dict[str, ApiSpec] = {
             "amount",
         ),
     ),
+    "sw_daily": ApiSpec(
+        table="sw_daily",
+        primary_keys=("ts_code", "trade_date"),
+        date_column="trade_date",
+        columns=(
+            "ts_code",
+            "trade_date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "pre_close",
+            "change",
+            "pct_chg",
+            "vol",
+            "amount",
+        ),
+    ),
     "index_weight": ApiSpec(
         table="index_weight",
         primary_keys=("index_code", "con_code", "trade_date"),
@@ -190,7 +208,16 @@ _DEFAULT_INDEX_CODES = (
     "000300.SH",
     "000905.SH",
     "000852.SH",
-    "000985.SH",
+    "000985.CSI",
+)
+_DEFAULT_SW_INDEX_CODES = (
+    "801010.SI", "801030.SI", "801040.SI", "801050.SI", "801080.SI",
+    "801880.SI", "801110.SI", "801120.SI", "801130.SI", "801140.SI",
+    "801150.SI", "801160.SI", "801170.SI", "801180.SI", "801200.SI",
+    "801210.SI", "801780.SI", "801790.SI", "801230.SI", "801710.SI",
+    "801720.SI", "801730.SI", "801890.SI", "801740.SI", "801750.SI",
+    "801760.SI", "801770.SI", "801950.SI", "801960.SI", "801970.SI",
+    "801980.SI",
 )
 _STOCK_BASIC_LIST_STATUSES = ("L", "D", "P")
 _QUARTER_ENDS = {"q1": "0331", "q2": "0630", "q3": "0930", "q4": "1231"}
@@ -324,6 +351,12 @@ class TushareCacheBackend:
             return sum(
                 self.update_data(api_name, start_date=start_date, end_date=end_date, ts_code=code)
                 for code in _DEFAULT_INDEX_CODES
+            )
+
+        if api_name == "sw_daily" and "ts_code" not in params:
+            return sum(
+                self.update_data(api_name, start_date=start_date, end_date=end_date, ts_code=code)
+                for code in _DEFAULT_SW_INDEX_CODES
             )
 
         if api_name == "index_weight" and "index_code" not in params:
@@ -462,6 +495,8 @@ class TushareCacheBackend:
 
     def _normalize_frame(self, api_name: str, data: pd.DataFrame, spec: ApiSpec) -> pd.DataFrame:
         frame = data.copy()
+        if api_name == "sw_daily" and "pct_change" in frame.columns and "pct_chg" not in frame.columns:
+            frame = frame.rename(columns={"pct_change": "pct_chg"})
         if api_name == "income" and "period" in frame.columns and "end_date" not in frame.columns:
             frame["end_date"] = [self._period_to_end_date(value) for value in frame["period"].tolist()]
         if api_name == "trade_cal" and "exchange" not in frame.columns:

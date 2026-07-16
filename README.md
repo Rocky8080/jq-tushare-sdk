@@ -69,6 +69,7 @@ python -m jq_tushare_sdk.cli update-data \
 - `adj_factor`
 - `stock_basic`
 - `index_daily`
+- `sw_daily`
 - `index_weight`
 - `income`
 
@@ -104,7 +105,7 @@ python -m jq_tushare_sdk.cli backtest \
   --output-dir backtest_runs
 ```
 
-运行回测前会先检查本地缓存；如发现可定位的缺口，会使用 `TUSHARE_TOKEN` 自动补齐并复查，复查仍失败时才停止回测并输出原因。检查会识别策略中静态可推断的 `get_price(count=...)`、`attribute_history(..., count)` 和 `history(count, ...)` 历史窗口，并为 ETF/基金价格和基准指数补齐回测开始日前的必要 lookback。对于直接调用以及遍历模块级索引列表的循环中出现的 `get_price(count=...)` 指数依赖，系统会在执行前逐一推断并检查对应的历史数据。
+运行回测前会先检查本地缓存；如发现可定位的缺口，会使用 `TUSHARE_TOKEN` 自动补齐并复查，复查仍失败时才停止回测并输出原因。检查会识别策略中静态可推断的 `get_price(count=...)`、`attribute_history(..., count)` 和 `history(count, ...)` 历史窗口，并为 ETF/基金价格和基准指数补齐回测开始日前的必要 lookback。对于直接调用以及遍历模块级索引列表的循环中出现的 `get_price(count=...)` 指数依赖，系统会在执行前逐一推断并检查对应的历史数据。申万行业指数 `801xxx.XSHG` 会自动映射到 Tushare `801xxx.SI` 并使用 `sw_daily` 缓存；中证全指 `000985.XSHG` 会映射到 `000985.CSI`。
 
 `get_fundamentals(..., statDate=...)` 读取 `income` 财务数据时会按查询日过滤 `ann_date` / `f_ann_date`，避免使用未来才披露的报表。显式指定季度时严格返回该季度，尚未披露则返回空结果，便于策略按自身逻辑回退；未指定 `statDate` 时返回查询日可见的最新报表。
 
@@ -177,7 +178,7 @@ Web 控制台提供：
 - 主页面直接显示选中的 HTML 回测报告。
 - 独立历史记录页，可搜索历史回测并跳回主报告页查看。
 
-策略文件选择使用浏览器文件弹窗。由于浏览器不会把本机绝对路径暴露给本地服务，Web 控制台会把选中的 `.py` 文件复制到项目内 `.jqts_web/strategies/` 后再运行；原始策略文件不会被修改。CLI 调用方式仍然直接使用命令行传入的策略路径。上传后界面会显示策略 `VERSION`、来源和文件 Hash；如果当前选择的是旧上传快照，且项目中存在同名更新策略，运行前会提示并改用项目原文件。
+点击“选择策略”会打开页面内的本地策略库，可搜索并直接选择项目中的聚宽策略，不依赖系统文件弹窗。也可以使用“从电脑导入”或把 `.py` 文件拖放到文件显示区域；导入时 Web 控制台会将文件复制到项目内 `.jqts_web/strategies/` 后再运行，原始文件不会被修改。CLI 调用方式仍然直接使用命令行传入的策略路径。选择后界面会显示策略 `VERSION`、来源和文件 Hash；如果当前选择的是旧上传快照，且项目中存在同名更新策略，运行前会提示并改用项目原文件。
 
 Web 控制台只绑定本地地址时不会对外提供服务；如需改成其他监听地址，请自行确认网络和权限边界。
 
@@ -213,7 +214,7 @@ python -m jq_tushare_sdk.cli update-data \
   --start YYYY-MM-DD \
   --end YYYY-MM-DD \
   --cache-db data/jq_tushare_cache.db \
-  --ts-code 000985.SH
+  --ts-code 000985.CSI
 
 python -m jq_tushare_sdk.cli refresh-report \
   backtest_runs/<run_id> \
@@ -240,7 +241,7 @@ http://127.0.0.1:8787/report.html
 当前重点支持日频 A 股策略的本地研究和回测，已覆盖的核心能力包括：
 
 - 策略生命周期：`initialize`、`run_daily`、`run_weekly`、`run_monthly`
-- 行情数据：`get_price`、`attribute_history`、`history`
+- 行情数据：`get_price`、`attribute_history`、`history`，支持股票、基金、常用宽基指数及申万行业指数日线
 - 基本面数据：`get_fundamentals`、`get_fundamentals_continuously`
 - 标的查询：`get_index_stocks`、`get_all_securities`、`get_security_info`、`get_current_data`、`get_industry`
 - 查询对象：`query`、`valuation`、`income`
@@ -258,7 +259,7 @@ http://127.0.0.1:8787/report.html
 
 ## Versioning
 
-当前版本：`v0.10.21`
+当前版本：`v0.10.22`
 
 版本号遵循 Semantic Versioning：
 

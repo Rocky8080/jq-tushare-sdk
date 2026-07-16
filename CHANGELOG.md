@@ -4,6 +4,15 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.22] - 2026-07-16
+
+### Changed
+
+- Add an in-page searchable strategy library so embedded browsers can select project strategies without a native file dialog.
+- Keep native file import as a secondary action and add drag-and-drop fallback.
+- Route JoinQuant-style `801xxx.XSHG` industry indexes to Tushare `sw_daily` data and include the Shenwan level-one index set in automatic cache updates.
+- Map the `000985.XSHG` benchmark to Tushare's `000985.CSI` code and make readiness checks generate API-specific refill requests for index gaps.
+
 ## [0.10.21] - 2026-07-11
 
 ### Changed

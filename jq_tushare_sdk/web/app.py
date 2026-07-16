@@ -371,6 +371,7 @@ def discover_strategies(project_root: str | Path) -> list[dict]:
                 "path": str(path),
                 "relative_path": rel.as_posix(),
                 "modified_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
+                **strategy_file_metadata(root, path),
             }
         )
     return sorted(strategies, key=lambda item: item["relative_path"])
@@ -1472,10 +1473,9 @@ def _render_app_html(project_root: Path, cache_db: Path, output_dir: Path) -> st
   <main class="result-workspace">
     <section class="parameter-bar" aria-label="运行参数">
       <form id="backtest-form" class="parameter-form compact">
-        <input id="strategy-file" type="file" accept=".py,text/x-python,text/plain" hidden>
         <input id="strategy-path" type="hidden">
-        <button type="button" id="choose-strategy" class="secondary">选择策略文件</button>
-        <div class="selected-file" id="selected-strategy">未选择策略文件</div>
+        <button type="button" id="choose-strategy" class="secondary">选择策略</button>
+        <div class="selected-file" id="selected-strategy" title="可将 Python 策略文件拖放到此处">未选择策略文件</div>
         <div class="strategy-meta" id="strategy-meta">策略版本：-- · 来源：--</div>
         <label class="date-field"><span>开始</span><input id="start-date" name="start_date" type="date" required></label>
         <label class="date-field"><span>结束</span><input id="end-date" name="end_date" type="date" required></label>
@@ -1502,6 +1502,23 @@ def _render_app_html(project_root: Path, cache_db: Path, output_dir: Path) -> st
       <iframe id="report-frame" title="回测报告" src="about:blank"></iframe>
     </section>
   </main>
+  <dialog id="strategy-dialog" class="strategy-dialog" aria-labelledby="strategy-dialog-title">
+    <div class="strategy-dialog-head">
+      <div>
+        <div class="section-label">本地策略库</div>
+        <h2 id="strategy-dialog-title">选择回测策略</h2>
+      </div>
+      <button type="button" id="close-strategy-dialog" class="icon-button" aria-label="关闭策略选择框" title="关闭">&times;</button>
+    </div>
+    <div class="strategy-dialog-tools">
+      <input id="strategy-filter" type="search" placeholder="搜索文件名、路径或版本" autocomplete="off">
+      <label class="secondary file-trigger import-trigger">
+        <input id="strategy-file" class="file-input" type="file" accept=".py,text/x-python,text/plain">
+        <span>从电脑导入</span>
+      </label>
+    </div>
+    <div id="strategy-list" class="strategy-list" role="listbox" aria-label="可用策略"></div>
+  </dialog>
   <script>{_app_js()}</script>
 </body>
 </html>"""
@@ -1651,6 +1668,110 @@ input {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.selected-file.is-dragover {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+  color: var(--blue);
+}
+.file-trigger {
+  position: relative;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center;
+  height: 36px;
+  padding: 0 13px;
+  border: 1px solid #c6d8eb;
+  border-radius: 6px;
+  color: var(--blue) !important;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.file-trigger span { color: inherit !important; font-size: inherit !important; }
+.file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+.file-trigger:focus-within {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+.strategy-dialog {
+  width: min(720px, calc(100vw - 32px));
+  max-height: min(680px, calc(100vh - 48px));
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 18px 48px rgba(31, 45, 58, .22);
+}
+.strategy-dialog::backdrop { background: rgba(31, 45, 58, .36); }
+.strategy-dialog-head,
+.strategy-dialog-tools {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.strategy-dialog-tools { background: var(--panel-soft); }
+.strategy-dialog-tools input[type="search"] { min-width: 0; flex: 1; }
+.icon-button {
+  width: 34px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 24px;
+  line-height: 1;
+}
+.icon-button:hover { border-color: var(--border); background: var(--panel-soft); color: var(--text); }
+.strategy-list {
+  max-height: min(500px, calc(100vh - 190px));
+  overflow: auto;
+}
+.strategy-row {
+  width: 100%;
+  min-height: 62px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px 16px;
+  align-items: center;
+  padding: 10px 16px;
+  border: 0;
+  border-bottom: 1px solid #e7edf3;
+  border-radius: 0;
+  background: var(--panel);
+  color: var(--text);
+  text-align: left;
+}
+.strategy-row:last-child { border-bottom: 0; }
+.strategy-row:hover, .strategy-row:focus-visible { background: var(--blue-soft); }
+.strategy-row-main { min-width: 0; }
+.strategy-row-name,
+.strategy-row-path {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.strategy-row-name { font-weight: 750; }
+.strategy-row-path, .strategy-row-meta { color: var(--muted); font-size: 12px; }
+.strategy-empty { padding: 32px 16px; color: var(--muted); text-align: center; }
+.import-trigger { flex: 0 0 auto; }
 .strategy-meta {
   min-height: 36px;
   display: flex;
@@ -1885,6 +2006,8 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   .job-progress { grid-template-columns: minmax(0, 1fr); }
   .job-progress > span { justify-self: start; }
   #report-frame { min-height: 560px; }
+  .strategy-dialog-tools { align-items: stretch; flex-direction: column; }
+  .strategy-row { grid-template-columns: minmax(0, 1fr); }
 }
 """
 
@@ -1892,6 +2015,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 def _app_js() -> str:
     return """
 const state = {
+  strategies: [],
   runs: [],
   jobs: [],
   selectedRun: null,
@@ -1947,13 +2071,14 @@ function setNotice(message, tone = '') {
   }
 }
 
-async function chooseStrategyFile() {
-  $('strategy-file').click();
-}
-
 async function uploadSelectedStrategyFile(event) {
   const file = event.target.files && event.target.files[0];
   if (!file) return;
+  await uploadStrategyFile(file);
+  event.target.value = '';
+}
+
+async function uploadStrategyFile(file) {
   try {
     const content = await file.text();
     const payload = await api('/api/strategy-file', {
@@ -1965,10 +2090,92 @@ async function uploadSelectedStrategyFile(event) {
     $('strategy-path').value = state.strategyPath;
     $('selected-strategy').textContent = `${file.name} -> ${state.strategyPath}`;
     renderStrategyMeta(payload.strategy);
+    closeStrategyDialog();
     setNotice('策略文件已选择。运行时会使用本项目内的本地副本，不修改原文件。');
   } catch (error) {
     setNotice(error.message, 'error');
   }
+}
+
+async function loadStrategies() {
+  const payload = await api('/api/strategies');
+  state.strategies = payload.strategies || [];
+  renderStrategyList();
+}
+
+function renderStrategyList() {
+  const query = $('strategy-filter').value.trim().toLowerCase();
+  const strategies = state.strategies.filter((strategy) => {
+    const searchable = [strategy.name, strategy.relative_path, strategy.strategy_version]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase();
+    return !query || searchable.includes(query);
+  });
+  const root = $('strategy-list');
+  root.innerHTML = '';
+  if (!strategies.length) {
+    root.innerHTML = '<div class="strategy-empty">没有匹配的项目策略，可使用“从电脑导入”或拖放 .py 文件。</div>';
+    return;
+  }
+  for (const strategy of strategies) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'strategy-row';
+    button.dataset.strategyPath = strategy.relative_path;
+    button.setAttribute('role', 'option');
+    button.innerHTML = `
+      <span class="strategy-row-main">
+        <span class="strategy-row-name">${escapeHtml(strategy.name)}</span>
+        <span class="strategy-row-path">${escapeHtml(strategy.relative_path)}</span>
+      </span>
+      <span class="strategy-row-meta">版本 ${escapeHtml(strategy.strategy_version || '--')} · ${escapeHtml(formatModifiedAt(strategy.modified_at))}</span>
+    `;
+    root.appendChild(button);
+  }
+}
+
+function formatModifiedAt(value) {
+  if (!value) return '修改时间未知';
+  return String(value).replace('T', ' ').slice(0, 16);
+}
+
+function openStrategyDialog() {
+  const dialog = $('strategy-dialog');
+  $('strategy-filter').value = '';
+  renderStrategyList();
+  if (typeof dialog.showModal === 'function') dialog.showModal();
+  else dialog.setAttribute('open', '');
+  $('strategy-filter').focus();
+}
+
+function closeStrategyDialog() {
+  const dialog = $('strategy-dialog');
+  if (typeof dialog.close === 'function' && dialog.open) dialog.close();
+  else dialog.removeAttribute('open');
+}
+
+function selectProjectStrategy(relativePath) {
+  const strategy = state.strategies.find((item) => item.relative_path === relativePath);
+  if (!strategy) return;
+  state.strategyPath = strategy.relative_path;
+  state.strategyMetadata = strategy;
+  $('strategy-path').value = state.strategyPath;
+  $('selected-strategy').textContent = strategy.relative_path;
+  renderStrategyMeta({ ...strategy, strategy_source: 'project_file' });
+  closeStrategyDialog();
+  setNotice(`已选择项目策略：${strategy.relative_path}`);
+}
+
+function setStrategyDropState(active) {
+  $('selected-strategy').classList.toggle('is-dragover', active);
+}
+
+async function handleStrategyDrop(event) {
+  event.preventDefault();
+  setStrategyDropState(false);
+  const file = event.dataTransfer?.files?.[0];
+  if (file) await uploadStrategyFile(file);
 }
 
 function renderStrategyMeta(metadata) {
@@ -2329,8 +2536,23 @@ function subtractOneMonth(date) {
 
 document.addEventListener('DOMContentLoaded', async () => {
   await setDefaultDates();
-  $('choose-strategy').addEventListener('click', chooseStrategyFile);
+  $('choose-strategy').addEventListener('click', openStrategyDialog);
+  $('close-strategy-dialog').addEventListener('click', closeStrategyDialog);
+  $('strategy-filter').addEventListener('input', renderStrategyList);
+  $('strategy-list').addEventListener('click', (event) => {
+    const button = event.target.closest('[data-strategy-path]');
+    if (button) selectProjectStrategy(button.dataset.strategyPath);
+  });
+  $('strategy-dialog').addEventListener('click', (event) => {
+    if (event.target === $('strategy-dialog')) closeStrategyDialog();
+  });
   $('strategy-file').addEventListener('change', uploadSelectedStrategyFile);
+  $('selected-strategy').addEventListener('dragover', (event) => {
+    event.preventDefault();
+    setStrategyDropState(true);
+  });
+  $('selected-strategy').addEventListener('dragleave', () => setStrategyDropState(false));
+  $('selected-strategy').addEventListener('drop', handleStrategyDrop);
   $('backtest-form').addEventListener('submit', submitBacktest);
   $('check-data').addEventListener('click', checkData);
   $('refresh-report').addEventListener('click', refreshSelectedReport);
@@ -2340,6 +2562,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (button) cancelBacktest(button.dataset.cancelJob);
   });
   try {
+    await loadStrategies();
     await refreshAll();
     setInterval(refreshAll, 3000);
     setInterval(updateJobTimers, 1000);
