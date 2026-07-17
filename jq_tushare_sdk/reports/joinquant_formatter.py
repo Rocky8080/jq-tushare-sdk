@@ -18,6 +18,8 @@ class JoinQuantOutputFormatter:
         "commission",
         "stamp_tax",
         "transfer_fee",
+        "dividend_tax",
+        "realized_pnl",
         "order_id",
         "trade_id",
         "reason",
@@ -58,10 +60,12 @@ class JoinQuantOutputFormatter:
                         "side": trade.side,
                         "amount": trade.amount,
                         "price": f"{trade.price:.4f}",
-                        "value": f"{trade.value:.2f}",
+                        "value": f"{self._signed_trade_value(trade):.2f}",
                         "commission": f"{trade.commission:.2f}",
                         "stamp_tax": f"{trade.stamp_tax:.2f}",
                         "transfer_fee": f"{trade.transfer_fee:.2f}",
+                        "dividend_tax": f"{getattr(trade, 'dividend_tax', 0.0):.2f}",
+                        "realized_pnl": f"{getattr(trade, 'realized_pnl', 0.0):.2f}",
                         "order_id": trade.order_id,
                         "trade_id": trade.trade_id,
                         "reason": trade.reason,
@@ -85,6 +89,12 @@ class JoinQuantOutputFormatter:
                         "reason": order.reason,
                     }
                 )
+
+    def _signed_trade_value(self, trade) -> float:
+        value = float(getattr(trade, "value", 0.0) or 0.0)
+        if getattr(trade, "side", "") == "sell" and value > 0:
+            return -value
+        return value
 
     def write_performance(self, path: Path, rows: list[dict]):
         with path.open("w", encoding="utf-8", newline="") as handle:

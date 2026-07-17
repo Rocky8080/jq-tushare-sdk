@@ -14,6 +14,7 @@ class Order:
     commission: float = 0.0
     stamp_tax: float = 0.0
     transfer_fee: float = 0.0
+    dividend_tax: float = 0.0
     created_at: datetime | None = None
     reason: str = ""
 
@@ -30,5 +31,7 @@ class Trade:
     commission: float
     stamp_tax: float
     transfer_fee: float = 0.0
+    dividend_tax: float = 0.0
     traded_at: datetime | None = None
     reason: str = ""
+    realized_pnl: float = 0.0

@@ -1,19 +1,24 @@
 from __future__ import annotations
 
+import csv
+import re
+import sqlite3
 import time as time_module
 from collections import defaultdict
-from contextlib import contextmanager
-from datetime import datetime, time
+from contextlib import closing, contextmanager
+from datetime import datetime, time, timedelta
+from pathlib import Path
 from typing import Callable
 
 from jq_tushare_sdk.broker.broker import Broker
 from jq_tushare_sdk.config import BacktestConfig, RunManifest
+from jq_tushare_sdk.data.code_map import is_tushare_fund_code, to_joinquant_code
 from jq_tushare_sdk.data.portal import DataPortal
 from jq_tushare_sdk.data.readiness import infer_strategy_price_lookback_start
 from jq_tushare_sdk.reports.joinquant_formatter import JoinQuantOutputFormatter
 from jq_tushare_sdk.reports.metrics import performance_row
 from jq_tushare_sdk.reports.output_manager import OutputManager
-from jq_tushare_sdk.runtime.context import Context, Portfolio
+from jq_tushare_sdk.runtime.context import Context, Portfolio, Position
 from jq_tushare_sdk.runtime.globals_state import RuntimeState
 from jq_tushare_sdk.runtime.loader import StrategyLoader
 from jq_tushare_sdk.runtime.logger import RuntimeLogger
@@ -21,6 +26,14 @@ from jq_tushare_sdk.runtime.scheduler import Scheduler
 
 
 class BacktestEngine:
+    _JOINQUANT_DISPLAY_NAME_ALIASES = {
+        "159915.XSHE": "创业板ETF易方达",
+        "510300.XSHG": "300ETF",
+        "510500.XSHG": "500ETF",
+        "512100.XSHG": "1000ETF",
+        "588000.XSHG": "科创50",
+    }
+
     _TIMELINE = [
         ("before_open", "09:00:00"),
         ("open", "09:30:00"),
@@ -78,6 +91,8 @@ class BacktestEngine:
             security_names = self._security_names(portal)
             benchmark = getattr(state, "benchmark", None) or self.config.benchmark
             trade_days = list(portal.get_trade_days(self.config.start_date, self.config.end_date))
+            etf_dividend_events = self._load_etf_dividend_events()
+            a_share_corporate_actions = self._load_a_share_corporate_actions()
         self._report_progress(0.04, "准备行情数据", f"共 {len(trade_days)} 个交易日")
         with profiler.measure_phase("benchmark", "基准数据读取"):
             benchmark_closes = self._benchmark_closes(portal, benchmark, trade_days)
@@ -90,23 +105,55 @@ class BacktestEngine:
         previous_total = None
         peak_value = float(context.portfolio.total_value)
         previous_trade_day = None
+        applied_etf_dividends: set[tuple[str, str]] = set()
+        a_share_entitlements: dict[str, dict] = {}
+        applied_a_share_actions: set[str] = set()
         total_trade_days = len(trade_days)
         for day_index, trade_day in enumerate(trade_days, start=1):
+            dividend_eligible_securities = set(context.portfolio.positions.keys())
             day_start = profiler.now()
             day_callback_seconds = 0.0
             day_mark_seconds = 0.0
             day_callback_count = 0
             context.previous_date = previous_trade_day
+            self._settle_a_share_corporate_actions(
+                context,
+                broker,
+                str(trade_day),
+                a_share_corporate_actions["pay_date"],
+                a_share_entitlements,
+                applied_a_share_actions,
+            )
             for label, time_text in timeline:
                 context.current_dt = datetime.strptime(
                     f"{trade_day} {time_text}",
                     "%Y-%m-%d %H:%M:%S",
                 )
-                for callback in scheduler.callbacks_for(
+                callbacks = scheduler.callbacks_for(
                     context.current_dt,
                     label,
                     previous_dt=previous_trade_day,
-                ):
+                )
+                if callbacks:
+                    mark_start = profiler.now()
+                    self._mark_to_market(
+                        context,
+                        portal,
+                        str(trade_day),
+                        current_dt=context.current_dt,
+                    )
+                    self._apply_etf_dividends(
+                        context,
+                        portal,
+                        str(trade_day),
+                        etf_dividend_events,
+                        applied_etf_dividends,
+                        dividend_eligible_securities,
+                    )
+                    elapsed = profiler.elapsed(mark_start)
+                    day_mark_seconds += elapsed
+                    profiler.record_phase_duration("mark_to_market", "每日估值", elapsed)
+                for callback in callbacks:
                     callback_start = profiler.now()
                     try:
                         callback(context)
@@ -121,10 +168,26 @@ class BacktestEngine:
                             name=self._callback_name(callback),
                             seconds=elapsed,
                         )
+            self._capture_a_share_entitlements(
+                context,
+                broker,
+                str(trade_day),
+                a_share_corporate_actions["record_date"],
+                a_share_entitlements,
+            )
+            self._apply_etf_dividends(
+                context,
+                portal,
+                str(trade_day),
+                etf_dividend_events,
+                applied_etf_dividends,
+                dividend_eligible_securities,
+            )
             mark_start = profiler.now()
             self._mark_to_market(context, portal, str(trade_day))
-            day_mark_seconds = profiler.elapsed(mark_start)
-            profiler.record_phase_duration("mark_to_market", "每日估值", day_mark_seconds)
+            elapsed = profiler.elapsed(mark_start)
+            day_mark_seconds += elapsed
+            profiler.record_phase_duration("mark_to_market", "每日估值", elapsed)
             position_rows.extend(
                 self._position_rows(context, str(trade_day), security_names)
             )
@@ -239,9 +302,10 @@ class BacktestEngine:
         if not trade_days:
             return {}
         try:
+            start_date = self._benchmark_fetch_start_date(str(trade_days[0]))
             frame = portal.get_price(
                 benchmark,
-                start_date=str(trade_days[0]),
+                start_date=start_date,
                 end_date=str(trade_days[-1]),
                 fields=["close"],
                 panel=False,
@@ -250,16 +314,21 @@ class BacktestEngine:
             return {}
         if frame.empty or "time" not in frame.columns or "close" not in frame.columns:
             return {}
-        return {
+        closes = {
             str(row["time"]): float(row["close"])
             for _, row in frame.iterrows()
             if row.get("close") is not None
         }
+        first_trade_day = str(trade_days[0])
+        previous_dates = sorted(date for date in closes if date < first_trade_day)
+        if previous_dates:
+            closes["__base__"] = closes[previous_dates[-1]]
+        return closes
 
     def _apply_benchmark_returns(self, rows: list[dict], benchmark_closes: dict[str, float]) -> None:
         if not rows or not benchmark_closes:
             return
-        base_close = None
+        base_close = benchmark_closes.get("__base__")
         previous_close = None
         for row in rows:
             close = benchmark_closes.get(str(row.get("date")))
@@ -274,6 +343,13 @@ class BacktestEngine:
             row["benchmark_return"] = f"{benchmark_return:.6f}"
             row["benchmark_daily_return"] = f"{benchmark_daily_return:.6f}"
             row["excess_return"] = f"{(strategy_return - benchmark_return):.6f}"
+
+    def _benchmark_fetch_start_date(self, first_trade_day: str) -> str:
+        try:
+            parsed = datetime.strptime(first_trade_day, "%Y-%m-%d").date()
+        except ValueError:
+            return first_trade_day
+        return (parsed - timedelta(days=14)).strftime("%Y-%m-%d")
 
     def _risk_metrics(self, rows: list[dict], *, benchmark: str | None = None, benchmark_issue: str | None = None) -> dict:
         if not rows:
@@ -417,18 +493,287 @@ class BacktestEngine:
             f"Unsupported schedule label for backtest execution timeline: {label}"
         )
 
-    def _mark_to_market(self, context: Context, portal: DataPortal, trade_day: str) -> None:
+    def _mark_to_market(
+        self,
+        context: Context,
+        portal: DataPortal,
+        trade_day: str,
+        *,
+        current_dt: datetime | None = None,
+    ) -> None:
         for code, position in context.portfolio.positions.items():
+            fields = ["close"]
+            use_open = self._uses_open_valuation(current_dt)
+            if use_open:
+                fields = ["open", "close"]
             frame = portal.get_price(
                 code,
                 count=1,
                 end_date=trade_day,
-                fields=["close"],
+                fields=fields,
                 panel=False,
             )
-            if frame.empty or "close" not in frame.columns:
+            if frame.empty:
                 continue
-            position.price = float(frame["close"].iloc[-1])
+            field = "open" if use_open and "open" in frame.columns else "close"
+            if field not in frame.columns:
+                continue
+            price = float(frame[field].iloc[-1])
+            if price <= 0 and field == "open" and "close" in frame.columns:
+                price = float(frame["close"].iloc[-1])
+            if price > 0:
+                position.price = price
+
+    def _uses_open_valuation(self, current_dt: datetime | None) -> bool:
+        if current_dt is None:
+            return False
+        time_method = getattr(current_dt, "time", None)
+        if not callable(time_method):
+            return False
+        return time_method() == time(9, 30)
+
+    def _load_a_share_corporate_actions(self) -> dict[str, dict[str, list[dict]]]:
+        events = {"record_date": defaultdict(list), "pay_date": defaultdict(list)}
+        seen: set[str] = set()
+        for db_path in self._a_share_corporate_action_db_paths():
+            try:
+                with closing(sqlite3.connect(db_path)) as conn:
+                    rows = conn.execute(
+                        """
+                        SELECT event_id, ts_code, record_date, pay_date, cash_div,
+                               stk_div, stk_bo_rate, stk_co_rate
+                        FROM corporate_actions
+                        """
+                    ).fetchall()
+            except sqlite3.Error:
+                continue
+            for row in rows:
+                event_id, ts_code, record_date, pay_date, cash_div, stk_div, bonus, transfer = row
+                event_id = str(event_id or "")
+                record_date = self._corporate_action_date(record_date)
+                pay_date = self._corporate_action_date(pay_date)
+                if not event_id or event_id in seen or not record_date or not pay_date:
+                    continue
+                seen.add(event_id)
+                event = {
+                    "event_id": event_id,
+                    "security": to_joinquant_code(str(ts_code)),
+                    "cash_div": float(cash_div or 0.0),
+                    "share_ratio": float(stk_div or 0.0) + float(bonus or 0.0) + float(transfer or 0.0),
+                }
+                events["record_date"][record_date].append(event)
+                events["pay_date"][pay_date].append(event)
+        return {key: dict(grouped) for key, grouped in events.items()}
+
+    def _a_share_corporate_action_db_paths(self) -> list[Path]:
+        roots = [Path(str(self.config.cache_db))]
+        backend_cache_dir = getattr(self.backend, "cache_dir", None)
+        if backend_cache_dir:
+            roots.append(Path(str(backend_cache_dir)))
+        paths: set[Path] = set()
+        for root in roots:
+            candidates = (root, root / "a_share", root.parent / "a_share")
+            for candidate in candidates:
+                if candidate.is_dir():
+                    paths.update(candidate.glob("a_share_????.db"))
+        return sorted(paths)
+
+    def _corporate_action_date(self, value) -> str:
+        text = str(value or "").strip()[:10].replace("-", "")
+        if len(text) != 8 or not text.isdigit():
+            return ""
+        return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+
+    def _capture_a_share_entitlements(
+        self,
+        context: Context,
+        broker: Broker,
+        trade_day: str,
+        events: dict[str, list[dict]],
+        entitlements: dict[str, dict],
+    ) -> None:
+        for event in events.get(str(trade_day), []):
+            event_id = str(event["event_id"])
+            if event_id in entitlements:
+                continue
+            position = context.portfolio.positions.get(str(event["security"]))
+            qualified_amount = float(position.total_amount) if position is not None else 0.0
+            qualified_amount = max(0.0, qualified_amount)
+            entitlements[event_id] = {
+                **event,
+                "qualified_amount": qualified_amount,
+                "tax_allocations": broker.capture_dividend_lots(
+                    str(event["security"]), qualified_amount
+                ),
+            }
+
+    def _settle_a_share_corporate_actions(
+        self,
+        context: Context,
+        broker: Broker,
+        trade_day: str,
+        events: dict[str, list[dict]],
+        entitlements: dict[str, dict],
+        applied: set[str],
+    ) -> None:
+        for event in events.get(str(trade_day), []):
+            event_id = str(event["event_id"])
+            if event_id in applied:
+                continue
+            entitlement = entitlements.get(event_id)
+            if entitlement is None:
+                continue
+            applied.add(event_id)
+            qualified_amount = float(entitlement.get("qualified_amount") or 0.0)
+            if qualified_amount <= 0:
+                continue
+            cash_div = float(entitlement.get("cash_div") or 0.0)
+            share_ratio = float(entitlement.get("share_ratio") or 0.0)
+            context.portfolio.available_cash += qualified_amount * cash_div
+            added_shares = qualified_amount * share_ratio
+            security = str(entitlement["security"])
+            withheld_dividend_tax = broker.attach_dividend_tax(
+                security,
+                list(entitlement.get("tax_allocations") or []),
+                cash_per_share=cash_div,
+            )
+            context.portfolio.available_cash -= withheld_dividend_tax
+            position = context.portfolio.positions.get(security)
+            if added_shares <= 0:
+                continue
+            if position is None:
+                position = Position(code=security)
+                context.portfolio.positions[security] = position
+            denominator = 1.0 + share_ratio
+            if denominator > 0 and float(position.total_amount or 0) > 0:
+                position.avg_cost = max(0.0, (float(position.avg_cost or 0.0) - cash_div) / denominator)
+                position.price = max(0.0, (float(position.price or 0.0) - cash_div) / denominator)
+            position.total_amount += added_shares
+            position.closeable_amount += added_shares
+
+    def _load_etf_dividend_events(self) -> dict[str, list[dict]]:
+        path = self._etf_dividend_events_path()
+        if path is None:
+            return {}
+        events: dict[str, list[dict]] = defaultdict(list)
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                ex_date = str(row.get("ex_date") or "")[:10]
+                ts_code = str(row.get("ts_code") or "").strip()
+                cash = self._parse_cash_dividend(row.get("cash"))
+                if not ex_date or not ts_code or cash <= 0:
+                    continue
+                events[ex_date].append(
+                    {
+                        "security": to_joinquant_code(ts_code),
+                        "cash": cash,
+                    }
+                )
+        return dict(events)
+
+    def _etf_dividend_events_path(self) -> Path | None:
+        return self._metadata_file_path("etf_adj_events.csv")
+
+    def _metadata_file_path(self, filename: str) -> Path | None:
+        candidates = []
+        cache_path = Path(str(self.config.cache_db))
+        candidates.append(cache_path / "_meta" / filename)
+        candidates.append(cache_path.parent / "_meta" / filename)
+        backend_cache_dir = getattr(self.backend, "cache_dir", None)
+        if backend_cache_dir:
+            backend_path = Path(str(backend_cache_dir))
+            candidates.append(backend_path / "_meta" / filename)
+            candidates.append(backend_path.parent / "_meta" / filename)
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def _parse_cash_dividend(self, value) -> float:
+        match = re.search(r"(\d+(?:\.\d+)?|\.\d+)", str(value or ""))
+        if match is None:
+            return 0.0
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return 0.0
+
+    def _apply_etf_dividends(
+        self,
+        context: Context,
+        portal: DataPortal,
+        trade_day: str,
+        events: dict[str, list[dict]],
+        applied: set[tuple[str, str]],
+        eligible_securities: set[str],
+    ) -> None:
+        for event in events.get(str(trade_day), []):
+            security = str(event.get("security") or "")
+            key = (str(trade_day), security)
+            if not security or key in applied:
+                continue
+            applied.add(key)
+            if security not in eligible_securities:
+                continue
+            position = context.portfolio.positions.get(security)
+            if position is None or int(position.total_amount or 0) <= 0:
+                continue
+            cash_per_share = float(event.get("cash") or 0.0)
+            if cash_per_share <= 0:
+                continue
+            amount = int(position.total_amount)
+            context.portfolio.available_cash += amount * cash_per_share
+            position.avg_cost = max(0.0, float(position.avg_cost or 0.0) - cash_per_share)
+            position.price = max(0.0, float(position.price or 0.0) - cash_per_share)
+        for security in eligible_securities:
+            position = context.portfolio.positions.get(security)
+            if position is None:
+                continue
+            key = (str(trade_day), str(security))
+            if key in applied or int(position.total_amount or 0) <= 0:
+                continue
+            cash_per_share = self._infer_etf_cash_dividend(portal, str(trade_day), str(security))
+            if cash_per_share <= 0:
+                continue
+            applied.add(key)
+            amount = int(position.total_amount)
+            context.portfolio.available_cash += amount * cash_per_share
+            position.avg_cost = max(0.0, float(position.avg_cost or 0.0) - cash_per_share)
+            position.price = max(0.0, float(position.price or 0.0) - cash_per_share)
+
+    def _infer_etf_cash_dividend(self, portal: DataPortal, trade_day: str, security: str) -> float:
+        if not is_tushare_fund_code(security):
+            return 0.0
+        try:
+            frame = portal.get_price(
+                security,
+                count=2,
+                end_date=trade_day,
+                fields=["close", "pre_close"],
+                panel=False,
+                fq=None,
+            )
+        except (NotImplementedError, KeyError, ValueError):
+            return 0.0
+        if frame.empty or len(frame) < 2:
+            return 0.0
+        frame = frame.sort_values("time").reset_index(drop=True)
+        current = frame.iloc[-1]
+        if str(current.get("time")) != str(trade_day):
+            return 0.0
+        previous_close = self._positive_float(frame.iloc[-2].get("close"))
+        current_pre_close = self._positive_float(current.get("pre_close"))
+        if previous_close <= 0 or current_pre_close <= 0:
+            return 0.0
+        cash = round(previous_close - current_pre_close, 4)
+        return cash if cash >= 0.0005 else 0.0
+
+    def _positive_float(self, value) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return number if number > 0 else 0.0
 
     def _position_rows(
         self,
@@ -460,12 +805,30 @@ class BacktestEngine:
 
     def _security_names(self, portal: DataPortal) -> dict[str, str]:
         securities = portal.get_all_securities()
-        if securities.empty or "name" not in securities.columns:
+        names = {}
+        if not securities.empty and "name" in securities.columns:
+            names.update(
+                {
+                    str(code): str(row["name"])
+                    for code, row in securities.iterrows()
+                }
+            )
+        names.update(self._etf_security_names())
+        names.update(self._JOINQUANT_DISPLAY_NAME_ALIASES)
+        return names
+
+    def _etf_security_names(self) -> dict[str, str]:
+        path = self._metadata_file_path("etf_basic.csv")
+        if path is None:
             return {}
-        return {
-            str(code): str(row["name"])
-            for code, row in securities.iterrows()
-        }
+        names = {}
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                ts_code = str(row.get("ts_code") or "").strip()
+                name = str(row.get("name") or "").strip()
+                if ts_code and name:
+                    names[to_joinquant_code(ts_code)] = name
+        return names
 
     def _read_log_lines(self, path) -> list[str]:
         if not path.exists():
