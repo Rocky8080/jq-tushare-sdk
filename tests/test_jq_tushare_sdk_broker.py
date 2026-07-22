@@ -237,13 +237,13 @@ class TestBroker(unittest.TestCase):
         order = broker.order_target_value("000001.XSHE", 10000.0)
 
         self.assertEqual(order.status, "filled")
-        self.assertEqual(order.amount, 500)
-        self.assertEqual(order.filled, 500)
-        self.assertEqual(context.portfolio.positions["000001.XSHE"].total_amount, 1000)
-        self.assertAlmostEqual(context.portfolio.available_cash, -5.0)
+        self.assertEqual(order.amount, 400)
+        self.assertEqual(order.filled, 400)
+        self.assertEqual(context.portfolio.positions["000001.XSHE"].total_amount, 900)
+        self.assertAlmostEqual(context.portfolio.available_cash, 995.0)
         self.assertEqual(len(broker.orders), 1)
         self.assertEqual(len(broker.trades), 1)
-        self.assertEqual(broker.trades[0].amount, 500)
+        self.assertEqual(broker.trades[0].amount, 400)
 
     def test_order_target_value_sizes_buy_with_raw_price_before_slippage(self):
         context = Context(Portfolio(1000000.0))
@@ -261,7 +261,7 @@ class TestBroker(unittest.TestCase):
         self.assertAlmostEqual(broker.trades[-1].value, 501356.7)
         self.assertAlmostEqual(order.commission, 150.40701)
 
-    def test_order_target_value_cash_check_uses_raw_price_before_slippage(self):
+    def test_order_target_value_cash_check_includes_slippage_and_fees(self):
         context = Context(Portfolio(498492.89))
         broker = Broker(
             context,
@@ -272,11 +272,27 @@ class TestBroker(unittest.TestCase):
         order = broker.order_target_value("159915.XSHE", 500000.0)
 
         self.assertEqual(order.status, "filled")
-        self.assertEqual(order.amount, 125200)
+        self.assertEqual(order.amount, 125000)
         self.assertAlmostEqual(order.price, 3.986)
-        self.assertAlmostEqual(broker.trades[-1].value, 499047.2)
-        self.assertAlmostEqual(order.commission, 149.71416)
-        self.assertAlmostEqual(context.portfolio.available_cash, -704.02416)
+        self.assertAlmostEqual(broker.trades[-1].value, 498250.0)
+        self.assertAlmostEqual(order.commission, 149.475)
+        self.assertAlmostEqual(context.portfolio.available_cash, 93.415)
+
+    def test_order_target_value_prevents_negative_cash_for_stock_open_trade(self):
+        context = Context(Portfolio(1000000.0))
+        broker = Broker(
+            context,
+            FakePortal(price=6.51),
+            CostModel(open_commission=0.0003, min_commission=5.0, slippage_fixed=0.01),
+        )
+
+        order = broker.order_target_value("601939.XSHG", 1000000.0)
+
+        self.assertEqual(order.status, "filled")
+        self.assertEqual(order.amount, 153300)
+        self.assertAlmostEqual(order.price, 6.52)
+        self.assertAlmostEqual(context.portfolio.available_cash, 184.1452)
+        self.assertGreaterEqual(context.portfolio.available_cash, 0.0)
 
     def test_order_value_sell_uses_sell_side_slippage_price(self):
         context = Context(
@@ -526,6 +542,109 @@ class TestBroker(unittest.TestCase):
 
         self.assertAlmostEqual(buy_order.price, 10.01)
         self.assertAlmostEqual(sell_order.price, 9.99)
+
+    def test_market_slippage_prices_follow_stock_and_etf_ticks(self):
+        stock_broker = Broker(
+            Context(Portfolio(100000.0)),
+            FakePortal(price=6.51),
+            CostModel(slippage_fixed=0.01),
+        )
+        etf_broker = Broker(
+            Context(Portfolio(100000.0)),
+            FakePortal(price=1.755),
+            CostModel(slippage_fixed=0.001),
+        )
+
+        stock_buy = stock_broker.order("601939.XSHG", 100)
+        stock_sell = stock_broker.order("601939.XSHG", -100)
+        etf_buy = etf_broker.order("510300.XSHG", 100)
+        etf_sell = etf_broker.order("510300.XSHG", -100)
+
+        self.assertEqual(stock_buy.price, 6.52)
+        self.assertEqual(stock_sell.price, 6.50)
+        self.assertEqual(etf_buy.price, 1.755)
+        self.assertEqual(etf_sell.price, 1.754)
+
+    def test_stock_slippage_uses_joinquant_half_even_tick_rounding(self):
+        broker = Broker(
+            Context(Portfolio(100000.0)),
+            FakePortal(price=6.65),
+            CostModel(slippage_fixed=0.01),
+        )
+
+        construction_sell = broker.order("601939.XSHG", -100)
+        construction_buy = Broker(
+            Context(Portfolio(100000.0)),
+            FakePortal(price=6.90),
+            CostModel(slippage_fixed=0.01),
+        ).order("601939.XSHG", 100)
+        agricultural_sell = Broker(
+            Context(Portfolio(100000.0)),
+            FakePortal(price=3.93),
+            CostModel(slippage_fixed=0.01),
+        ).order("601288.XSHG", -100)
+        wuliangye_buy = Broker(
+            Context(Portfolio(100000.0)),
+            FakePortal(price=152.51),
+            CostModel(slippage_fixed=0.01),
+        ).order("000858.XSHE", 100)
+        merchants_buy = Broker(
+            Context(Portfolio(100000.0)),
+            FakePortal(price=35.10),
+            CostModel(slippage_fixed=0.01),
+        ).order("600036.XSHG", 100)
+
+        self.assertEqual(construction_sell.price, 6.64)
+        self.assertEqual(construction_buy.price, 6.90)
+        self.assertEqual(agricultural_sell.price, 3.92)
+        self.assertEqual(wuliangye_buy.price, 152.51)
+        self.assertEqual(merchants_buy.price, 35.11)
+
+    def test_sell_consumes_prepaid_fifo_dividend_tax_without_second_charge(self):
+        context = Context(Portfolio(100000.0))
+        broker = Broker(context, FakePortal(price=10.0), CostModel(close_tax=0.0))
+        broker.order("000001.XSHE", 100)
+
+        allocations = broker.capture_dividend_lots("000001.XSHE", 100)
+        withheld = broker.attach_dividend_tax("000001.XSHE", allocations, cash_per_share=0.5)
+        context.portfolio.available_cash -= withheld
+        sell = broker.order("000001.XSHE", -100)
+
+        self.assertEqual(withheld, 10.0)
+        self.assertEqual(sell.dividend_tax, 0.0)
+        self.assertEqual(broker.trades[-1].dividend_tax, 0.0)
+        self.assertAlmostEqual(context.portfolio.available_cash, 99980.0)
+
+    def test_sell_refunds_prepaid_dividend_tax_by_holding_period(self):
+        cases = (
+            ("within one calendar month", datetime(2024, 2, 2), 0.0, 100040.0),
+            ("after one calendar month", datetime(2024, 2, 3), -5.0, 100045.0),
+            ("after one calendar year", datetime(2025, 1, 3), -10.0, 100050.0),
+        )
+        costs = CostModel(
+            open_commission=0.0,
+            close_commission=0.0,
+            close_tax=0.0,
+            min_commission=0.0,
+        )
+
+        for label, sold_at, expected_adjustment, expected_cash in cases:
+            with self.subTest(label=label):
+                context = Context(Portfolio(100000.0), current_dt=datetime(2024, 1, 2, 9, 30))
+                broker = Broker(context, FakePortal(price=10.0), costs)
+                broker.order("000001.XSHE", 100)
+                allocations = broker.capture_dividend_lots("000001.XSHE", 100)
+                context.portfolio.available_cash += 50.0
+                context.portfolio.available_cash -= broker.attach_dividend_tax(
+                    "000001.XSHE", allocations, cash_per_share=0.5
+                )
+
+                context.current_dt = sold_at
+                sell = broker.order("000001.XSHE", -100)
+
+                self.assertEqual(sell.dividend_tax, expected_adjustment)
+                self.assertEqual(broker.trades[-1].dividend_tax, expected_adjustment)
+                self.assertAlmostEqual(context.portfolio.available_cash, expected_cash)
 
     def test_open_callback_market_order_uses_open_price_with_slippage(self):
         context = Context(Portfolio(100000.0), current_dt=datetime(2024, 1, 2, 9, 30))

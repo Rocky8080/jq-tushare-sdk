@@ -1,13 +1,26 @@
 from __future__ import annotations
 
+import calendar
 from copy import deepcopy
-from datetime import time
+from dataclasses import dataclass
+from datetime import date, datetime, time
 import inspect
+
+import numpy as np
 
 from jq_tushare_sdk.broker.costs import CostModel
 from jq_tushare_sdk.broker.order import Order, Trade
 from jq_tushare_sdk.broker.portfolio import round_lot_amount, trade_lot_size
+from jq_tushare_sdk.data.code_map import is_tushare_fund_code
 from jq_tushare_sdk.runtime.context import Position
+
+
+@dataclass
+class _DividendTaxLot:
+    lot_id: int
+    remaining_amount: float
+    acquired_at: datetime | None = None
+    pending_tax: float = 0.0
 
 
 class Broker:
@@ -23,6 +36,41 @@ class Broker:
         self.target_portfolio_signals: list[dict] = []
         self._order_seq = 0
         self._trade_seq = 0
+        self._tax_lot_seq = 0
+        self._dividend_tax_lots: dict[str, list[_DividendTaxLot]] = {}
+
+    def capture_dividend_lots(self, security: str, amount: float) -> list[dict]:
+        remaining = max(0.0, float(amount or 0.0))
+        allocations = []
+        for lot in self._dividend_tax_lots.get(str(security), []):
+            if remaining <= 0:
+                break
+            allocated = min(remaining, float(lot.remaining_amount or 0.0))
+            if allocated <= 0:
+                continue
+            allocations.append({"lot_id": lot.lot_id, "amount": allocated})
+            remaining -= allocated
+        return allocations
+
+    def attach_dividend_tax(
+        self,
+        security: str,
+        allocations: list[dict],
+        *,
+        cash_per_share: float,
+        tax_rate: float = 0.20,
+    ) -> float:
+        lots = {lot.lot_id: lot for lot in self._dividend_tax_lots.get(str(security), [])}
+        attached = 0.0
+        for allocation in allocations:
+            lot = lots.get(allocation.get("lot_id"))
+            amount = max(0.0, float(allocation.get("amount") or 0.0))
+            if lot is None or amount <= 0:
+                continue
+            tax = amount * max(0.0, float(cash_per_share or 0.0)) * max(0.0, float(tax_rate))
+            lot.pending_tax += tax
+            attached += tax
+        return attached
 
     def order(
         self,
@@ -111,21 +159,15 @@ class Broker:
 
         if buy_target_amount > current_amount:
             requested_delta = buy_target_amount - current_amount
+            execution_price = self._price(security, requested_delta, style)
             safe_delta = self._cash_safe_buy_amount(
                 security,
                 requested_delta,
-                reference_price,
+                execution_price,
                 self.context.portfolio.available_cash,
-                include_costs=False,
             )
             target_amount = current_amount + safe_delta
-            return self.order_target(
-                security,
-                target_amount,
-                style=style,
-                cash_check_price=reference_price,
-                cash_check_includes_costs=False,
-            )
+            return self.order_target(security, target_amount, style=style)
         elif sell_target_amount < current_amount:
             target_amount = sell_target_amount
         else:
@@ -149,7 +191,8 @@ class Broker:
         commission = self.cost_model.commission(value, side)
         stamp_tax = self.cost_model.tax(value, side)
         transfer_fee = self.cost_model.transfer_fee(value, side, security)
-        total_cost = commission + stamp_tax + transfer_fee
+        dividend_tax = self._consume_dividend_tax_lots(security, abs(amount)) if side == "sell" else 0.0
+        total_cost = commission + stamp_tax + transfer_fee + dividend_tax
 
         if side == "buy" and self.context.portfolio.available_cash < self._cash_check_outlay(
             security,
@@ -158,6 +201,7 @@ class Broker:
             include_costs=cash_check_includes_costs,
         ):
             return self._reject(security, amount, price, "insufficient cash")
+        realized_pnl = self._realized_pnl(security, amount, price)
 
         order = self._order(
             security=security,
@@ -169,9 +213,21 @@ class Broker:
             commission=commission,
             stamp_tax=stamp_tax,
             transfer_fee=transfer_fee,
+            dividend_tax=dividend_tax,
             reason="",
         )
-        trade = self._trade(order, side, abs(amount), price, value, commission, stamp_tax, transfer_fee)
+        trade = self._trade(
+            order,
+            side,
+            abs(amount),
+            price,
+            value,
+            commission,
+            stamp_tax,
+            transfer_fee,
+            realized_pnl,
+            dividend_tax,
+        )
 
         if side == "buy":
             self.context.portfolio.available_cash -= value + total_cost
@@ -179,6 +235,8 @@ class Broker:
             self.context.portfolio.available_cash += value - total_cost
 
         self._apply_position(security, amount, price)
+        if amount > 0:
+            self._add_dividend_tax_lot(security, amount)
         self.orders.append(order)
         self.trades.append(trade)
         return order
@@ -205,13 +263,74 @@ class Broker:
         if existing.total_amount <= 0:
             positions.pop(security, None)
 
+    def _add_dividend_tax_lot(self, security: str, amount: float) -> None:
+        if is_tushare_fund_code(security) or amount <= 0:
+            return
+        self._tax_lot_seq += 1
+        self._dividend_tax_lots.setdefault(str(security), []).append(
+            _DividendTaxLot(
+                lot_id=self._tax_lot_seq,
+                remaining_amount=float(amount),
+                acquired_at=getattr(self.context, "current_dt", None),
+            )
+        )
+
+    def _consume_dividend_tax_lots(self, security: str, amount: float) -> float:
+        remaining = max(0.0, float(amount or 0.0))
+        lots = self._dividend_tax_lots.get(str(security), [])
+        adjustment = 0.0
+        for lot in lots:
+            if remaining <= 0:
+                break
+            consumed = min(remaining, float(lot.remaining_amount or 0.0))
+            if consumed <= 0:
+                continue
+            if lot.pending_tax > 0 and lot.remaining_amount > 0:
+                withheld_tax = lot.pending_tax * consumed / lot.remaining_amount
+                final_tax = withheld_tax * self._dividend_tax_rate(lot.acquired_at) / 0.20
+                adjustment += final_tax - withheld_tax
+                lot.pending_tax -= withheld_tax
+            lot.remaining_amount -= consumed
+            remaining -= consumed
+        self._dividend_tax_lots[str(security)] = [
+            lot for lot in lots if lot.remaining_amount > 0
+        ]
+        return adjustment
+
+    def _dividend_tax_rate(self, acquired_at: datetime | None) -> float:
+        acquired_on = self._as_date(acquired_at)
+        sold_on = self._as_date(getattr(self.context, "current_dt", None))
+        if acquired_on is None or sold_on is None:
+            return 0.20
+        if sold_on <= self._add_calendar_months(acquired_on, 1):
+            return 0.20
+        if sold_on <= self._add_calendar_months(acquired_on, 12):
+            return 0.10
+        return 0.0
+
+    @staticmethod
+    def _as_date(value) -> date | None:
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        return None
+
+    @staticmethod
+    def _add_calendar_months(value: date, months: int) -> date:
+        month_index = value.month - 1 + months
+        year = value.year + month_index // 12
+        month = month_index % 12 + 1
+        day = min(value.day, calendar.monthrange(year, month)[1])
+        return date(year, month, day)
+
     def _price(self, security: str, amount: int, style=None) -> float:
         explicit_price = self._style_price(style)
         if explicit_price is not None:
             return explicit_price
 
         raw_price = self._raw_price(security)
-        return self._slipped_price(raw_price, amount)
+        return self._slipped_price(raw_price, amount, security)
 
     def _reference_price(self, security: str, style=None) -> float:
         explicit_price = self._style_price(style)
@@ -242,17 +361,14 @@ class Broker:
             raise NotImplementedError(f"Non-positive local {price_field} price for {security}")
         return raw_price
 
-    def _slipped_price(self, raw_price: float, amount: int) -> float:
+    def _slipped_price(self, raw_price: float, amount: int, security: str) -> float:
         fixed_slip = self.cost_model.slippage_fixed / 2.0
         if amount > 0:
-            return round(
-                raw_price * (1 + self.cost_model.slippage_rate) + fixed_slip,
-                4,
-            )
-        return round(
-            raw_price * (1 - self.cost_model.slippage_rate) - fixed_slip,
-            4,
-        )
+            price = raw_price * (1 + self.cost_model.slippage_rate) + fixed_slip
+        else:
+            price = raw_price * (1 - self.cost_model.slippage_rate) - fixed_slip
+        decimals = 3 if is_tushare_fund_code(security) else 2
+        return float(np.round(price, decimals))
 
     def _current_state(self, security: str):
         current = self._portal_call(
@@ -317,7 +433,6 @@ class Broker:
         low = 0
         high = desired_amount // lot
         best = 0
-
         while low <= high:
             mid = (low + high) // 2
             candidate = mid * lot
@@ -328,6 +443,14 @@ class Broker:
                 high = mid - 1
 
         return best if best > 0 else requested_amount
+
+    def _realized_pnl(self, security: str, amount: int, price: float) -> float:
+        if amount >= 0:
+            return 0.0
+        position = self.context.portfolio.positions.get(security)
+        if position is None:
+            return 0.0
+        return (float(price) - float(position.avg_cost or 0.0)) * abs(int(amount))
 
     def _cash_check_outlay(self, security: str, amount: int, price: float, *, include_costs: bool = True) -> float:
         if include_costs:
@@ -384,6 +507,7 @@ class Broker:
             commission=0.0,
             stamp_tax=0.0,
             transfer_fee=0.0,
+            dividend_tax=0.0,
             reason=reason,
         )
         self.orders.append(order)
@@ -400,6 +524,7 @@ class Broker:
         commission: float,
         stamp_tax: float,
         transfer_fee: float,
+        dividend_tax: float,
         reason: str,
     ):
         self._order_seq += 1
@@ -414,11 +539,24 @@ class Broker:
             commission=commission,
             stamp_tax=stamp_tax,
             transfer_fee=transfer_fee,
+            dividend_tax=dividend_tax,
             created_at=getattr(self.context, "current_dt", None),
             reason=reason,
         )
 
-    def _trade(self, order: Order, side: str, amount: int, price: float, value: float, commission: float, stamp_tax: float, transfer_fee: float):
+    def _trade(
+        self,
+        order: Order,
+        side: str,
+        amount: int,
+        price: float,
+        value: float,
+        commission: float,
+        stamp_tax: float,
+        transfer_fee: float,
+        realized_pnl: float = 0.0,
+        dividend_tax: float = 0.0,
+    ):
         self._trade_seq += 1
         return Trade(
             trade_id=f"T{self._trade_seq:08d}",
@@ -431,8 +569,10 @@ class Broker:
             commission=commission,
             stamp_tax=stamp_tax,
             transfer_fee=transfer_fee,
+            dividend_tax=dividend_tax,
             traded_at=getattr(self.context, "current_dt", None),
             reason=order.reason,
+            realized_pnl=realized_pnl,
         )
 
     def _validate_kwargs(self, kwargs: dict):
