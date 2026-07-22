@@ -30,6 +30,7 @@ _REQUIRED_LOCAL_APIS = [
     "trade_cal",
     "daily",
     "daily_basic",
+    "adj_factor",
     "index_weight",
     "stock_basic",
     "index_daily",

@@ -40,6 +40,7 @@ _UPDATE_PRIORITY = {
     "income": 10,
 }
 _MARKET_DAILY_APIS = {"daily", "daily_basic", "adj_factor", "fund_adj", "index_daily"}
+_PRICE_LOOKBACK_APIS = {"daily", "adj_factor", "fund_adj"}
 _REQUIRED_STOCK_BASIC_LIST_STATUSES = {"L", "D"}
 
 
@@ -104,6 +105,8 @@ class DataReadinessCheck:
                 continue
             if api_name == "trade_cal":
                 check_start, check_end = calendar_start, end
+            elif api_name in _PRICE_LOOKBACK_APIS:
+                check_start, check_end = price_market_start, price_market_end
             elif api_name in _MARKET_DAILY_APIS:
                 check_start, check_end = market_start, market_end
             else:
@@ -130,7 +133,10 @@ class DataReadinessCheck:
                 issues.append(
                     ReadinessIssue(
                         api_name=api_name,
-                        message=f"{api_name} starts at {min_date}, missing requested start {config.start_date}.",
+                        message=(
+                            f"{api_name} starts at {min_date}, "
+                            f"missing required start {_display_date(check_start)}."
+                        ),
                         suggestion=f"python update_data.py --api {api_name} --start-date {check_start} --end-date {min_date}",
                         update_requests=(_update_request(api_name, check_start, str(min_date)),),
                     )
@@ -500,6 +506,11 @@ def infer_strategy_price_lookback_start(strategy_path, start_date: str) -> str:
     lookback_days = max(max_count * 3 + 7, 14)
     start_dt = datetime.strptime(normalize_date(start_date), "%Y%m%d")
     return (start_dt - timedelta(days=lookback_days)).strftime("%Y%m%d")
+
+
+def _display_date(value: str) -> str:
+    normalized = normalize_date(value)
+    return datetime.strptime(normalized, "%Y%m%d").strftime("%Y-%m-%d")
 
 
 def infer_strategy_max_price_count(strategy_path) -> int:

@@ -434,7 +434,7 @@ class TestJoinQuantAPI(unittest.TestCase):
         self.assertEqual(df["market_cap"].tolist(), [0.0045])
         self.assertEqual(df["turnover_ratio"].tolist(), [1.2])
 
-    def test_get_current_data_at_open_uses_previous_trade_day_close(self):
+    def test_get_current_data_at_open_exposes_current_day_open(self):
         set_runtime_state(
             RuntimeState(
                 data_portal=DataPortal(APIPortalBackend()),
@@ -444,8 +444,10 @@ class TestJoinQuantAPI(unittest.TestCase):
 
         current = get_current_data(["000001.XSHE"])
 
-        self.assertEqual(current["000001.XSHE"].last_price, 10.5)
-        self.assertEqual(current["000001.XSHE"].day_open, 10.0)
+        self.assertEqual(current["000001.XSHE"].last_price, 10.6)
+        self.assertEqual(current["000001.XSHE"].day_open, 10.6)
+        self.assertEqual(current["000001.XSHE"].high_limit, 11.55)
+        self.assertEqual(current["000001.XSHE"].low_limit, 9.45)
 
     def test_attribute_history_real_portal_supports_default_compat_kwargs(self):
         set_runtime_state(

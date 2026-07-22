@@ -4,6 +4,26 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.24] - 2026-07-22
+
+### Changed
+
+- Load `get_price(..., count=N)` data from a bounded historical window instead of scanning the full configured backtest history.
+- Prefetch at most 45 calendar days of price and adjustment-factor data to reduce repeated SQLite extensions during sequential backtest days without exposing future rows to strategies.
+- Validate and automatically refill `adj_factor` together with daily prices for the strategy's inferred historical lookback window.
+
+### Fixed
+
+- Prevent data readiness checks from accepting a cache whose visible backtest range is complete but whose price or adjustment-factor lookback is too short.
+
+## [0.10.23] - 2026-07-22
+
+### Fixed
+
+- Align `get_current_data()` with JoinQuant's current-unit semantics at 09:30: expose the current trading day's known opening price instead of the previous trading day's open.
+- Use the opening price as `last_price` at the opening snapshot and calculate daily price limits from the previous close.
+- Keep historical, fundamentals, and pre-open data boundaries unchanged to avoid future-data leakage.
+
 ## [0.10.22] - 2026-07-16
 
 ### Changed

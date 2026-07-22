@@ -382,19 +382,19 @@ class DataPortal:
                     "name": code,
                 }
 
-        price_by_code = {}
+        price_rows_by_code = {}
         if self.optimize_data and codes:
             price_frame = self.get_price(
                 codes,
-                count=1,
+                count=2,
                 end_date=date,
                 fields=["open", "close", "volume"],
                 panel=False,
             )
             if not price_frame.empty:
-                price_by_code = {
-                    str(row["code"]): row
-                    for _, row in price_frame.iterrows()
+                price_rows_by_code = {
+                    str(code): group.sort_values("time").reset_index(drop=True)
+                    for code, group in price_frame.groupby("code", sort=False)
                 }
 
         current = {}
@@ -402,28 +402,41 @@ class DataPortal:
             metadata = metadata_by_code[code]
             name = str(metadata.get("name") or "")
             if self.optimize_data:
-                row = price_by_code.get(code)
+                rows = price_rows_by_code.get(code)
             else:
-                price = self.get_price(code, count=1, end_date=date, fields=["open", "close", "volume"], panel=False)
-                row = None if price.empty else price.iloc[-1]
+                rows = self.get_price(
+                    code,
+                    count=2,
+                    end_date=date,
+                    fields=["open", "close", "volume"],
+                    panel=False,
+                )
+            row = None if rows is None or rows.empty else rows.iloc[-1]
             last_price = 0.0
             day_open = 0.0
             paused = True
+            limit_reference = 0.0
             if row is not None:
-                last_price = self._float_value(row.get("close"), 0.0)
-                day_open = self._float_value(row.get("open"), last_price)
+                closing_price = self._float_value(row.get("close"), 0.0)
+                day_open = self._float_value(row.get("open"), closing_price)
                 volume = self._float_value(row.get("volume"), 0.0)
                 row_date = normalize_date(row.get("time")) if row.get("time") else ""
                 requested_date = normalize_date(date) if date is not None else row_date
                 paused = row_date != requested_date or volume <= 0
+                at_open = row_date == requested_date and self._is_open_snapshot(date)
+                last_price = day_open if at_open else closing_price
+                if row_date == requested_date and len(rows) > 1:
+                    limit_reference = self._float_value(rows.iloc[-2].get("close"), last_price)
+                else:
+                    limit_reference = last_price
             is_st = self._is_st_name(name)
             limit_ratio = self._limit_ratio(code, is_st)
             current[code] = SimpleNamespace(
                 is_st=is_st,
                 paused=paused,
                 last_price=last_price,
-                high_limit=round(last_price * (1 + limit_ratio), 2) if last_price else 0.0,
-                low_limit=round(last_price * (1 - limit_ratio), 2) if last_price else 0.0,
+                high_limit=round(limit_reference * (1 + limit_ratio), 2) if limit_reference else 0.0,
+                low_limit=round(limit_reference * (1 - limit_ratio), 2) if limit_reference else 0.0,
                 day_open=day_open,
                 name=name,
             )
@@ -1289,6 +1302,13 @@ class DataPortal:
         if raw_code.startswith(("300", "301", "688", "689")):
             return 0.2
         return 0.1
+
+    def _is_open_snapshot(self, value) -> bool:
+        time_method = getattr(value, "time", None)
+        if not callable(time_method):
+            return False
+        current_time = time_method()
+        return current_time.hour == 9 and current_time.minute == 30
 
     def _float_value(self, value, default: float) -> float:
         if value is None or pd.isna(value):

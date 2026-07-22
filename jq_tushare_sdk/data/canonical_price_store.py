@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta
 from time import perf_counter
 from typing import Callable
 
@@ -36,6 +37,7 @@ class CanonicalPriceStats:
 
 class CanonicalPriceStore:
     _RAW_CODE_CHUNK_SIZE = 400
+    _FORWARD_PREFETCH_DAYS = 45
 
     def __init__(
         self,
@@ -66,28 +68,36 @@ class CanonicalPriceStore:
         started = perf_counter()
         try:
             requested_codes = [str(code) for code in ts_codes]
-            requested_start = normalize_date(start_date) if start_date is not None else self.start_date
             requested_end = normalize_date(end_date)
-            source = self._raw_source(
-                api_name,
-                requested_codes,
-                requested_start,
-                requested_end,
-            )
-            result = source[
-                (source["trade_date"] >= requested_start)
-                & (source["trade_date"] <= requested_end)
-            ]
-            result = self._select_codes(result, requested_codes)
-            if count is not None:
-                if int(count) <= 0:
-                    result = result.iloc[0:0].copy()
-                else:
-                    result = (
-                        result.sort_values(["ts_code", "trade_date"], kind="mergesort")
-                        .groupby("ts_code", sort=False, group_keys=False)
-                        .tail(int(count))
-                    )
+            if count is not None and start_date is None:
+                result = self._raw_count_source(
+                    api_name,
+                    requested_codes,
+                    requested_end,
+                    int(count),
+                )
+            else:
+                requested_start = normalize_date(start_date) if start_date is not None else self.start_date
+                source = self._raw_source(
+                    api_name,
+                    requested_codes,
+                    requested_start,
+                    requested_end,
+                )
+                result = source[
+                    (source["trade_date"] >= requested_start)
+                    & (source["trade_date"] <= requested_end)
+                ]
+                result = self._select_codes(result, requested_codes)
+                if count is not None:
+                    if int(count) <= 0:
+                        result = result.iloc[0:0].copy()
+                    else:
+                        result = (
+                            result.sort_values(["ts_code", "trade_date"], kind="mergesort")
+                            .groupby("ts_code", sort=False, group_keys=False)
+                            .tail(int(count))
+                        )
             if fq == "pre" and factor_api_name is not None and not result.empty:
                 result = self._adjusted_source(
                     api_name,
@@ -113,7 +123,8 @@ class CanonicalPriceStore:
     ) -> None:
         normalized_start = normalize_date(requested_start)
         load_start = min(self.start_date, normalized_start) if use_configured_start else normalized_start
-        load_end = max(self.end_date, normalize_date(requested_end))
+        normalized_end = normalize_date(requested_end)
+        load_end = max(self.end_date, normalized_end) if use_configured_start else normalized_end
         requested_codes = self._unique_codes(ts_codes)
         states = self._raw.setdefault(api_name, {})
         loads: dict[tuple[str, str], list[str]] = {}
@@ -206,15 +217,17 @@ class CanonicalPriceStore:
         requested_end,
         *,
         use_configured_start: bool = True,
+        prefetch_days: int = 0,
     ) -> pd.DataFrame:
         start = normalize_date(requested_start)
         end = normalize_date(requested_end)
         requested_codes = self._unique_codes(ts_codes)
+        load_end = self._prefetch_end(end, prefetch_days)
         self._ensure_raw(
             api_name,
             requested_codes,
             start,
-            end,
+            load_end,
             use_configured_start=use_configured_start,
         )
         states = self._raw.get(api_name, {})
@@ -240,6 +253,93 @@ class CanonicalPriceStore:
             .sort_values(["trade_date", "ts_code"], kind="mergesort")
             .reset_index(drop=True)
         )
+
+    def _raw_count_source(
+        self,
+        api_name: str,
+        ts_codes: list[str],
+        requested_end: str,
+        count: int,
+    ) -> pd.DataFrame:
+        if count <= 0:
+            return pd.DataFrame(columns=["ts_code", "trade_date"])
+        requested_codes = self._unique_codes(ts_codes)
+        window_start = self._count_window_start(requested_end, count)
+        load_end = self._prefetch_end(requested_end, self._FORWARD_PREFETCH_DAYS)
+        self._ensure_raw(
+            api_name,
+            requested_codes,
+            window_start,
+            load_end,
+            use_configured_start=False,
+        )
+
+        states = self._raw.get(api_name, {})
+        incomplete = [
+            code
+            for code in requested_codes
+            if self._count_available_rows(states.get(code), requested_end) < count
+            and states.get(code) is not None
+            and states[code].start_date > self.start_date
+        ]
+        if incomplete:
+            self._ensure_raw(
+                api_name,
+                incomplete,
+                self.start_date,
+                load_end,
+                use_configured_start=False,
+            )
+
+        parts = []
+        template = None
+        states = self._raw.get(api_name, {})
+        for code in requested_codes:
+            current = states.get(code)
+            if current is None:
+                continue
+            template = current.frame
+            tail = self._state_tail(current, requested_end, count)
+            if not tail.empty:
+                parts.append(tail)
+        if not parts:
+            if template is not None:
+                return template.iloc[0:0].copy()
+            return pd.DataFrame(columns=["ts_code", "trade_date"])
+        return (
+            pd.concat(parts, ignore_index=True)
+            .sort_values(["trade_date", "ts_code"], kind="mergesort")
+            .reset_index(drop=True)
+        )
+
+    def _count_window_start(self, requested_end: str, count: int) -> str:
+        lookback_days = max(int(count) * 3 + 7, 14)
+        end = datetime.strptime(normalize_date(requested_end), "%Y%m%d")
+        inferred = (end - timedelta(days=lookback_days)).strftime("%Y%m%d")
+        return max(self.start_date, inferred)
+
+    def _prefetch_end(self, requested_end: str, days: int) -> str:
+        end = datetime.strptime(normalize_date(requested_end), "%Y%m%d")
+        inferred = (end + timedelta(days=max(0, int(days)))).strftime("%Y%m%d")
+        return min(self.end_date, inferred)
+
+    def _count_available_rows(self, state: _ApiFrame | None, requested_end: str) -> int:
+        if state is None or state.frame.empty:
+            return 0
+        dates = state.frame["trade_date"]
+        return int(dates.searchsorted(normalize_date(requested_end), side="right"))
+
+    def _state_tail(self, state: _ApiFrame, requested_end: str, count: int) -> pd.DataFrame:
+        if state.frame.empty:
+            return state.frame
+        right = int(
+            state.frame["trade_date"].searchsorted(
+                normalize_date(requested_end),
+                side="right",
+            )
+        )
+        left = max(0, right - int(count))
+        return state.frame.iloc[left:right]
 
     def _adjusted_source(
         self,
@@ -277,6 +377,7 @@ class CanonicalPriceStore:
                 factor_start,
                 factor_end,
                 use_configured_start=False,
+                prefetch_days=self._FORWARD_PREFETCH_DAYS,
             )
             if factors.empty or "adj_factor" not in factors.columns:
                 return price
@@ -381,7 +482,7 @@ class CanonicalPriceStore:
             api_name,
             [ts_code],
             start,
-            end,
+            self._prefetch_end(end, self._FORWARD_PREFETCH_DAYS),
             use_configured_start=False,
         )
         current = self._raw.get(api_name, {}).get(ts_code)

@@ -702,6 +702,74 @@ class TestDataLayer(unittest.TestCase):
                 count=1,
             )
 
+    def test_canonical_count_query_loads_a_bounded_window(self):
+        backend = FakeBackend()
+        dates = pd.date_range("2024-01-01", "2024-06-30", freq="B")
+        backend.frames["daily"] = pd.DataFrame(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": value.strftime("%Y%m%d"),
+                    "open": float(index),
+                    "high": float(index),
+                    "low": float(index),
+                    "close": float(index),
+                    "vol": 100.0,
+                    "amount": 1000.0,
+                }
+                for index, value in enumerate(dates, start=1)
+            ]
+        )
+        portal = DataPortal(
+            backend,
+            price_cache_start="2024-01-01",
+            price_cache_end="2024-06-30",
+        )
+
+        frame = portal.get_price(
+            "000001.XSHE",
+            end_date="2024-03-01",
+            count=2,
+            fields="close",
+            fq=None,
+            panel=False,
+        )
+
+        daily_calls = [params for name, params in backend.calls if name == "daily"]
+        self.assertEqual(frame["time"].tolist(), ["2024-02-29", "2024-03-01"])
+        self.assertEqual(daily_calls[0]["end_date"], "20240415")
+        self.assertGreater(daily_calls[0]["start_date"], "20240101")
+        self.assertLessEqual(portal.performance_snapshot()["canonical_cache"]["loaded_rows"], 45)
+
+    def test_canonical_count_query_extends_backwards_when_window_is_sparse(self):
+        backend = FakeBackend()
+        backend.frames["daily"] = pd.DataFrame(
+            [
+                {"ts_code": "000001.SZ", "trade_date": "20240102", "close": 10.0},
+                {"ts_code": "000001.SZ", "trade_date": "20240201", "close": 10.1},
+                {"ts_code": "000001.SZ", "trade_date": "20240301", "close": 10.2},
+            ]
+        )
+        portal = DataPortal(
+            backend,
+            price_cache_start="2024-01-01",
+            price_cache_end="2024-06-30",
+        )
+
+        frame = portal.get_price(
+            "000001.XSHE",
+            end_date="2024-03-01",
+            count=3,
+            fields="close",
+            fq=None,
+            panel=False,
+        )
+
+        daily_calls = [params for name, params in backend.calls if name == "daily"]
+        self.assertEqual(frame["close"].tolist(), [10.0, 10.1, 10.2])
+        self.assertEqual(len(daily_calls), 2)
+        self.assertEqual(daily_calls[-1]["start_date"], "20240101")
+
     def test_get_current_data_without_securities_uses_stock_basic(self):
         portal = DataPortal(FakeBackend())
 
@@ -729,7 +797,7 @@ class TestDataLayer(unittest.TestCase):
 
         self.assertEqual(list(current.keys()), ["600000.XSHG"])
         self.assertEqual(current["600000.XSHG"].name, "浦发银行")
-        self.assertEqual(current["600000.XSHG"].high_limit, round(20.8 * 1.1, 2))
+        self.assertEqual(current["600000.XSHG"].high_limit, round(20.4 * 1.1, 2))
         self.assertEqual(current["600000.XSHG"].day_open, 20.5)
 
     def test_get_current_data_batches_price_lookup_for_security_list(self):
@@ -1217,6 +1285,41 @@ class TestDataLayer(unittest.TestCase):
         self.assertEqual(issues[1].update_requests[0].api_name, "daily_basic")
         self.assertEqual(issues[1].update_requests[0].start_date, "20240101")
         self.assertEqual(issues[1].update_requests[0].end_date, "20240131")
+
+    def test_readiness_checks_price_lookback_and_adjustment_factor(self):
+        class ShortHistoryBackend(FakeBackend):
+            def status(self, api_name):
+                if api_name in {"daily", "daily_basic", "adj_factor"}:
+                    return {
+                        "exists": True,
+                        "record_count": 10,
+                        "min_date": "20260415",
+                        "max_date": "20260721",
+                    }
+                return super().status(api_name)
+
+        with TemporaryDirectory() as tmp:
+            strategy_path = Path(tmp) / "lookback_strategy.py"
+            strategy_path.write_text(
+                "LOOKBACK = 84\n\ndef signal(context):\n    return get_price('000001.XSHE', count=LOOKBACK)\n",
+                encoding="utf-8",
+            )
+            config = BacktestConfig(
+                strategy_path=str(strategy_path),
+                start_date="2026-06-18",
+                end_date="2026-07-21",
+                initial_cash=1000000.0,
+                cache_db="/tmp/cache.db",
+            )
+
+            issues = DataReadinessCheck(ShortHistoryBackend()).check_required(
+                config,
+                ["daily", "daily_basic", "adj_factor"],
+            )
+
+        self.assertEqual([issue.api_name for issue in issues], ["daily", "adj_factor"])
+        self.assertEqual(issues[0].update_requests[0].start_date, "20251002")
+        self.assertEqual(issues[1].update_requests[0].start_date, "20251002")
 
     def test_readiness_reports_stock_basic_missing_historical_statuses(self):
         class ListedOnlyBackend(FakeBackend):

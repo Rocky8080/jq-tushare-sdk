@@ -151,7 +151,7 @@ def get_security_info(security):
 def get_current_data(securities=None):
     return runtime_state().data_portal.get_current_data(
         securities,
-        date=_context_data_date(),
+        date=_context_current_data_date(),
     )
 
 
@@ -245,6 +245,20 @@ def _context_current_date():
     if context is None:
         return None
     return getattr(context, "current_dt", None)
+
+
+def _context_current_data_date():
+    state = runtime_state()
+    context = getattr(state, "context", None)
+    if context is None:
+        return None
+    current_dt = getattr(context, "current_dt", None)
+    if current_dt is None:
+        return None
+    time_method = getattr(current_dt, "time", None)
+    if callable(time_method) and time_method() < time(9, 30):
+        return _context_visible_data_date(state)
+    return current_dt
 
 
 def _partial_daily_bar_date(requested_date, frequency):

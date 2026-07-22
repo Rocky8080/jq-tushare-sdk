@@ -258,7 +258,7 @@ class Broker:
         current = self._portal_call(
             "get_current_data",
             [security],
-            date=self._as_of_date(),
+            date=getattr(self.context, "current_dt", None),
         )
         return current[security]
 
