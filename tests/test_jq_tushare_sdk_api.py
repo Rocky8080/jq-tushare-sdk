@@ -636,7 +636,7 @@ class TestJoinQuantAPI(unittest.TestCase):
         exports["set_slippage"](exports["PriceRelatedSlippage"](0.02))
         order = broker.order("000001.XSHE", 100)
 
-        self.assertAlmostEqual(order.price, 10.812)
+        self.assertAlmostEqual(order.price, 10.81)
 
     def test_set_slippage_supports_fixed_style(self):
         exports = exported_globals()
@@ -654,8 +654,8 @@ class TestJoinQuantAPI(unittest.TestCase):
         buy_order = broker.order("000001.XSHE", 100)
         sell_order = broker.order("000001.XSHE", -100)
 
-        self.assertAlmostEqual(buy_order.price, 10.605)
-        self.assertAlmostEqual(sell_order.price, 10.595)
+        self.assertAlmostEqual(buy_order.price, 10.60)
+        self.assertAlmostEqual(sell_order.price, 10.60)
 
     def test_set_slippage_rejects_unsupported_styles(self):
         class UnsupportedSlippage:

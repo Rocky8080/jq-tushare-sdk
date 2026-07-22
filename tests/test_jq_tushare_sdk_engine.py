@@ -184,6 +184,8 @@ def handle_open(context):
                     "commission",
                     "stamp_tax",
                     "transfer_fee",
+                    "dividend_tax",
+                    "realized_pnl",
                     "order_id",
                     "trade_id",
                     "reason",

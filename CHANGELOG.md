@@ -11,6 +11,8 @@ This project follows Semantic Versioning.
 - Load `get_price(..., count=N)` data from a bounded historical window instead of scanning the full configured backtest history.
 - Prefetch at most 45 calendar days of price and adjustment-factor data to reduce repeated SQLite extensions during sequential backtest days without exposing future rows to strategies.
 - Validate and automatically refill `adj_factor` together with daily prices for the strategy's inferred historical lookback window.
+- Process A-share cash dividends, FIFO holding-period dividend tax adjustments, and realized profit and loss in local backtests.
+- Export `dividend_tax` and `realized_pnl` with transaction records and apply stock/ETF tick precision to market-order slippage prices.
 
 ### Fixed
 
