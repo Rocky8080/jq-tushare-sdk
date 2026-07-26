@@ -4,6 +4,17 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.25] - 2026-07-26
+
+### Added
+
+- Show strategy version and annualized Sharpe ratio in backtest history, including safe fallbacks for older runs.
+
+### Fixed
+
+- Treat a priced `MarketOrderStyle` as a market-order protection boundary instead of using the protection price as the fill price.
+- Reject market orders whose simulated execution price breaches the supplied protection boundary.
+
 ## [0.10.24] - 2026-07-22
 
 ### Changed

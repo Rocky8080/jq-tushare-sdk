@@ -84,7 +84,8 @@ class LimitOrderStyle:
 
 
 class MarketOrderStyle:
-    pass
+    def __init__(self, price=None):
+        self.price = price
 
 
 class TestBroker(unittest.TestCase):
@@ -521,6 +522,87 @@ class TestBroker(unittest.TestCase):
         self.assertAlmostEqual(order.price, 10.2)
         self.assertAlmostEqual(context.portfolio.available_cash, 98975.0)
         self.assertEqual(context.portfolio.positions["000001.XSHE"].total_amount, 100)
+
+    def test_market_order_protection_price_is_a_boundary_not_fill_price(self):
+        context = Context(
+            Portfolio(100000.0),
+            current_dt=datetime(2024, 1, 2, 9, 30),
+        )
+        broker = Broker(
+            context,
+            FakePortal(price=10.0, open_price=10.0),
+            CostModel(min_commission=5.0),
+        )
+
+        order = broker.order(
+            "688001.XSHG",
+            200,
+            style=MarketOrderStyle(10.2),
+        )
+
+        self.assertEqual(order.status, "filled")
+        self.assertAlmostEqual(order.price, 10.0)
+        self.assertAlmostEqual(context.portfolio.available_cash, 97995.0)
+
+    def test_market_order_rejects_execution_outside_protection_boundary(self):
+        context = Context(
+            Portfolio(100000.0),
+            current_dt=datetime(2024, 1, 2, 9, 30),
+        )
+        broker = Broker(
+            context,
+            FakePortal(price=10.0, open_price=10.0),
+            CostModel(min_commission=5.0),
+        )
+
+        order = broker.order(
+            "688001.XSHG",
+            200,
+            style=MarketOrderStyle(9.9),
+        )
+
+        self.assertEqual(order.status, "rejected")
+        self.assertEqual(order.reason, "market protection price violated")
+        self.assertNotIn("688001.XSHG", context.portfolio.positions)
+
+    def test_market_sell_protection_price_is_a_lower_boundary(self):
+        context = Context(
+            Portfolio(
+                0.0,
+                positions={
+                    "688001.XSHG": Position(
+                        code="688001.XSHG",
+                        total_amount=400,
+                        closeable_amount=400,
+                        avg_cost=9.0,
+                        price=10.0,
+                    )
+                },
+            ),
+            current_dt=datetime(2024, 1, 2, 9, 30),
+        )
+        broker = Broker(
+            context,
+            FakePortal(price=10.0, open_price=10.0),
+            CostModel(min_commission=5.0),
+        )
+
+        filled = broker.order(
+            "688001.XSHG",
+            -200,
+            style=MarketOrderStyle(9.8),
+        )
+        rejected = broker.order(
+            "688001.XSHG",
+            -200,
+            style=MarketOrderStyle(10.1),
+        )
+
+        self.assertEqual(filled.status, "filled")
+        self.assertAlmostEqual(filled.price, 10.0)
+        self.assertEqual(rejected.status, "rejected")
+        self.assertEqual(rejected.reason, "market protection price violated")
+        self.assertEqual(context.portfolio.positions["688001.XSHG"].total_amount, 200)
 
     def test_fixed_slippage_uses_half_spread_for_each_side(self):
         context = Context(Portfolio(100000.0))

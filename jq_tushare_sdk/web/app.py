@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import ast
 import calendar
+import csv
 import hashlib
 import json
+import math
 import mimetypes
 import os
 import re
@@ -95,6 +97,7 @@ class RunStore:
         for manifest_path in sorted(self.output_dir.glob("*/manifest.json"), reverse=True):
             run_dir = manifest_path.parent
             manifest = _read_json(manifest_path)
+            config = _read_json(run_dir / "config.json")
             summary = _read_json(run_dir / "reports" / "summary.json")
             run_id = str(manifest.get("run_id") or run_dir.name)
             report_file = run_dir / "reports" / "report.html"
@@ -105,6 +108,12 @@ class RunStore:
             if initial_cash and final_value is not None:
                 return_rate = final_value / initial_cash - 1
             profile = summary.get("performance_profile") if isinstance(summary, dict) else {}
+            sharpe_ratio = _to_float(summary.get("sharpe_ratio"))
+            if sharpe_ratio is None:
+                sharpe_ratio = _read_annualized_sharpe(run_dir / "reports" / "performance.csv")
+            strategy_version = manifest.get("strategy_version") or config.get("strategy_version")
+            if not strategy_version:
+                strategy_version = _read_logged_strategy_version(run_dir / "logs" / "backtest.log")
             runs.append(
                 {
                     "run_id": run_id,
@@ -117,7 +126,7 @@ class RunStore:
                     "return_rate": return_rate,
                     "trade_count": summary.get("trade_count"),
                     "sdk_version": manifest.get("sdk_version"),
-                    "strategy_version": manifest.get("strategy_version"),
+                    "strategy_version": strategy_version,
                     "strategy_source": manifest.get("strategy_source"),
                     "strategy_hash": manifest.get("strategy_hash"),
                     "project_strategy_path": manifest.get("project_strategy_path"),
@@ -125,6 +134,7 @@ class RunStore:
                     "project_strategy_hash": manifest.get("project_strategy_hash"),
                     "project_strategy_is_newer": manifest.get("project_strategy_is_newer"),
                     "duration_seconds": _to_float((profile or {}).get("total_seconds")),
+                    "sharpe_ratio": sharpe_ratio,
                     "status": "completed" if has_report else "incomplete",
                     "report_path": f"{run_id}/reports/report.html" if has_report else None,
                     "run_dir": str(run_dir),
@@ -1554,6 +1564,15 @@ def _render_history_html() -> str:
         </div>
         <input id="history-filter" class="search" placeholder="搜索策略、日期或版本">
       </div>
+      <div class="history-columns" aria-hidden="true">
+        <span>策略</span>
+        <span>回测区间</span>
+        <span>策略版本</span>
+        <span>收益</span>
+        <span>Sharpe</span>
+        <span>耗时</span>
+        <span>操作</span>
+      </div>
       <div id="history-runs" class="history-list"></div>
       <template id="history-link-template"><a href="/?run_id=">选择</a></template>
     </section>
@@ -1967,18 +1986,27 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   gap: 14px;
 }
 .search { max-width: 320px; }
+.history-columns,
+.history-row {
+  display: grid;
+  grid-template-columns: minmax(260px, 1.5fr) 150px 92px 100px 88px 90px 84px;
+  gap: 12px;
+  align-items: center;
+}
+.history-columns {
+  margin-top: 18px;
+  padding: 0 12px 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
 .history-list {
   display: grid;
-  margin-top: 14px;
   border: 1px solid #e2e8ef;
   border-radius: 6px;
   overflow: hidden;
 }
 .history-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1.5fr) 160px 110px 100px 90px;
-  gap: 12px;
-  align-items: center;
   min-height: 64px;
   padding: 10px 12px;
   border-bottom: 1px solid #e7edf3;
@@ -1992,6 +2020,12 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   white-space: nowrap;
 }
 .history-main span, .muted { color: var(--muted); }
+.history-version {
+  color: var(--blue);
+  font-weight: 800;
+  white-space: nowrap;
+}
+.history-label { display: none; }
 .positive { color: var(--red); font-weight: 800; }
 .negative { color: var(--green); font-weight: 800; }
 @media (max-width: 1180px) {
@@ -2003,7 +2037,17 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 }
 @media (max-width: 760px) {
   .topbar { align-items: flex-start; flex-direction: column; }
+  .panel-head { align-items: stretch; flex-direction: column; }
+  .search { max-width: none; }
   .parameter-form.compact, .settings-panel, .history-row, .job-item { display: grid; grid-template-columns: 1fr; }
+  .history-columns { display: none; }
+  .history-list { grid-template-columns: minmax(0, 1fr); }
+  .history-row { gap: 8px; grid-template-columns: minmax(0, 1fr); min-width: 0; width: 100%; }
+  .history-row > div:not(.history-main) {
+    display: grid;
+    grid-template-columns: 72px minmax(0, 1fr);
+  }
+  .history-label { display: inline; color: var(--muted); font-weight: 600; }
   .job-progress { grid-template-columns: minmax(0, 1fr); }
   .job-progress > span { justify-self: start; }
   #report-frame { min-height: 560px; }
@@ -2578,6 +2622,7 @@ def _history_js() -> str:
     return """
 const $ = (id) => document.getElementById(id);
 const pct = (value) => value == null ? '--' : `${(Number(value) * 100).toFixed(2)}%`;
+const ratio = (value) => value == null ? '--' : Number(value).toFixed(3);
 const seconds = (value) => value == null ? '--' : `${Number(value).toFixed(2)}s`;
 
 async function loadHistory() {
@@ -2591,7 +2636,7 @@ function renderHistory(runs) {
   const filter = $('history-filter').value.trim().toLowerCase();
   const root = $('history-runs');
   const rows = runs.filter((run) => {
-    const text = `${run.strategy_name} ${run.start_date} ${run.end_date} ${run.sdk_version}`.toLowerCase();
+    const text = `${run.strategy_name} ${run.start_date} ${run.end_date} ${run.strategy_version} ${run.sdk_version}`.toLowerCase();
     return !filter || text.includes(filter);
   });
   root.innerHTML = '';
@@ -2603,6 +2648,8 @@ function renderHistory(runs) {
     const row = document.createElement('div');
     row.className = 'history-row';
     const cls = Number(run.return_rate) >= 0 ? 'positive' : 'negative';
+    const sharpeCls = run.sharpe_ratio == null ? '' : (Number(run.sharpe_ratio) >= 0 ? 'positive' : 'negative');
+    const version = run.strategy_version ? `v${run.strategy_version}` : '--';
     let action = `<a class="primary link-button" href="/?run_id=${encodeURIComponent(run.run_id)}">选择</a>`;
     if (!run.report_path) {
       action = '<span class="disabled-link incomplete">未生成报告</span>';
@@ -2612,9 +2659,11 @@ function renderHistory(runs) {
         <strong>${escapeHtml(run.strategy_name || '')}</strong>
         <span>${escapeHtml(run.run_id)}</span>
       </div>
-      <div>${escapeHtml(run.start_date || '')}<br>${escapeHtml(run.end_date || '')}</div>
-      <div class="${cls}">${pct(run.return_rate)}</div>
-      <div>${seconds(run.duration_seconds)}</div>
+      <div><span class="history-label">区间</span><span>${escapeHtml(run.start_date || '')}<br>${escapeHtml(run.end_date || '')}</span></div>
+      <div><span class="history-label">版本</span><span class="history-version">${escapeHtml(version)}</span></div>
+      <div><span class="history-label">收益</span><span class="${cls}">${pct(run.return_rate)}</span></div>
+      <div><span class="history-label">Sharpe</span><span class="${sharpeCls}">${ratio(run.sharpe_ratio)}</span></div>
+      <div><span class="history-label">耗时</span><span>${seconds(run.duration_seconds)}</span></div>
       ${action}
     `;
     root.appendChild(row);
@@ -2720,6 +2769,39 @@ def _read_json(path: Path) -> dict:
     if not path.exists():
         return {}
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _read_annualized_sharpe(path: Path) -> float | None:
+    if not path.exists():
+        return None
+    with path.open(encoding="utf-8", newline="") as handle:
+        daily_returns = [
+            value
+            for row in csv.DictReader(handle)
+            if (value := _to_float(row.get("daily_return"))) is not None
+        ]
+    if len(daily_returns) < 2:
+        return None
+    mean = sum(daily_returns) / len(daily_returns)
+    variance = sum((value - mean) ** 2 for value in daily_returns) / (len(daily_returns) - 1)
+    volatility = math.sqrt(variance)
+    if volatility <= 0:
+        return None
+    return mean / volatility * math.sqrt(252)
+
+
+def _read_logged_strategy_version(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        for _ in range(20):
+            line = handle.readline()
+            if not line:
+                break
+            match = re.search(r"策略版本\s*[:：]\s*([^\s]+)", line)
+            if match:
+                return match.group(1)
+    return None
 
 
 def _to_float(*values) -> float | None:

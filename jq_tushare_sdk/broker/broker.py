@@ -98,6 +98,13 @@ class Broker:
         price = self._price(security, rounded_amount, style)
         if getattr(current_state, "paused", False):
             return self._reject(security, rounded_amount, price, "security paused")
+        if self._violates_market_protection(style, side, price):
+            return self._reject(
+                security,
+                rounded_amount,
+                price,
+                "market protection price violated",
+            )
         if side == "buy" and self._is_locked_limit(current_state, side, price):
             return self._reject(security, rounded_amount, price, "limit-up buy blocked")
         if side == "sell" and self._is_locked_limit(current_state, side, price):
@@ -601,10 +608,23 @@ class Broker:
     def _style_price(self, style):
         if style is None:
             return None
+        if style.__class__.__name__ != "LimitOrderStyle":
+            return None
         price = getattr(style, "price", None)
         if price is None:
             return None
         return float(price)
+
+    def _violates_market_protection(self, style, side: str, execution_price: float) -> bool:
+        if style is None or style.__class__.__name__ != "MarketOrderStyle":
+            return False
+        protection_price = getattr(style, "price", None)
+        if protection_price is None:
+            return False
+        protection_price = float(protection_price)
+        if side == "buy":
+            return float(execution_price) > protection_price
+        return float(execution_price) < protection_price
 
     def _value_order_direction(self, value: float) -> int:
         return 1 if value >= 0 else -1

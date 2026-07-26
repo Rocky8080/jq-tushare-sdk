@@ -1,4 +1,5 @@
 import json
+import math
 import sqlite3
 import tempfile
 import threading
@@ -60,6 +61,16 @@ class TestWebConsole(unittest.TestCase):
                 final_value=2100000.0,
                 total_seconds=17.0,
             )
+            beta_run = output_dir / "20260703-110000_beta_20260601_20260630"
+            (beta_run / "logs").mkdir()
+            (beta_run / "logs" / "backtest.log").write_text(
+                "2026-07-03 11:00:00 INFO 策略版本: 2.1.0\n",
+                encoding="utf-8",
+            )
+            (beta_run / "reports" / "performance.csv").write_text(
+                "date,daily_return\n2026-06-01,0.01\n2026-06-02,-0.005\n2026-06-03,0.02\n",
+                encoding="utf-8",
+            )
 
             runs = RunStore(output_dir).list_runs()
 
@@ -68,6 +79,11 @@ class TestWebConsole(unittest.TestCase):
         self.assertEqual(runs[0]["status"], "completed")
         self.assertAlmostEqual(runs[0]["return_rate"], 0.05)
         self.assertEqual(runs[0]["duration_seconds"], 17.0)
+        self.assertEqual(runs[0]["strategy_version"], "2.1.0")
+        expected_sharpe = ((0.01 - 0.005 + 0.02) / 3) / math.sqrt(
+            sum((value - ((0.01 - 0.005 + 0.02) / 3)) ** 2 for value in (0.01, -0.005, 0.02)) / 2
+        ) * math.sqrt(252)
+        self.assertAlmostEqual(runs[0]["sharpe_ratio"], expected_sharpe)
         self.assertEqual(runs[0]["report_path"], "20260703-110000_beta_20260601_20260630/reports/report.html")
 
     def test_run_store_returns_strategy_reproducibility_metadata(self):
@@ -514,6 +530,15 @@ class TestWebConsole(unittest.TestCase):
         self.assertIn("未生成报告", script)
         self.assertIn("disabled-link", script)
         self.assertIn("incomplete", script)
+
+    def test_history_page_displays_strategy_version_and_sharpe(self):
+        html = web_app._render_history_html()
+        script = web_app._history_js()
+
+        self.assertIn("策略版本", html)
+        self.assertIn("Sharpe", html)
+        self.assertIn("run.strategy_version", script)
+        self.assertIn("run.sharpe_ratio", script)
 
     def test_html_report_logs_strategy_reproducibility_metadata(self):
         config = SimpleNamespace(
