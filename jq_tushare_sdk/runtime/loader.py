@@ -52,15 +52,17 @@ class LoadedStrategy:
     loaded_run_type: str
     safety: Any = None
 
-    def initialize(self, context):
-        initializer = self.namespace.get("initialize")
-        if initializer is None:
-            raise AttributeError(f"Strategy {self.path} does not define initialize(context)")
+    def _run_lifecycle_hook(self, name, context, required=False):
+        callback = self.namespace.get(name)
+        if callback is None:
+            if required:
+                raise AttributeError(f"Strategy {self.path} does not define {name}(context)")
+            return None
         _assert_strategy_run_mode(
             self.loaded_run_type,
             context,
             self.path,
-            "initialize",
+            name,
         )
         self.state.context = context
         if self.safety is None:
@@ -70,9 +72,20 @@ class LoadedStrategy:
                 _strategy_import_path(self.path),
                 _pandas_legacy_panel_guard(),
             ):
-                return initializer(context)
+                return callback(context)
         with _runtime_state_scope(self.state):
-            return self.safety.execute(initializer, context)
+            return self.safety.execute(callback, context)
+
+    def initialize(self, context):
+        return self._run_lifecycle_hook("initialize", context, required=True)
+
+    def after_code_changed(self, context):
+        """Match JoinQuant backtests, which invoke this optional hook once."""
+        return self._run_lifecycle_hook("after_code_changed", context)
+
+    def process_initialize(self, context):
+        """Initialize non-persistent runtime resources after other startup hooks."""
+        return self._run_lifecycle_hook("process_initialize", context)
 
 
 class InertRedisClient:

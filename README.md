@@ -240,7 +240,7 @@ http://127.0.0.1:8787/report.html
 
 当前重点支持日频 A 股策略的本地研究和回测，已覆盖的核心能力包括：
 
-- 策略生命周期：`initialize`、`run_daily`、`run_weekly`、`run_monthly`
+- 策略生命周期：`initialize`、可选的 `after_code_changed` / `process_initialize`、`run_daily`、`run_weekly`、`run_monthly`
 - 行情数据：`get_price`、`attribute_history`、`history`，支持股票、基金、常用宽基指数及申万行业指数日线
 - 基本面数据：`get_fundamentals`、`get_fundamentals_continuously`
 - 标的查询：`get_index_stocks`、`get_all_securities`、`get_security_info`、`get_current_data`、`get_industry`
@@ -259,7 +259,7 @@ http://127.0.0.1:8787/report.html
 
 ## Versioning
 
-当前版本：`v0.10.25`
+当前版本：`v0.10.26`
 
 版本号遵循 Semantic Versioning：
 

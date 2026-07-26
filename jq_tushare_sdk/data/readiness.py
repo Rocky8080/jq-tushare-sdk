@@ -438,11 +438,23 @@ def infer_strategy_benchmark(strategy_path) -> str | None:
                 if isinstance(target, ast.Name) and value is not _UNRESOLVED:
                     module_env[target.id] = value
 
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "initialize":
-            benchmark = _benchmark_from_initialize(node, module_env)
-            if benchmark:
-                return benchmark
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+    }
+    for lifecycle_name in ("initialize", "process_initialize"):
+        lifecycle = functions.get(lifecycle_name)
+        if lifecycle is None:
+            continue
+        benchmark = _benchmark_from_lifecycle(
+            lifecycle,
+            module_env,
+            functions,
+            visited=set(),
+        )
+        if benchmark:
+            return benchmark
     return None
 
 
@@ -590,6 +602,37 @@ def _benchmark_from_initialize(function: ast.FunctionDef, module_env: dict[str, 
         if isinstance(call, ast.Call) and _is_name(call.func, "set_benchmark") and call.args:
             value = _evaluate_static_expression(call.args[0], env)
             return value if isinstance(value, str) else None
+    return None
+
+
+def _benchmark_from_lifecycle(
+    function: ast.FunctionDef,
+    module_env: dict[str, object],
+    functions: dict[str, ast.FunctionDef],
+    visited: set[str],
+) -> str | None:
+    if function.name in visited:
+        return None
+    visited.add(function.name)
+
+    benchmark = _benchmark_from_initialize(function, module_env)
+    if benchmark:
+        return benchmark
+
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        helper = functions.get(node.func.id)
+        if helper is None:
+            continue
+        benchmark = _benchmark_from_lifecycle(
+            helper,
+            module_env,
+            functions,
+            visited,
+        )
+        if benchmark:
+            return benchmark
     return None
 
 

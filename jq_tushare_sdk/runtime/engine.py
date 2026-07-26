@@ -86,6 +86,8 @@ class BacktestEngine:
         with profiler.measure_phase("initialize", "策略初始化"):
             loaded = StrategyLoader().load(self.config.strategy_path, state)
             loaded.initialize(context)
+            loaded.after_code_changed(context)
+            loaded.process_initialize(context)
         with profiler.measure_phase("setup", "基础数据准备"):
             timeline = self._execution_timeline(scheduler)
             security_names = self._security_names(portal)

@@ -4,6 +4,13 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.26] - 2026-07-27
+
+### Added
+
+- Run the optional JoinQuant `after_code_changed(context)` and `process_initialize(context)` lifecycle hooks after `initialize(context)` in local backtests.
+- Infer strategy benchmarks declared in `process_initialize` as well as `initialize`.
+
 ## [0.10.25] - 2026-07-26
 
 ### Added

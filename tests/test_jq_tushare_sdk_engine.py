@@ -106,6 +106,53 @@ class BenchmarkBackend(FakeBackend):
 
 
 class TestBacktestEngine(unittest.TestCase):
+    def test_engine_runs_joinquant_startup_hooks_in_order_and_replaces_schedules(self):
+        source = """
+from jqdata import *
+
+def initialize(context):
+    log.info('lifecycle:initialize')
+    run_daily(old_open, time='open')
+
+def after_code_changed(context):
+    log.info('lifecycle:after_code_changed')
+    unschedule_all()
+    run_daily(new_open, time='open')
+
+def process_initialize(context):
+    log.info('lifecycle:process_initialize')
+    g.runtime_ready = True
+
+def old_open(context):
+    log.info('callback:old')
+
+def new_open(context):
+    log.info('callback:new ready=%s', g.runtime_ready)
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            strategy_path = Path(tmp) / "lifecycle_strategy.py"
+            strategy_path.write_text(source, encoding="utf-8")
+            config = BacktestConfig(
+                strategy_path=str(strategy_path),
+                start_date="2024-01-02",
+                end_date="2024-01-03",
+                initial_cash=100000.0,
+                cache_db="/tmp/cache.db",
+                output_dir=str(Path(tmp) / "runs"),
+                strategy_name="lifecycle",
+            )
+
+            manifest = BacktestEngine(config, backend=FakeBackend()).run()
+            log_text = (manifest.logs_dir / "backtest.log").read_text(encoding="utf-8")
+
+        initialize_at = log_text.index("lifecycle:initialize")
+        changed_at = log_text.index("lifecycle:after_code_changed")
+        process_at = log_text.index("lifecycle:process_initialize")
+        self.assertLess(initialize_at, changed_at)
+        self.assertLess(changed_at, process_at)
+        self.assertNotIn("callback:old", log_text)
+        self.assertEqual(log_text.count("callback:new ready=True"), 2)
+
     def test_engine_writes_joinquant_like_outputs(self):
         source = """
 from jqdata import *

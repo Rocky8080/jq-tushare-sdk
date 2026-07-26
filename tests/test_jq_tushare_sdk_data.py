@@ -1389,6 +1389,37 @@ def initialize(context):
         self.assertEqual(issues[0].update_requests[0].api_name, "index_daily")
         self.assertEqual(dict(issues[0].update_requests[0].params), {"ts_code": "000985.CSI"})
 
+    def test_readiness_infers_benchmark_from_process_initialize(self):
+        with TemporaryDirectory() as tmp:
+            strategy_path = Path(tmp) / "process_benchmark_strategy.py"
+            strategy_path.write_text(
+                """
+def initialize(context):
+    pass
+
+def process_initialize(context):
+    apply_platform_settings()
+
+def apply_platform_settings():
+    set_benchmark("000985.XSHG")
+""",
+                encoding="utf-8",
+            )
+            config = BacktestConfig(
+                strategy_path=str(strategy_path),
+                start_date="2024-01-02",
+                end_date="2024-01-03",
+                initial_cash=1000000.0,
+                cache_db="/tmp/cache.db",
+                benchmark="399006.XSHE",
+            )
+
+            issues = DataReadinessCheck(FakeBackend()).check_required(config, ["index_daily"])
+
+        self.assertEqual(len(issues), 1)
+        self.assertIn("000985.XSHG", issues[0].message)
+        self.assertEqual(dict(issues[0].update_requests[0].params), {"ts_code": "000985.CSI"})
+
     def test_readiness_reports_missing_sw_industry_daily_history(self):
         class MissingOneSwIndexBackend(FakeBackend):
             def fetch(self, api_name, **params):
