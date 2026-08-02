@@ -469,6 +469,81 @@ class TestDataLayer(unittest.TestCase):
         self.assertEqual(backend.fetch_counts["daily"], 1)
         self.assertEqual(backend.fetch_counts["adj_factor"], 1)
 
+    def test_canonical_factor_view_compresses_repeated_values_without_changing_prices(self):
+        backend = FakeBackend()
+        dates = pd.date_range("2024-01-02", periods=6, freq="B")
+        backend.frames["daily"] = pd.DataFrame(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": value.strftime("%Y%m%d"),
+                    "close": 12.0,
+                }
+                for value in dates
+            ]
+        )
+        backend.frames["adj_factor"] = pd.DataFrame(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": value.strftime("%Y%m%d"),
+                    "adj_factor": factor,
+                }
+                for value, factor in zip(dates, [1.0, 1.0, 1.0, 2.0, 2.0, 2.0])
+            ]
+        )
+        portal = DataPortal(
+            backend,
+            price_cache_start="2024-01-01",
+            price_cache_end="2024-01-31",
+        )
+
+        frame = portal.get_price(
+            "000001.XSHE",
+            start_date="2024-01-02",
+            end_date="2024-01-09",
+            fields="close",
+            fq="pre",
+            panel=False,
+        )
+        cache = portal.performance_snapshot()["canonical_cache"]
+
+        self.assertEqual(frame["close"].tolist(), [6.0, 6.0, 6.0, 12.0, 12.0, 12.0])
+        self.assertEqual(cache["factor_rows_scanned"], 6)
+        self.assertEqual(cache["factor_change_nodes"], 2)
+
+    def test_canonical_compressed_factor_view_preserves_missing_date_fallback(self):
+        backend = FakeBackend()
+        backend.frames["daily"] = pd.DataFrame(
+            [
+                {"ts_code": "000001.SZ", "trade_date": "20240102", "close": 10.0},
+                {"ts_code": "000001.SZ", "trade_date": "20240103", "close": 10.0},
+                {"ts_code": "000001.SZ", "trade_date": "20240104", "close": 10.0},
+            ]
+        )
+        backend.frames["adj_factor"] = pd.DataFrame(
+            [
+                {"ts_code": "000001.SZ", "trade_date": "20240102", "adj_factor": 1.0},
+                {"ts_code": "000001.SZ", "trade_date": "20240104", "adj_factor": 2.0},
+            ]
+        )
+        portal = DataPortal(
+            backend,
+            price_cache_start="2024-01-01",
+            price_cache_end="2024-01-31",
+        )
+
+        frame = portal.get_price(
+            "000001.XSHE",
+            start_date="2024-01-02",
+            end_date="2024-01-04",
+            fields="close",
+            fq="pre",
+            panel=False,
+        )
+
+        self.assertEqual(frame["close"].tolist(), [5.0, 10.0, 10.0])
+
     def test_get_price_reuses_final_result_cache_and_returns_copies(self):
         class CountingPortal(DataPortal):
             def __init__(self, backend):
@@ -769,6 +844,41 @@ class TestDataLayer(unittest.TestCase):
         self.assertEqual(frame["close"].tolist(), [10.0, 10.1, 10.2])
         self.assertEqual(len(daily_calls), 2)
         self.assertEqual(daily_calls[-1]["start_date"], "20240101")
+
+    def test_canonical_count_query_skips_requested_code_without_price_rows(self):
+        backend = FakeBackend()
+        backend.frames["daily"] = pd.DataFrame(
+            [
+                {"ts_code": "000001.SZ", "trade_date": "20240102", "close": 10.0},
+                {"ts_code": "000001.SZ", "trade_date": "20240103", "close": 10.1},
+            ]
+        )
+        portal = DataPortal(
+            backend,
+            price_cache_start="2024-01-01",
+            price_cache_end="2024-01-31",
+        )
+
+        frame = portal.get_price(
+            ["000001.XSHE", "999999.XSHE"],
+            end_date="2024-01-03",
+            count=1,
+            fields="close",
+            fq=None,
+            panel=False,
+        )
+
+        self.assertEqual(frame["code"].tolist(), ["000001.XSHE"])
+        self.assertEqual(frame["close"].tolist(), [10.1])
+
+    def test_vectorized_price_date_formatter_accepts_normalized_and_hyphenated_dates(self):
+        portal = DataPortal(FakeBackend(), optimize_data=False)
+
+        formatted = portal._format_joinquant_dates(
+            pd.Series(["20240102", "2024-01-03"])
+        )
+
+        self.assertEqual(formatted.tolist(), ["2024-01-02", "2024-01-03"])
 
     def test_get_current_data_without_securities_uses_stock_basic(self):
         portal = DataPortal(FakeBackend())

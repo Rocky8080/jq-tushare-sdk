@@ -387,12 +387,20 @@ class JoinQuantHtmlReport:
         portal = profile.get("data_portal") or {}
         public_calls = portal.get("public_calls") or []
         cache = portal.get("canonical_cache") or {}
+        factor_rows = self._to_float(cache.get("factor_rows_scanned"))
+        factor_nodes = self._to_float(cache.get("factor_change_nodes"))
+        factor_node_ratio = (
+            f"{factor_nodes / factor_rows * 100:.2f}%" if factor_rows else "--"
+        )
         cache_rows = [
             {"metric": "主缓存加载", "value": cache.get("loads", 0)},
             {"metric": "主缓存扩展", "value": cache.get("extensions", 0)},
             {"metric": "加载行数", "value": cache.get("loaded_rows", 0)},
             {"metric": "前复权命中", "value": cache.get("adjusted_hits", 0)},
             {"metric": "前复权未命中", "value": cache.get("adjusted_misses", 0)},
+            {"metric": "因子累计扫描行", "value": int(factor_rows)},
+            {"metric": "累计变化节点", "value": int(factor_nodes)},
+            {"metric": "因子节点占比", "value": factor_node_ratio},
         ]
         public_call_rows = self._performance_table_rows(
             public_calls,

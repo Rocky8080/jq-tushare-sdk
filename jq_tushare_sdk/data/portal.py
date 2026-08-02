@@ -1166,8 +1166,8 @@ class DataPortal:
     def _format_price_frame(self, df: pd.DataFrame, fields: Iterable[str]) -> pd.DataFrame:
         self._validate_price_frame(df)
         result = pd.DataFrame()
-        result["time"] = [joinquant_date(value) for value in df["trade_date"].tolist()]
-        result["code"] = [to_joinquant_code(value) for value in df["ts_code"].tolist()]
+        result["time"] = self._format_joinquant_dates(df["trade_date"])
+        result["code"] = self._format_joinquant_codes(df["ts_code"])
         for field in fields:
             source = PRICE_FIELD_MAP.get(field, field)
             if source not in df.columns:
@@ -1177,6 +1177,15 @@ class DataPortal:
             else:
                 result[field] = df[source].values
         return result.reset_index(drop=True)
+
+    def _format_joinquant_dates(self, values: pd.Series) -> pd.Series:
+        dates = values.astype(str).str[:10].str.replace("-", "", regex=False)
+        return dates.str[:4] + "-" + dates.str[4:6] + "-" + dates.str[6:8]
+
+    def _format_joinquant_codes(self, values: pd.Series) -> pd.Series:
+        raw = values.astype(str)
+        mapping = {code: to_joinquant_code(code) for code in raw.unique()}
+        return raw.map(mapping)
 
     def _apply_price_adjustment(
         self,

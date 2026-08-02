@@ -4,6 +4,20 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.27] - 2026-08-02
+
+### Changed
+
+- Compress repeated adjustment factors into per-security change nodes while retaining exact-date availability and historical end-date anchoring.
+- Use vectorized integer-key factor lookup to avoid rebuilding pandas multi-indexes in the pre-adjustment hot path.
+- Show cumulative factor rows scanned, generated change nodes, and node ratio in performance reports.
+- Ignore generated backtest output directories with custom `backtest_runs*` suffixes.
+
+### Fixed
+
+- Skip requested securities that have no cached price rows instead of failing a mixed-security `count` query.
+- Accept both compact and hyphenated dates in vectorized JoinQuant price output formatting.
+
 ## [0.10.26] - 2026-07-27
 
 ### Added

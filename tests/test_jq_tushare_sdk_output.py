@@ -172,6 +172,43 @@ class TestOutputManager(unittest.TestCase):
         self.assertIn('href="#risk"', html)
         self.assertIn('id="risk"', html)
 
+    def test_html_report_shows_factor_change_node_compression(self):
+        config = SimpleNamespace(
+            strategy_name="demo",
+            strategy_path="/repo/demo.py",
+            start_date="2026-06-01",
+            end_date="2026-06-30",
+            initial_cash=1000000.0,
+            cache_db="/repo/data/cache.db",
+        )
+        manifest = SimpleNamespace(run_id="run-1")
+
+        html = JoinQuantHtmlReport().render(
+            config=config,
+            manifest=manifest,
+            performance_rows=[],
+            summary={
+                "final_value": 1100000.0,
+                "performance_profile": {
+                    "data_portal": {
+                        "canonical_cache": {
+                            "factor_rows_scanned": 1000,
+                            "factor_change_nodes": 25,
+                        }
+                    }
+                },
+            },
+            trades=[],
+            position_rows=[],
+            log_lines=[],
+            security_names={},
+        )
+
+        self.assertIn("因子累计扫描行", html)
+        self.assertIn("累计变化节点", html)
+        self.assertIn("因子节点占比", html)
+        self.assertIn("2.50%", html)
+
     def test_html_report_risk_section_includes_sharpe_and_turnover_metrics(self):
         config = SimpleNamespace(
             strategy_name="demo",
