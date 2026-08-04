@@ -9,8 +9,13 @@ import pandas as pd
 from jq_tushare_sdk.adapters.tushare.cache_backend import TushareCacheBackend
 from jq_tushare_sdk.config import BacktestConfig
 from jq_tushare_sdk.data.code_map import to_joinquant_code, to_tushare_code
+from jq_tushare_sdk.data.income_periods import required_income_periods
 from jq_tushare_sdk.data.portal import DataPortal
-from jq_tushare_sdk.data.readiness import DataReadinessCheck, update_missing_data
+from jq_tushare_sdk.data.readiness import (
+    DataReadinessCheck,
+    DataUpdateRequest,
+    update_missing_data,
+)
 
 
 class FakeBackend:
@@ -1812,19 +1817,22 @@ def get_signal(context):
 
         self.assertEqual(issues, [])
 
-    def test_readiness_accepts_recent_income_quarter_before_backtest_end(self):
+    def test_readiness_accepts_consecutive_income_quarters_for_backtest_window(self):
         class IncomeBackend:
             def status(self, api_name):
                 self.api_name = api_name
                 return {
                     "exists": True,
-                    "record_count": 1,
-                    "min_date": "20260331",
+                    "record_count": 2,
+                    "min_date": "20251231",
                     "max_date": "20260331",
                 }
 
             def fetch(self, api_name, **params):
-                if api_name == "income" and params.get("period") == "2026q1":
+                if api_name == "income" and params.get("period") in {
+                    "2026q1",
+                    "2025q4",
+                }:
                     return pd.DataFrame(
                         [
                             {
@@ -1847,6 +1855,61 @@ def get_signal(context):
         issues = DataReadinessCheck(IncomeBackend()).check_required(config, ["income"])
 
         self.assertEqual(issues, [])
+
+    def test_income_period_requirements_follow_reporting_deadlines(self):
+        self.assertEqual(
+            required_income_periods("2025-10-30", "2025-10-30"),
+            ["2025q2", "2025q1"],
+        )
+        self.assertEqual(
+            required_income_periods("2025-10-31", "2025-10-31"),
+            ["2025q3", "2025q2"],
+        )
+
+    def test_readiness_reports_only_missing_income_comparison_quarter(self):
+        class IncomeBackend:
+            def status(self, api_name):
+                return {
+                    "exists": True,
+                    "record_count": 2,
+                    "min_date": "20250630",
+                    "max_date": "20250930",
+                }
+
+            def fetch(self, api_name, **params):
+                if api_name == "income" and params.get("period") in {"2025q3", "2025q2"}:
+                    return pd.DataFrame(
+                        [
+                            {
+                                "ts_code": "000001.SZ",
+                                "end_date": "20250930",
+                                "report_type": "1",
+                            }
+                        ]
+                    )
+                return pd.DataFrame()
+
+        config = BacktestConfig(
+            strategy_path="strategy.py",
+            start_date="2025-10-09",
+            end_date="2025-12-30",
+            initial_cash=1000000.0,
+            cache_db="/tmp/cache.db",
+        )
+
+        issues = DataReadinessCheck(IncomeBackend()).check_required(config, ["income"])
+
+        self.assertEqual(len(issues), 1)
+        self.assertIn("2025q1", issues[0].message)
+        self.assertEqual(
+            issues[0].update_requests,
+            (
+                DataUpdateRequest(
+                    api_name="income",
+                    params=(("period", "2025q1"),),
+                ),
+            ),
+        )
 
     def test_cache_backend_uses_project_local_sqlite_without_join_tushare_package(self):
         with TemporaryDirectory() as tmp:
@@ -2169,6 +2232,26 @@ def get_signal(context):
             "20260331",
             [call.kwargs.get("period") for call in pro.income_vip.mock_calls],
         )
+        self.assertEqual(
+            {
+                call.kwargs.get("period")
+                for call in pro.income_vip.mock_calls
+            },
+            {"20260331", "20251231"},
+        )
+
+    def test_cache_backend_income_periods_cover_long_backtest_start(self):
+        with TemporaryDirectory() as tmp:
+            backend = TushareCacheBackend(
+                str(Path(tmp) / "data" / "jq_tushare_cache.db"),
+                cache_mode="strict_local",
+            )
+
+            periods = backend._income_periods_for_range("20250102", "20260731")
+
+        self.assertEqual(periods[0], "20260331")
+        self.assertEqual(periods[-1], "20240630")
+        self.assertEqual(len(periods), 8)
 
     def test_cache_backend_fetch_income_period_uses_exact_quarter(self):
         with TemporaryDirectory() as tmp:

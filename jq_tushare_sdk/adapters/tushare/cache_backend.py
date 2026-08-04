@@ -12,6 +12,8 @@ from typing import Iterable
 import pandas as pd
 
 from jq_tushare_sdk.data.code_map import normalize_date
+from jq_tushare_sdk.data.income_periods import income_period_end
+from jq_tushare_sdk.data.income_periods import required_income_periods
 
 
 DEFAULT_PACKAGE_ENV = "JQ_TUSHARE_SDK_TUSHARE_PACKAGE"
@@ -389,7 +391,7 @@ class TushareCacheBackend:
         if api_name == "income" and "period" not in params:
             return sum(
                 self.update_data("income", period=period)
-                for period in self._income_periods_for_range(end_date or params.get("end_date") or start_date)
+                for period in self._income_periods_for_range(start_date, end_date)
             )
 
         if api_name == "income" and "period" in params and "ts_code" not in params:
@@ -568,20 +570,17 @@ class TushareCacheBackend:
             if day.weekday() < 5
         ]
 
-    def _income_periods_for_range(self, end_date: str) -> list[str]:
-        end = normalize_date(end_date)
-        year = int(end[:4])
-        month = int(end[4:6])
-        current_quarter = ((month - 1) // 3) + 1
-        periods = []
-        for offset in range(0, 6):
-            quarter_index = current_quarter - offset
-            period_year = year
-            while quarter_index <= 0:
-                quarter_index += 4
-                period_year -= 1
-            periods.append(f"{period_year}{_QUARTER_ENDS[f'q{quarter_index}']}")
-        return periods
+    def _income_periods_for_range(
+        self,
+        start_date: str | None,
+        end_date: str | None,
+    ) -> list[str]:
+        start = start_date or end_date or datetime.now().strftime("%Y%m%d")
+        end = end_date or start_date or start
+        return [
+            income_period_end(period)
+            for period in required_income_periods(start, end)
+        ]
 
     def _period_to_end_date(self, value) -> str:
         text = str(value).strip().lower()

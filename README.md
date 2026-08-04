@@ -91,7 +91,7 @@ python -m jq_tushare_sdk.cli check-data \
 Data readiness check passed
 ```
 
-如果缺数据，命令会输出缺失的数据表和建议执行的补数命令。`check-data` 只做诊断，不会写入缓存；`backtest` 和 Web 控制台运行回测时会先尝试自动补齐这些缺口。
+如果缺数据，命令会输出缺失的数据表和建议执行的补数命令。`income` 财务数据会按完整回测区间和 A 股季度报告披露节点逐季检查，并额外覆盖上一比较期，保证增长计算所需的报告期连续存在，同时避免把尚未到披露期限的季度误判为缺数。`check-data` 只做诊断，不会写入缓存；`backtest` 和 Web 控制台运行回测时会先尝试按缺失季度自动补齐。
 
 ## Run Backtest
 
@@ -259,7 +259,7 @@ http://127.0.0.1:8787/report.html
 
 ## Versioning
 
-当前版本：`v0.10.27`
+当前版本：`v0.10.28`
 
 版本号遵循 Semantic Versioning：
 

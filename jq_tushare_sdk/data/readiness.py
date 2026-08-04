@@ -8,6 +8,7 @@ from jq_tushare_sdk.data.code_map import is_tushare_index_code
 from jq_tushare_sdk.data.code_map import is_tushare_sw_index_code
 from jq_tushare_sdk.data.code_map import normalize_date
 from jq_tushare_sdk.data.code_map import to_tushare_code
+from jq_tushare_sdk.data.income_periods import required_income_periods
 
 
 @dataclass(frozen=True)
@@ -252,25 +253,48 @@ class DataReadinessCheck:
         )
 
     def _check_income(self, config, start: str, end: str) -> ReadinessIssue | None:
+        required_periods = required_income_periods(start, end)
         status = self.backend.status("income")
         if not status.get("exists") or int(status.get("record_count", 0) or 0) == 0:
             return ReadinessIssue(
                 api_name="income",
                 message="Local cache has no data for income.",
-                suggestion=f"python update_data.py --api income --start-date {start} --end-date {end}",
-                update_requests=(_update_request("income", start, end),),
+                suggestion=(
+                    "python -m jq_tushare_sdk.cli update-data --api income "
+                    f"--start {start} --end {end} --cache-db <cache_db>"
+                ),
+                update_requests=tuple(
+                    _update_request("income", period=period)
+                    for period in required_periods
+                ),
             )
 
-        for period in self._income_periods_for_range(end):
-            frame = self.backend.fetch("income", period=period)
-            if frame is not None and not frame.empty:
-                return None
+        missing_periods = []
+        for period in required_periods:
+            try:
+                frame = self.backend.fetch("income", period=period)
+            except Exception:
+                frame = None
+            if frame is None or frame.empty:
+                missing_periods.append(period)
+
+        if not missing_periods:
+            return None
 
         return ReadinessIssue(
             api_name="income",
-            message=f"income has no recent quarterly data for requested end {config.end_date}.",
-            suggestion=f"python update_data.py --api income --start-date {start} --end-date {end}",
-            update_requests=(_update_request("income", start, end),),
+            message=(
+                "income is missing required consecutive quarters for backtest "
+                f"{config.start_date} to {config.end_date}: {', '.join(missing_periods)}."
+            ),
+            suggestion=(
+                "python -m jq_tushare_sdk.cli update-data --api income "
+                f"--start {start} --end {end} --cache-db <cache_db>"
+            ),
+            update_requests=tuple(
+                _update_request("income", period=period)
+                for period in missing_periods
+            ),
         )
 
     def _check_index_weight(self, config, start: str, end: str) -> ReadinessIssue | None:
@@ -373,21 +397,6 @@ class DataReadinessCheck:
             missing.append(f"{symbol}({ts_code}) {api_name} ends at {max_date}")
             update_requests.append(_update_request(api_name, max_date, end, ts_code=ts_code))
         return missing, update_requests
-
-    def _income_periods_for_range(self, end_date: str) -> list[str]:
-        end = normalize_date(end_date)
-        year = int(end[:4])
-        month = int(end[4:6])
-        current_quarter = ((month - 1) // 3) + 1
-        periods = []
-        for offset in range(0, 6):
-            quarter_index = current_quarter - offset
-            period_year = year
-            while quarter_index <= 0:
-                quarter_index += 4
-                period_year -= 1
-            periods.append(f"{period_year}q{quarter_index}")
-        return periods
 
     def _market_date_bounds(self, start: str, end: str) -> tuple[str, str]:
         try:

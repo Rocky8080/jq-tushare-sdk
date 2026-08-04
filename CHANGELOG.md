@@ -4,6 +4,14 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.28] - 2026-08-04
+
+### Fixed
+
+- Validate every consecutive income quarter required by the full backtest window instead of accepting any single recent quarter.
+- Generate exact automatic refill requests for missing income periods, including comparison quarters needed by growth calculations.
+- Make range-based income updates cover the full backtest window and required comparison periods, using reporting deadlines to avoid requiring quarters that were not yet due.
+
 ## [0.10.27] - 2026-08-02
 
 ### Changed
