@@ -61,6 +61,15 @@ class BacktestEngine:
         output = self.output_manager.create_run(self.config)
         self.active_run_dir = output.run_dir
         logger = RuntimeLogger(output.logs_dir / "backtest.log")
+        skipped_rebalance_records = []
+        logger.add_listener(
+            lambda level, text, context: self._capture_skipped_rebalance_log(
+                skipped_rebalance_records,
+                level,
+                text,
+                context,
+            )
+        )
         price_cache_start = infer_strategy_price_lookback_start(
             self.config.strategy_path,
             self.config.start_date,
@@ -101,7 +110,6 @@ class BacktestEngine:
             benchmark_issue = None
             if trade_days and not benchmark_closes:
                 benchmark_issue = self._benchmark_missing_reason(benchmark)
-
         rows = []
         position_rows = []
         previous_total = None
@@ -157,9 +165,15 @@ class BacktestEngine:
                     profiler.record_phase_duration("mark_to_market", "每日估值", elapsed)
                 for callback in callbacks:
                     callback_start = profiler.now()
+                    callback_name = self._callback_name(callback)
+                    logger.set_context(
+                        trade_date=str(trade_day),
+                        callback=callback_name,
+                    )
                     try:
                         callback(context)
                     finally:
+                        logger.clear_context()
                         elapsed = profiler.elapsed(callback_start)
                         day_callback_seconds += elapsed
                         day_callback_count += 1
@@ -167,7 +181,7 @@ class BacktestEngine:
                         profiler.record_callback(
                             date=str(trade_day),
                             time_label=str(label),
-                            name=self._callback_name(callback),
+                            name=callback_name,
                             seconds=elapsed,
                         )
             self._capture_a_share_entitlements(
@@ -249,6 +263,7 @@ class BacktestEngine:
             state=state,
             benchmark=benchmark,
             benchmark_issue=benchmark_issue,
+            skipped_rebalance_records=skipped_rebalance_records,
             performance_profile=profiler.snapshot(
                 trade_days=len(trade_days),
                 data_portal=portal.performance_snapshot(),
@@ -283,6 +298,7 @@ class BacktestEngine:
         state,
         benchmark: str,
         benchmark_issue: str | None = None,
+        skipped_rebalance_records: list[dict] | None = None,
         performance_profile: dict | None = None,
     ) -> dict:
         risk = self._risk_metrics(rows, benchmark=benchmark, benchmark_issue=benchmark_issue)
@@ -296,9 +312,76 @@ class BacktestEngine:
             "record_count": len(state.records),
             "signal_count": len(broker.target_portfolio_signals),
             "benchmark": benchmark,
+            "skipped_rebalance_events": self._extract_skipped_rebalance_events(
+                skipped_rebalance_records or [],
+            ),
             "performance_profile": performance_profile or {},
             **risk,
         }
+
+    _SKIPPED_REBALANCE_MARKERS = (
+        "本轮普通换仓顺延",
+        "质量闸门拦截或执行异常，本轮未执行调仓",
+    )
+    _REBALANCE_NAME_KEYWORDS = (
+        "select",
+        "rebalance",
+        "holding",
+        "first_run",
+        "empty_position",
+        "weekly",
+        "monthly",
+        "position",
+    )
+
+    def _capture_skipped_rebalance_log(
+        self,
+        records: list[dict],
+        level: str,
+        text: str,
+        context: dict,
+    ) -> None:
+        callback = str(context.get("callback") or "")
+        trade_date = str(context.get("trade_date") or "")
+        if not callback or not trade_date:
+            return
+        if not any(keyword in callback.lower() for keyword in self._REBALANCE_NAME_KEYWORDS):
+            return
+        if not any(marker in text for marker in self._SKIPPED_REBALANCE_MARKERS):
+            return
+        records.append(
+            {
+                "callback": callback,
+                "date": trade_date,
+                "level": str(level),
+                "message": str(text),
+            }
+        )
+
+    def _extract_skipped_rebalance_events(self, records: list[dict]) -> list[dict]:
+        """Aggregate structured deferral logs captured during callbacks."""
+        grouped: dict[str, dict[str, str]] = {}
+        for record in records:
+            callback = str(record.get("callback") or "")
+            date = str(record.get("date") or "")
+            if not callback or not date:
+                continue
+            grouped.setdefault(callback, {})
+            grouped[callback].setdefault(date, str(record.get("message") or ""))
+
+        events = []
+        for name, date_messages in grouped.items():
+            deferred_days = sorted(date_messages)
+            events.append(
+                {
+                    "callback": name,
+                    "date": deferred_days[0],
+                    "deferred_days": len(deferred_days),
+                    "note": date_messages[deferred_days[0]],
+                }
+            )
+        events.sort(key=lambda item: (item.get("date", ""), item.get("callback", "")))
+        return events
 
     def _benchmark_closes(self, portal: DataPortal, benchmark: str, trade_days: list[str]) -> dict[str, float]:
         if not trade_days:

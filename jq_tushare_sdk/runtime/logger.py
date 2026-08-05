@@ -29,6 +29,22 @@ class RuntimeLogger:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._context = {}
+        self._listeners = []
+
+    def set_context(self, **values):
+        self._context = {
+            str(key): value
+            for key, value in values.items()
+            if value is not None
+        }
+
+    def clear_context(self):
+        self._context = {}
+
+    def add_listener(self, listener):
+        if listener is not None:
+            self._listeners.append(listener)
 
     def info(self, message, *args, **kwargs):
         self._write("INFO", message, *args, exc_info=kwargs.get("exc_info", False))
@@ -54,3 +70,9 @@ class RuntimeLogger:
                     trace_text = "".join(traceback.format_exception(*exc_info))
                 if trace_text and trace_text != "NoneType: None\n":
                     handle.write(_redact_sensitive_text(trace_text))
+        context = dict(self._context)
+        for listener in tuple(self._listeners):
+            try:
+                listener(level, text, context)
+            except Exception:
+                continue

@@ -1,4 +1,5 @@
 import inspect
+import os
 from datetime import datetime, time, timedelta
 
 import pandas as pd
@@ -262,6 +263,8 @@ def _context_current_data_date():
 
 
 def _partial_daily_bar_date(requested_date, frequency):
+    if os.environ.get("JQTS_DISABLE_PARTIAL_BAR") == "1":
+        return None
     if requested_date is None or frequency not in {"daily", "1d"}:
         return None
     current_dt = _context_current_date()

@@ -56,11 +56,12 @@ class JoinQuantHtmlReport:
                 "</head>",
                 "<body>",
                 self._topbar(config, summary, strategy_name),
-                self._tabs(),
+                self._tabs(summary),
                 '<main class="workspace">',
                 self._risk_section(metrics, equity_svg, returns_svg, exposure_svg, config, performance_rows, summary),
                 self._transactions_section(trades, names),
                 self._positions_section(position_rows, performance_rows, names),
+                self._deferral_section(summary),
                 self._performance_section(profile),
                 self._logs_section(config, manifest, log_lines or []),
                 "</main>",
@@ -94,7 +95,7 @@ class JoinQuantHtmlReport:
   <div class="final-value">期末权益 {final_value}</div>
 </header>"""
 
-    def _tabs(self) -> str:
+    def _tabs(self, summary: dict) -> str:
         tabs = [
             ("risk", "收益风险"),
             ("trades", "交易"),
@@ -102,6 +103,8 @@ class JoinQuantHtmlReport:
             ("performance", "性能"),
             ("logs", "日志"),
         ]
+        if summary.get("skipped_rebalance_events"):
+            tabs.insert(3, ("deferrals", "调仓顺延"))
         links = "\n".join(
             f'  <a class="tab-link{" active" if index == 0 else ""}" href="#{anchor}">{escape(label)}</a>'
             for index, (anchor, label) in enumerate(tabs)
@@ -337,6 +340,37 @@ class JoinQuantHtmlReport:
   </div>
   <div class="stat-grid">{summary_cards}</div>
   <div class="detail-list">{''.join(groups) if groups else empty}</div>
+</section>"""
+
+    def _deferral_section(self, summary: dict) -> str:
+        events = summary.get("skipped_rebalance_events") or []
+        if not events:
+            return ""
+        rows = []
+        for event in events:
+            rows.append(
+                '<tr>'
+                f"<td>{escape(str(event.get('callback', '')))}</td>"
+                f"<td>{escape(str(event.get('date', '')))}</td>"
+                f"<td>{escape(str(event.get('deferred_days', 0)))} 次</td>"
+                f"<td>{escape(str(event.get('note', '')))}</td>"
+                "</tr>"
+            )
+        return f"""
+<section id="deferrals" class="panel">
+  <div class="section-heading">
+    <div>
+      <div class="section-eyebrow">调仓顺延</div>
+      <h2>调仓顺延事件</h2>
+    </div>
+    <div class="section-note">策略在以下回调的调仓被顺延（如开盘缺口保护/质量闸门），本地成交可能与平台相差一个交易日，导致买入价系统性偏高。</div>
+  </div>
+  <div class="table-wrap">
+    <table class="report-table">
+      <thead><tr><th>回调</th><th>首次顺延</th><th>顺延次数</th><th>说明</th></tr></thead>
+      <tbody>{''.join(rows)}</tbody>
+    </table>
+  </div>
 </section>"""
 
     def _performance_section(self, profile: dict) -> str:

@@ -811,6 +811,81 @@ def initialize(context):
         self.assertIn('class="equity-line excess"', html)
         self.assertNotIn("创业板指", html)
 
+    def test_engine_records_skipped_rebalance_events(self):
+        source = """
+from jqdata import *
+
+def initialize(context):
+    g.days = 0
+    run_daily(select_stock, time='open')
+    run_daily(check_holding_count, time='open')
+
+def select_stock(context):
+    g.days += 1
+    log.info(f"使用上一交易日 {context.current_dt.date()} 进行市值筛选")
+    if g.days == 1:
+        log.info("本轮普通换仓顺延：正选含高开新票 600000.XSHG(+8.12%)")
+        log.info("周度调仓评估完成：候选18只，质量闸门拦截或执行异常，本轮未执行调仓")
+
+def check_holding_count(context):
+    log.info("持仓数量检查完成")
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            strategy_path = Path(tmp) / "deferral_strategy.py"
+            strategy_path.write_text(source, encoding="utf-8")
+            config = BacktestConfig(
+                strategy_path=str(strategy_path),
+                start_date="2024-01-02",
+                end_date="2024-01-03",
+                initial_cash=100000.0,
+                cache_db="/tmp/cache.db",
+                output_dir=str(Path(tmp) / "runs"),
+                strategy_name="deferral",
+            )
+            manifest = BacktestEngine(config, backend=FakeBackend()).run()
+            summary = json.loads((manifest.reports_dir / "summary.json").read_text(encoding="utf-8"))
+            html = (manifest.reports_dir / "report.html").read_text(encoding="utf-8")
+
+        events = summary["skipped_rebalance_events"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["callback"], "select_stock")
+        self.assertEqual(events[0]["date"], "2024-01-02")
+        self.assertEqual(events[0]["deferred_days"], 1)
+        self.assertIn("顺延", events[0]["note"])
+        self.assertIn('id="deferrals"', html)
+        self.assertIn("调仓顺延", html)
+
+    def test_engine_records_no_deferral_events_without_rebalance_callback(self):
+        source = """
+from jqdata import *
+
+def initialize(context):
+    run_daily(housekeeping, time='open')
+
+def housekeeping(context):
+    log.info("使用上一交易日 %s 进行市值筛选", context.current_dt.date())
+    log.info("本轮普通换仓顺延：正选含高开新票")
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            strategy_path = Path(tmp) / "housekeeping_strategy.py"
+            strategy_path.write_text(source, encoding="utf-8")
+            config = BacktestConfig(
+                strategy_path=str(strategy_path),
+                start_date="2024-01-02",
+                end_date="2024-01-03",
+                initial_cash=100000.0,
+                cache_db="/tmp/cache.db",
+                output_dir=str(Path(tmp) / "runs"),
+                strategy_name="housekeeping",
+            )
+            manifest = BacktestEngine(config, backend=FakeBackend()).run()
+            summary = json.loads((manifest.reports_dir / "summary.json").read_text(encoding="utf-8"))
+            html = (manifest.reports_dir / "report.html").read_text(encoding="utf-8")
+
+        self.assertEqual(summary["skipped_rebalance_events"], [])
+        self.assertNotIn('href="#deferrals"', html)
+        self.assertNotIn('id="deferrals"', html)
+
     def test_engine_reports_performance_profile_bottlenecks(self):
         source = """
 from jqdata import *

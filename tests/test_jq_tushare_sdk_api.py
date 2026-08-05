@@ -1,8 +1,11 @@
 import unittest
 from datetime import date, datetime
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pandas as pd
+
+from jq_tushare_sdk.api import jqdata
 
 from jq_tushare_sdk.broker.broker import Broker
 from jq_tushare_sdk.broker.costs import CostModel
@@ -152,6 +155,10 @@ class APIPortalBackend:
 class TestJoinQuantAPI(unittest.TestCase):
     def setUp(self):
         set_runtime_state(RuntimeState(data_portal=FakePortal()))
+
+    def test_partial_daily_bar_can_be_disabled_for_diagnostics(self):
+        with patch.dict("os.environ", {"JQTS_DISABLE_PARTIAL_BAR": "1"}):
+            self.assertIsNone(jqdata._partial_daily_bar_date("2024-01-03", "daily"))
 
     def test_exported_globals_contains_core_api(self):
         exports = exported_globals()

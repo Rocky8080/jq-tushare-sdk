@@ -166,24 +166,28 @@ def _add_cache_args(parser):
 
 def _check_local_readiness(config, backend):
     issues = _local_readiness_issues(config, backend)
-    if not issues:
+    blocking = [issue for issue in issues if not issue.advisory]
+    _print_advisory_issues(issues)
+    if not blocking:
         return []
-    _print_readiness_issues(config, issues)
-    return issues
+    _print_readiness_issues(config, blocking)
+    return blocking
 
 
 def _ensure_local_readiness(config, backend):
     issues = _local_readiness_issues(config, backend)
-    if not issues:
+    blocking = [issue for issue in issues if not issue.advisory]
+    _print_advisory_issues(issues)
+    if not blocking:
         return []
 
     print("Local cache is incomplete; attempting automatic Tushare data update...")
     try:
-        counts = update_missing_data(backend, issues)
+        counts = update_missing_data(backend, blocking)
     except Exception as exc:
         print(f"Automatic data update failed: {exc}")
-        _print_readiness_issues(config, issues)
-        return issues
+        _print_readiness_issues(config, blocking)
+        return blocking
 
     if counts:
         print("Automatic data update completed:")
@@ -193,9 +197,18 @@ def _ensure_local_readiness(config, backend):
         print("No automatic data update request could be inferred from readiness issues.")
 
     issues = _local_readiness_issues(config, backend)
-    if issues:
-        _print_readiness_issues(config, issues)
-    return issues
+    blocking = [issue for issue in issues if not issue.advisory]
+    if blocking:
+        _print_readiness_issues(config, blocking)
+    return blocking
+
+
+def _print_advisory_issues(issues) -> None:
+    for issue in issues:
+        if not issue.advisory:
+            continue
+        print(f"提示: {issue.message}")
+        print(f"  {issue.suggestion}")
 
 
 def _local_readiness_issues(config, backend):

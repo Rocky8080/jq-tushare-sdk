@@ -44,11 +44,14 @@ def _latest_mandatory_period_index(value) -> int:
     normalized = normalize_date(value)
     year = int(normalized[:4])
     month_day = int(normalized[4:])
-    if month_day >= 1031:
+    # Backtests execute during the trading day. A report whose legal deadline
+    # is today may still be published after the simulated callback, so only
+    # advance the mandatory period on the following calendar day.
+    if month_day > 1031:
         quarter = 3
-    elif month_day >= 831:
+    elif month_day > 831:
         quarter = 2
-    elif month_day >= 430:
+    elif month_day > 430:
         quarter = 1
     else:
         year -= 1

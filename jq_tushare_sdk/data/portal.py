@@ -1,3 +1,4 @@
+import os
 import time
 from datetime import date, datetime
 from types import SimpleNamespace
@@ -54,9 +55,17 @@ class DataPortal:
         *,
         price_cache_start: str | None = None,
         price_cache_end: str | None = None,
+        default_fq: str | None = None,
     ):
         self.backend = backend
         self.optimize_data = bool(optimize_data)
+        env_fq = os.environ.get("JQTS_DEFAULT_FQ")
+        if default_fq is not None:
+            self._default_fq = default_fq
+        elif env_fq in {"pre", "none", ""}:
+            self._default_fq = None if env_fq == "none" else "pre"
+        else:
+            self._default_fq = None
         self._price_count_cache = {}
         self._price_count_group_cache = {}
         self._date_range_cache = {}
@@ -65,6 +74,9 @@ class DataPortal:
         self._fetch_cache = {}
         self._security_metadata_cache = None
         self._industry_cache = None
+        self._sw_industry_cache = None
+        self._sw_members_index = None
+        self._sw_l1_name_by_code = None
         self._valuation_cache = {}
         self._portal_calls = {"get_price": {"count": 0, "seconds": 0.0}}
         self._result_cache_hits = 0
@@ -121,6 +133,10 @@ class DataPortal:
         fq=None,
         **kwargs,
     ):
+        if fq is None and self._default_fq:
+            # JoinQuant's get_price defaults to pre-adjusted (fq='pre'); the SDK
+            # stays raw (None) unless opted in via JQTS_DEFAULT_FQ or the portal.
+            fq = self._default_fq
         skip_paused = bool(kwargs.pop("skip_paused", False))
         fill_paused = bool(kwargs.pop("fill_paused", False))
         self._validate_price_options(frequency=frequency, panel=panel, fq=fq, kwargs=kwargs)
@@ -443,23 +459,137 @@ class DataPortal:
         return current
 
     def get_industry(self, securities, date=None):
-        industry_by_code = self._industry_map()
         codes = self._normalize_securities(securities)
-        missing_codes = [code for code in codes if code not in industry_by_code]
+        industry_by_code = self._industry_map()
+        sw_by_code = self._sw_l1_industry_map(codes, date=date)
+        missing_codes = [
+            code
+            for code in codes
+            if code not in sw_by_code and code not in industry_by_code
+        ]
         if missing_codes:
             names = ", ".join(missing_codes)
             raise NotImplementedError(
                 f"stock_basic backend data does not include requested security industry: {names}"
             )
-        return {
-            code: {
+        result = {}
+        for code in codes:
+            sw = sw_by_code.get(code) or {}
+            fallback = industry_by_code.get(code, "")
+            industry_name = sw.get("industry_name") or fallback
+            industry_code = sw.get("industry_code") or fallback
+            result[code] = {
                 "sw_l1": {
-                    "industry_code": industry_by_code[code],
-                    "industry_name": industry_by_code[code],
+                    "industry_code": industry_code,
+                    "industry_name": industry_name,
                 },
-                "industry_name": industry_by_code[code],
+                "industry_name": industry_name,
             }
-            for code in codes
+        return result
+
+    def _sw_l1_industry_map(self, codes=None, date=None) -> dict[str, dict[str, str]]:
+        """Return JoinQuant security to SW L1 code/name as of ``date``.
+
+        Uses the Tushare ``index_member`` / ``index_classify`` caches (SW2021).
+        Only the requested ``codes`` are resolved on the date-sensitive path;
+        membership rows are indexed once and kept in ``self._sw_members_index``.
+        Falls back to an empty mapping when the SW tables are unavailable, in
+        which case ``get_industry`` degrades to ``stock_basic.industry``.
+        """
+        if self._sw_industry_cache is not None and date is None:
+            return self._sw_industry_cache
+        if self._sw_members_index is None:
+            try:
+                members = self._fetch("index_member")
+                classify = self._fetch("index_classify")
+            except Exception:
+                self._sw_members_index = {}
+                self._sw_l1_name_by_code = {}
+            else:
+                l1_name: dict[str, str] = {}
+                if classify is not None and not classify.empty and "index_code" in classify.columns:
+                    l1 = (
+                        classify[classify.get("level") == "L1"]
+                        if "level" in classify.columns
+                        else classify
+                    )
+                    if "industry_name" in l1.columns:
+                        l1_name = {
+                            str(code): str(name)
+                            for code, name in zip(l1["index_code"], l1["industry_name"])
+                            if code and name
+                        }
+                index: dict[str, list[tuple[str, str, str, str]]] = {}
+                if members is not None and not members.empty and "con_code" in members.columns:
+                    in_col = "in_date" in members.columns
+                    out_col = "out_date" in members.columns
+                    current_col = "is_new" in members.columns
+                    for _, row in members.iterrows():
+                        index.setdefault(str(row["con_code"]), []).append(
+                            (
+                                str(row.get("index_code") or ""),
+                                self._membership_date(row.get("in_date")) if in_col else "",
+                                self._membership_date(row.get("out_date")) if out_col else "",
+                                str(row.get("is_new") or "") if current_col else "",
+                            )
+                        )
+                self._sw_members_index = index
+                self._sw_l1_name_by_code = l1_name
+        index = self._sw_members_index or {}
+        l1_name = self._sw_l1_name_by_code or {}
+        if not l1_name or not index:
+            return {}
+        asof = normalize_date(date) if date is not None else None
+        target_codes = [to_tushare_code(code) for code in codes] if codes else None
+        result: dict[str, dict[str, str]] = {}
+        if target_codes is None:
+            for raw, entries in index.items():
+                value = self._sw_value_for(entries, l1_name, asof)
+                if value:
+                    result[to_joinquant_code(raw)] = value
+        else:
+            for raw in target_codes:
+                value = self._sw_value_for(index.get(raw, []), l1_name, asof)
+                if value:
+                    result[to_joinquant_code(raw)] = value
+        if date is None:
+            self._sw_industry_cache = result
+        return result
+
+    @staticmethod
+    def _membership_date(value) -> str:
+        if value is None or pd.isna(value):
+            return ""
+        text = str(value).strip().replace("-", "")
+        return "" if text.lower() in {"", "nan", "none"} else text[:8]
+
+    @staticmethod
+    def _sw_value_for(
+        entries: list[tuple[str, str, str, str]],
+        l1_name: dict[str, str],
+        asof: str | None,
+    ) -> dict[str, str] | None:
+        if not entries:
+            return None
+        candidates = []
+        for index_code, in_date, out_date, is_new in entries:
+            if asof is None:
+                if out_date and is_new != "Y":
+                    continue
+            else:
+                if in_date and asof < in_date:
+                    continue
+                if out_date and asof >= out_date:
+                    continue
+            name = l1_name.get(index_code, "")
+            if name:
+                candidates.append((in_date, index_code, name))
+        if not candidates:
+            return None
+        _, index_code, name = max(candidates)
+        return {
+            "industry_code": index_code.split(".")[0],
+            "industry_name": name,
         }
 
     def get_fundamentals(self, q, date=None, statDate=None):

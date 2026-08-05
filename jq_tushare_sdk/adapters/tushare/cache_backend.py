@@ -210,6 +210,26 @@ _API_SPECS: dict[str, ApiSpec] = {
             "n_income_attr_p",
         ),
     ),
+    "index_member": ApiSpec(
+        table="sw_industry_member",
+        primary_keys=("index_code", "con_code", "in_date", "out_date"),
+        date_column=None,
+        columns=("index_code", "con_code", "in_date", "out_date", "is_new"),
+    ),
+    "index_classify": ApiSpec(
+        table="sw_industry_classify",
+        primary_keys=("index_code", "level"),
+        date_column=None,
+        columns=(
+            "index_code",
+            "industry_name",
+            "level",
+            "industry_code",
+            "is_pub",
+            "parent_code",
+            "src",
+        ),
+    ),
 }
 
 _DEFAULT_UPDATE_APIS = (
@@ -299,7 +319,9 @@ class TushareCacheBackend:
         if "ts_code" in spec.primary_keys:
             order_columns.append("ts_code")
         elif "index_code" in spec.primary_keys:
-            order_columns.extend(["index_code", "con_code"])
+            order_columns.append("index_code")
+            if "con_code" in spec.columns:
+                order_columns.append("con_code")
         if order_columns:
             sql += " ORDER BY " + ", ".join(order_columns)
         frame = self._read_sql(sql, sql_params)
@@ -382,6 +404,17 @@ class TushareCacheBackend:
                 for code in _DEFAULT_SW_INDEX_CODES
             )
 
+        if api_name == "index_classify":
+            return self._update_sw_classify(params)
+
+        if api_name == "index_member":
+            if "index_code" not in params and "ts_code" not in params:
+                return sum(
+                    self.update_data(api_name, index_code=code)
+                    for code in self._fetch_sw_l1_codes()
+                )
+            return self._update_sw_members(params)
+
         if api_name == "index_weight" and "index_code" not in params:
             return sum(
                 self.update_data(api_name, start_date=start_date, end_date=end_date, index_code=code)
@@ -420,6 +453,62 @@ class TushareCacheBackend:
         self._wait_for_rate_limit()
         data = method(**api_params)
         return self.cache_data("income", data)
+
+    def _update_sw_classify(self, params: dict) -> int:
+        level = str(params.get("level") or "L1")
+        src = str(params.get("src") or "SW2021")
+        pro = self._pro_api()
+        self._wait_for_rate_limit()
+        data = pro.index_classify(level=level, src=src)
+        if data is None or data.empty:
+            return 0
+        frame = data.copy()
+        if "src" not in frame.columns:
+            frame["src"] = src
+        return self.cache_data("index_classify", frame)
+
+    def _update_sw_members(self, params: dict) -> int:
+        """Fetch SW2021 members through Tushare's index_member_all API."""
+        payload = {}
+        if params.get("index_code"):
+            payload["l1_code"] = str(params["index_code"])
+        if params.get("ts_code"):
+            payload["ts_code"] = str(params["ts_code"])
+        statuses = [str(params["is_new"])] if params.get("is_new") else ["Y", "N"]
+        pro = self._pro_api()
+        total = 0
+        for status in statuses:
+            self._wait_for_rate_limit()
+            data = pro.index_member_all(**payload, is_new=status)
+            if data is None or data.empty:
+                continue
+            frame = data.rename(
+                columns={"l1_code": "index_code", "ts_code": "con_code"}
+            ).copy()
+            frame["is_new"] = status
+            total += self.cache_data("index_member", frame)
+        return total
+
+    def _fetch_sw_l1_codes(self) -> list[str]:
+        """申万一级行业指数代码（SW2021），从本地缓存读取，缺失则拉取。"""
+        try:
+            spec = self._spec("index_classify")
+            rows = self._read_sql(
+                f"SELECT DISTINCT index_code FROM {spec.table} WHERE level='L1' ORDER BY index_code",
+                [],
+            )
+            codes = [str(value) for value in rows["index_code"].tolist() if value]
+            if codes:
+                return codes
+        except Exception:
+            pass
+        self.update_data("index_classify", level="L1", src="SW2021")
+        spec = self._spec("index_classify")
+        rows = self._read_sql(
+            f"SELECT DISTINCT index_code FROM {spec.table} WHERE level='L1' ORDER BY index_code",
+            [],
+        )
+        return [str(value) for value in rows["index_code"].tolist() if value]
 
     def update_range(
         self,
@@ -466,7 +555,7 @@ class TushareCacheBackend:
     def _create_table_sql(self, spec: ApiSpec) -> str:
         column_defs = []
         for column in spec.columns:
-            if column.endswith("_date") or column in {"ts_code", "index_code", "con_code", "exchange", "symbol", "name", "industry", "market", "list_status", "report_type", "comp_type", "is_hs", "area", "fullname", "enname", "cnspell", "curr_type", "delist_date", "act_name", "act_ent_type"}:
+            if column.endswith("_date") or column in {"ts_code", "index_code", "con_code", "exchange", "symbol", "name", "industry", "market", "list_status", "report_type", "comp_type", "is_hs", "area", "fullname", "enname", "cnspell", "curr_type", "delist_date", "act_name", "act_ent_type", "is_new", "src", "level"}:
                 sql_type = "TEXT"
             elif column == "is_open":
                 sql_type = "INTEGER"

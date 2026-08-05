@@ -685,7 +685,8 @@ def _handler_factory(
                     issues = _check_data_readiness(
                         manager._config_from_request(request),
                     )
-                    self._write_json({"ok": not issues, "issues": issues})
+                    blocking = [issue for issue in issues if not issue.get("advisory")]
+                    self._write_json({"ok": not blocking, "issues": issues})
                 elif parsed.path == "/api/refresh-report":
                     self._write_json(_refresh_report_request(run_store, cache_db, payload))
                 else:
@@ -770,18 +771,23 @@ def _run_local_backtest(
     try:
         report(4, "检查本地数据")
         issues = _readiness_issues(config, backend=backend)
-        if issues:
+        advisory = [issue for issue in issues if issue.advisory]
+        blocking = [issue for issue in issues if not issue.advisory]
+        for issue in advisory:
+            report(4, "数据提示", issue.message)
+        if blocking:
             from jq_tushare_sdk.data.readiness import update_missing_data
 
             try:
-                report(10, "自动补齐数据", f"发现 {len(issues)} 个数据缺口")
-                update_missing_data(backend, issues)
+                report(10, "自动补齐数据", f"发现 {len(blocking)} 个数据缺口")
+                update_missing_data(backend, blocking)
             except Exception as exc:
-                raise RuntimeError(_format_readiness_error(config, issues, f"Automatic data update failed: {exc}")) from exc
+                raise RuntimeError(_format_readiness_error(config, blocking, f"Automatic data update failed: {exc}")) from exc
             report(25, "复查本地数据")
             issues = _readiness_issues(config, backend=backend)
-        if issues:
-            raise RuntimeError(_format_readiness_error(config, issues, "Local cache is not ready after automatic update:"))
+            blocking = [issue for issue in issues if not issue.advisory]
+        if blocking:
+            raise RuntimeError(_format_readiness_error(config, blocking, "Local cache is not ready after automatic update:"))
         report(30, "准备回测引擎")
 
         def report_engine(value: float, stage: str, detail: str | None = None) -> None:
@@ -845,6 +851,7 @@ def _serialize_readiness_issues(issues) -> list[dict]:
             "api_name": issue.api_name,
             "message": issue.message,
             "suggestion": issue.suggestion,
+            "advisory": bool(issue.advisory),
         }
         for issue in issues
     ]

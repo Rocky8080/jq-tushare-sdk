@@ -295,6 +295,19 @@ class TestDataLayer(unittest.TestCase):
         self.assertEqual(df["close"].tolist(), [5.25, 10.2])
         self.assertEqual(df["money"].tolist(), [10500000.0, 9300000.0])
 
+    def test_get_price_supports_opt_in_default_pre_adjustment(self):
+        with patch.dict("os.environ", {"JQTS_DEFAULT_FQ": "pre"}):
+            portal = DataPortal(FakeBackend())
+            df = portal.get_price(
+                "000001.XSHE",
+                start_date="20240102",
+                end_date="20240103",
+                fields=["open", "close"],
+            )
+
+        self.assertEqual(df["open"].tolist(), [5.0, 10.6])
+        self.assertEqual(df["close"].tolist(), [5.25, 10.2])
+
     def test_get_price_applies_pre_adjustment_to_etf_when_requested(self):
         portal = DataPortal(FakeBackend())
         df = portal.get_price(
@@ -1368,6 +1381,44 @@ class TestDataLayer(unittest.TestCase):
         self.assertEqual(result["000001.XSHE"]["sw_l1"]["industry_name"], "银行")
         self.assertEqual(result["000001.XSHE"]["sw_l1"]["industry_code"], "银行")
 
+    def test_get_industry_uses_sw_l1_membership_for_requested_date(self):
+        backend = FakeBackend()
+        backend.frames["index_classify"] = pd.DataFrame(
+            [
+                {"index_code": "801780.SI", "industry_name": "银行", "level": "L1"},
+                {"index_code": "801790.SI", "industry_name": "非银金融", "level": "L1"},
+            ]
+        )
+        backend.frames["index_member"] = pd.DataFrame(
+            [
+                {
+                    "index_code": "801780.SI",
+                    "con_code": "000001.SZ",
+                    "in_date": "19910101",
+                    "out_date": "20211210",
+                    "is_new": "N",
+                },
+                {
+                    "index_code": "801790.SI",
+                    "con_code": "000001.SZ",
+                    "in_date": "20211213",
+                    "out_date": "",
+                    "is_new": "Y",
+                },
+            ]
+        )
+        portal = DataPortal(backend)
+
+        historical = portal.get_industry(["000001.XSHE"], date="2020-01-02")
+        current = portal.get_industry(["000001.XSHE"], date="2024-01-02")
+        latest = portal.get_industry(["000001.XSHE"])
+
+        self.assertEqual(historical["000001.XSHE"]["sw_l1"]["industry_code"], "801780")
+        self.assertEqual(historical["000001.XSHE"]["sw_l1"]["industry_name"], "银行")
+        self.assertEqual(current["000001.XSHE"]["sw_l1"]["industry_code"], "801790")
+        self.assertEqual(current["000001.XSHE"]["sw_l1"]["industry_name"], "非银金融")
+        self.assertEqual(latest, current)
+
     def test_get_industry_rejects_malformed_stock_basic(self):
         backend = FakeBackend()
         backend.frames["stock_basic"] = pd.DataFrame([{"ts_code": "000001.SZ", "name": "平安银行"}])
@@ -1817,13 +1868,81 @@ def get_signal(context):
 
         self.assertEqual(issues, [])
 
+    def test_readiness_warns_on_holiday_short_factor_window(self):
+        class HolidayGapBackend(FakeBackend):
+            def fetch(self, api_name, **params):
+                if api_name == "trade_cal":
+                    return pd.DataFrame(
+                        [
+                            {"exchange": "SSE", "cal_date": "20250924", "is_open": 1},
+                            {"exchange": "SSE", "cal_date": "20250925", "is_open": 1},
+                            {"exchange": "SSE", "cal_date": "20250926", "is_open": 1},
+                            {"exchange": "SSE", "cal_date": "20250929", "is_open": 1},
+                            {"exchange": "SSE", "cal_date": "20250930", "is_open": 1},
+                            # 国庆长假：10-01 至 10-08 休市
+                            {"exchange": "SSE", "cal_date": "20251009", "is_open": 1},
+                            {"exchange": "SSE", "cal_date": "20251010", "is_open": 1},
+                            {"exchange": "SSE", "cal_date": "20251013", "is_open": 1},
+                        ]
+                    )
+                return super().fetch(api_name, **params)
+
+        config = BacktestConfig(
+            strategy_path="strategy.py",
+            start_date="2025-10-09",
+            end_date="2025-10-17",
+            initial_cash=1000000.0,
+            cache_db="/tmp/cache.db",
+        )
+
+        issues = DataReadinessCheck(HolidayGapBackend()).check_required(config, ["daily"])
+
+        advisories = [issue for issue in issues if issue.advisory]
+        self.assertEqual(len(advisories), 1)
+        self.assertEqual(advisories[0].api_name, "trade_cal")
+        self.assertIn("2025-10-10", advisories[0].message)
+        self.assertIn("1 个交易日", advisories[0].message)
+        self.assertEqual(advisories[0].update_requests, ())
+
+    def test_readiness_does_not_warn_without_holiday_gap(self):
+        class NormalBackend(FakeBackend):
+            def fetch(self, api_name, **params):
+                if api_name == "trade_cal":
+                    return pd.DataFrame(
+                        [
+                            {"exchange": "SSE", "cal_date": "20251006", "is_open": 1},
+                            {"exchange": "SSE", "cal_date": "20251007", "is_open": 1},
+                            {"exchange": "SSE", "cal_date": "20251008", "is_open": 1},
+                            {"exchange": "SSE", "cal_date": "20251009", "is_open": 1},
+                            {"exchange": "SSE", "cal_date": "20251010", "is_open": 1},
+                            {"exchange": "SSE", "cal_date": "20251013", "is_open": 1},
+                            {"exchange": "SSE", "cal_date": "20251014", "is_open": 1},
+                            {"exchange": "SSE", "cal_date": "20251015", "is_open": 1},
+                            {"exchange": "SSE", "cal_date": "20251016", "is_open": 1},
+                            {"exchange": "SSE", "cal_date": "20251017", "is_open": 1},
+                        ]
+                    )
+                return super().fetch(api_name, **params)
+
+        config = BacktestConfig(
+            strategy_path="strategy.py",
+            start_date="2025-10-09",
+            end_date="2025-10-17",
+            initial_cash=1000000.0,
+            cache_db="/tmp/cache.db",
+        )
+
+        issues = DataReadinessCheck(NormalBackend()).check_required(config, ["daily"])
+
+        self.assertEqual([issue for issue in issues if issue.advisory], [])
+
     def test_readiness_accepts_consecutive_income_quarters_for_backtest_window(self):
         class IncomeBackend:
             def status(self, api_name):
                 self.api_name = api_name
                 return {
                     "exists": True,
-                    "record_count": 2,
+                    "record_count": 240,
                     "min_date": "20251231",
                     "max_date": "20260331",
                 }
@@ -1836,10 +1955,11 @@ def get_signal(context):
                     return pd.DataFrame(
                         [
                             {
-                                "ts_code": "000001.SZ",
-                                "end_date": "20260331",
+                                "ts_code": f"{index:06d}.SZ",
+                                "end_date": "20260331" if params.get("period") == "2026q1" else "20251231",
                                 "report_type": "1",
                             }
+                            for index in range(120)
                         ]
                     )
                 return pd.DataFrame()
@@ -1863,6 +1983,10 @@ def get_signal(context):
         )
         self.assertEqual(
             required_income_periods("2025-10-31", "2025-10-31"),
+            ["2025q2", "2025q1"],
+        )
+        self.assertEqual(
+            required_income_periods("2025-11-01", "2025-11-01"),
             ["2025q3", "2025q2"],
         )
 
@@ -1871,7 +1995,7 @@ def get_signal(context):
             def status(self, api_name):
                 return {
                     "exists": True,
-                    "record_count": 2,
+                    "record_count": 240,
                     "min_date": "20250630",
                     "max_date": "20250930",
                 }
@@ -1881,10 +2005,11 @@ def get_signal(context):
                     return pd.DataFrame(
                         [
                             {
-                                "ts_code": "000001.SZ",
-                                "end_date": "20250930",
+                                "ts_code": f"{index:06d}.SZ",
+                                "end_date": "20250930" if params.get("period") == "2025q3" else "20250630",
                                 "report_type": "1",
                             }
+                            for index in range(120)
                         ]
                     )
                 return pd.DataFrame()
@@ -1910,6 +2035,97 @@ def get_signal(context):
                 ),
             ),
         )
+
+    def test_readiness_refills_sparse_income_quarter(self):
+        class IncomeBackend:
+            def status(self, api_name):
+                return {
+                    "exists": True,
+                    "record_count": 245,
+                    "min_date": "20251231",
+                    "max_date": "20260331",
+                }
+
+            def fetch(self, api_name, **params):
+                if api_name != "income":
+                    return pd.DataFrame()
+                period = params.get("period")
+                count = 5 if period == "2025q4" else 120
+                return pd.DataFrame(
+                    [
+                        {
+                            "ts_code": f"{index:06d}.SZ",
+                            "end_date": "20251231" if period == "2025q4" else "20260331",
+                            "report_type": "1",
+                        }
+                        for index in range(count)
+                    ]
+                )
+
+        config = BacktestConfig(
+            strategy_path="strategy.py",
+            start_date="2026-06-01",
+            end_date="2026-06-30",
+            initial_cash=1000000.0,
+            cache_db="/tmp/cache.db",
+        )
+
+        issues = DataReadinessCheck(IncomeBackend()).check_required(config, ["income"])
+
+        self.assertEqual(len(issues), 1)
+        self.assertIn("2025q4 (5 symbols", issues[0].message)
+        self.assertEqual(
+            issues[0].update_requests,
+            (
+                DataUpdateRequest(
+                    api_name="income",
+                    params=(("period", "2025q4"),),
+                ),
+            ),
+        )
+
+    def test_readiness_compares_income_coverage_with_adjacent_quarters(self):
+        periods = required_income_periods("2025-01-02", "2026-07-31")
+        counts = {
+            period: 100 + (len(periods) - index - 1) * 10
+            for index, period in enumerate(periods)
+        }
+
+        class IncomeBackend:
+            def status(self, api_name):
+                return {
+                    "exists": True,
+                    "record_count": sum(counts.values()),
+                    "min_date": "20240630",
+                    "max_date": "20260331",
+                }
+
+            def fetch(self, api_name, **params):
+                if api_name != "income":
+                    return pd.DataFrame()
+                period = params.get("period")
+                return pd.DataFrame(
+                    [
+                        {
+                            "ts_code": f"{index:06d}.SZ",
+                            "end_date": period,
+                            "report_type": "1",
+                        }
+                        for index in range(counts.get(period, 0))
+                    ]
+                )
+
+        config = BacktestConfig(
+            strategy_path="strategy.py",
+            start_date="2025-01-02",
+            end_date="2026-07-31",
+            initial_cash=1000000.0,
+            cache_db="/tmp/cache.db",
+        )
+
+        issues = DataReadinessCheck(IncomeBackend()).check_required(config, ["income"])
+
+        self.assertEqual(issues, [])
 
     def test_cache_backend_uses_project_local_sqlite_without_join_tushare_package(self):
         with TemporaryDirectory() as tmp:
@@ -2238,6 +2454,52 @@ def get_signal(context):
                 for call in pro.income_vip.mock_calls
             },
             {"20260331", "20251231"},
+        )
+
+    def test_cache_backend_updates_sw_members_through_index_member_all(self):
+        pro = Mock()
+        pro.index_member_all.side_effect = [
+            pd.DataFrame(
+                [
+                    {
+                        "l1_code": "801780.SI",
+                        "ts_code": "000001.SZ",
+                        "in_date": "20211213",
+                        "out_date": "",
+                        "is_new": "Y",
+                    }
+                ]
+            ),
+            pd.DataFrame(
+                [
+                    {
+                        "l1_code": "801780.SI",
+                        "ts_code": "000002.SZ",
+                        "in_date": "20000101",
+                        "out_date": "20211210",
+                        "is_new": "N",
+                    }
+                ]
+            ),
+        ]
+
+        with TemporaryDirectory() as tmp, patch("tushare.pro_api", return_value=pro):
+            backend = TushareCacheBackend(
+                str(Path(tmp) / "data" / "jq_tushare_cache.db"),
+                token="placeholder",
+                cache_mode="strict_local",
+            )
+            count = backend.update_data("index_member", index_code="801780.SI")
+            frame = backend.fetch("index_member", index_code="801780.SI")
+
+        self.assertEqual(count, 2)
+        self.assertEqual(frame["con_code"].tolist(), ["000001.SZ", "000002.SZ"])
+        self.assertEqual(
+            [call.kwargs for call in pro.index_member_all.mock_calls],
+            [
+                {"l1_code": "801780.SI", "is_new": "Y"},
+                {"l1_code": "801780.SI", "is_new": "N"},
+            ],
         )
 
     def test_cache_backend_income_periods_cover_long_backtest_start(self):

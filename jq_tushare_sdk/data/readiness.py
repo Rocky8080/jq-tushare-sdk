@@ -8,6 +8,7 @@ from jq_tushare_sdk.data.code_map import is_tushare_index_code
 from jq_tushare_sdk.data.code_map import is_tushare_sw_index_code
 from jq_tushare_sdk.data.code_map import normalize_date
 from jq_tushare_sdk.data.code_map import to_tushare_code
+from jq_tushare_sdk.data.income_periods import income_period_end
 from jq_tushare_sdk.data.income_periods import required_income_periods
 
 
@@ -25,6 +26,7 @@ class ReadinessIssue:
     message: str
     suggestion: str
     update_requests: tuple[DataUpdateRequest, ...] = ()
+    advisory: bool = False
 
 
 _UPDATE_PRIORITY = {
@@ -43,6 +45,8 @@ _UPDATE_PRIORITY = {
 _MARKET_DAILY_APIS = {"daily", "daily_basic", "adj_factor", "fund_adj", "index_daily"}
 _PRICE_LOOKBACK_APIS = {"daily", "adj_factor", "fund_adj"}
 _REQUIRED_STOCK_BASIC_LIST_STATUSES = {"L", "D"}
+_MIN_INCOME_SYMBOLS = 100
+_MIN_INCOME_COVERAGE_RATIO = 0.85
 
 
 def update_missing_data(backend, issues: list[ReadinessIssue]) -> dict[str, int]:
@@ -85,6 +89,9 @@ class DataReadinessCheck:
         market_start, market_end = self._market_date_bounds(start, end)
         price_market_start, price_market_end = self._market_date_bounds(price_start, end)
         issues = []
+        short_window_issue = self._check_holiday_short_window(config, start, end)
+        if short_window_issue is not None:
+            issues.append(short_window_issue)
         fund_issue = self._check_strategy_funds(config, price_market_start, price_market_end)
         if fund_issue is not None:
             issues.append(fund_issue)
@@ -269,23 +276,61 @@ class DataReadinessCheck:
                 ),
             )
 
-        missing_periods = []
+        period_counts = {}
         for period in required_periods:
             try:
                 frame = self.backend.fetch("income", period=period)
             except Exception:
                 frame = None
-            if frame is None or frame.empty:
-                missing_periods.append(period)
+            period_counts[period] = self._income_symbol_count(frame)
 
-        if not missing_periods:
+        missing_periods = [
+            period for period, count in period_counts.items() if count == 0
+        ]
+        expected_counts = self._expected_income_symbol_counts(required_periods)
+        incomplete_periods = []
+        for index, (period, count) in enumerate(period_counts.items()):
+            if count == 0:
+                continue
+            neighbor_counts = [
+                period_counts[required_periods[neighbor_index]]
+                for neighbor_index in (index - 1, index + 1)
+                if 0 <= neighbor_index < len(required_periods)
+            ]
+            reference = max(
+                neighbor_counts + [expected_counts.get(period, 0)],
+                default=0,
+            )
+            minimum = max(
+                _MIN_INCOME_SYMBOLS,
+                int(reference * _MIN_INCOME_COVERAGE_RATIO),
+            )
+            if count < minimum:
+                incomplete_periods.append((period, count, minimum))
+
+        affected_periods = missing_periods + [
+            period for period, _, _ in incomplete_periods
+        ]
+        if not affected_periods:
             return None
+
+        details = []
+        if missing_periods:
+            details.append("missing " + ", ".join(missing_periods))
+        if incomplete_periods:
+            details.append(
+                "incomplete "
+                + ", ".join(
+                    f"{period} ({count} symbols, expected at least {minimum})"
+                    for period, count, minimum in incomplete_periods
+                )
+            )
 
         return ReadinessIssue(
             api_name="income",
             message=(
-                "income is missing required consecutive quarters for backtest "
-                f"{config.start_date} to {config.end_date}: {', '.join(missing_periods)}."
+                "income does not have complete consecutive quarters for backtest "
+                f"{config.start_date} to {config.end_date}: {'; '.join(details)}."
             ),
             suggestion=(
                 "python -m jq_tushare_sdk.cli update-data --api income "
@@ -293,9 +338,48 @@ class DataReadinessCheck:
             ),
             update_requests=tuple(
                 _update_request("income", period=period)
-                for period in missing_periods
+                for period in affected_periods
             ),
         )
+
+    def _income_symbol_count(self, frame) -> int:
+        if frame is None or frame.empty:
+            return 0
+        if "ts_code" not in frame.columns:
+            return len(frame)
+        symbols = frame["ts_code"].dropna().astype(str).str.strip()
+        return int(symbols[symbols != ""].nunique())
+
+    def _expected_income_symbol_counts(self, periods: list[str]) -> dict[str, int]:
+        try:
+            frame = self.backend.fetch("stock_basic")
+        except Exception:
+            return {}
+        if frame is None or frame.empty or "ts_code" not in frame.columns:
+            return {}
+
+        stocks = frame.copy()
+        if "list_date" in stocks.columns:
+            stocks["list_date"] = stocks["list_date"].fillna("").astype(str).str.replace("-", "", regex=False)
+        if "delist_date" in stocks.columns:
+            stocks["delist_date"] = stocks["delist_date"].fillna("").astype(str).str.replace("-", "", regex=False)
+
+        expected = {}
+        for period in periods:
+            period_end = income_period_end(period)
+            eligible = stocks
+            if "list_date" in stocks.columns:
+                eligible = eligible[
+                    (eligible["list_date"] == "")
+                    | (eligible["list_date"] <= period_end)
+                ]
+            if "delist_date" in stocks.columns:
+                eligible = eligible[
+                    (eligible["delist_date"] == "")
+                    | (eligible["delist_date"] >= period_end)
+                ]
+            expected[period] = self._income_symbol_count(eligible)
+        return expected
 
     def _check_index_weight(self, config, start: str, end: str) -> ReadinessIssue | None:
         symbols = infer_strategy_index_symbols(getattr(config, "strategy_path", None))
@@ -426,6 +510,108 @@ class DataReadinessCheck:
         if not values:
             return start, end
         return min(values), max(values)
+
+    def _check_holiday_short_window(
+        self,
+        config,
+        start: str,
+        end: str,
+    ) -> ReadinessIssue | None:
+        """Warn when early backtest sessions run on a degraded short factor window.
+
+        Strategies that compute short-window factors from a natural-day lookback
+        (e.g. ``end_date - 5 days``) silently degrade right after a multi-day
+        holiday: the lookback window of the first one or two sessions contains
+        only one or two trading days, so those factors fall back to defaults.
+        This is advisory: the cache itself is complete.
+        """
+        calendar_start_dt = datetime.strptime(normalize_date(start), "%Y%m%d") - timedelta(days=20)
+        calendar_start = calendar_start_dt.strftime("%Y%m%d")
+        try:
+            frame = self.backend.fetch(
+                "trade_cal",
+                exchange="SSE",
+                start_date=calendar_start,
+                end_date=end,
+            )
+        except Exception:
+            return None
+        if frame is None or frame.empty or "cal_date" not in frame.columns or "is_open" not in frame.columns:
+            return None
+        try:
+            open_dates = sorted(
+                normalize_date(item)
+                for item in frame["cal_date"][frame["is_open"].astype(int) == 1].dropna().tolist()
+            )
+        except Exception:
+            return None
+        if not open_dates:
+            return None
+        try:
+            calendar_min = min(normalize_date(item) for item in frame["cal_date"].dropna().tolist())
+        except Exception:
+            calendar_min = None
+        start_norm = normalize_date(start)
+        end_norm = normalize_date(end)
+        window_opens = [day for day in open_dates if start_norm <= day <= end_norm]
+        if not window_opens:
+            return None
+
+        # Only treat this as a holiday scenario when a holiday-sized closure
+        # (a multi-day break of at most two weeks) exists between consecutive
+        # sessions in the recent history. Sparse/truncated synthetic calendars
+        # (e.g. a months-long gap) are not holiday gaps and are ignored.
+        holiday_gap_seen = False
+        for previous, current in zip(open_dates, open_dates[1:]):
+            gap = (
+                datetime.strptime(current, "%Y%m%d")
+                - datetime.strptime(previous, "%Y%m%d")
+            ).days
+            if 3 <= gap <= 15:
+                holiday_gap_seen = True
+                break
+        if not holiday_gap_seen:
+            return None
+
+        worst_day = None
+        worst_sessions = None
+        checked_days = 0
+        for day in window_opens:
+            checked_days += 1
+            if checked_days > 5:
+                break
+            earlier = [value for value in open_dates if value < day]
+            if not earlier:
+                continue
+            prev_open = earlier[-1]
+            window_start = (
+                datetime.strptime(prev_open, "%Y%m%d") - timedelta(days=5)
+            ).strftime("%Y%m%d")
+            if calendar_min is not None and calendar_min > window_start:
+                # Calendar does not cover the whole lookback window, so the
+                # session count cannot be trusted; skip rather than warn.
+                continue
+            sessions = sum(1 for value in earlier if value > window_start)
+            if sessions < 3 and (worst_day is None or sessions < worst_sessions):
+                worst_day = day
+                worst_sessions = sessions
+        if worst_day is None:
+            return None
+        return ReadinessIssue(
+            api_name="trade_cal",
+            message=(
+                "回测前存在长假/长停牌间隔：回测起点附近交易日 "
+                + _display_date(worst_day) + " 的 5 日自然日窗口内只有 "
+                f"{worst_sessions} 个交易日。策略的短期因子（如 5 日行业超额、短线动量）"
+                "在回测最初 1-2 个交易日会因样本不足退化。"
+            ),
+            suggestion=(
+                "数据本身已齐备，此为提示。建议核对策略短窗口因子（如 start=end-5 天 "
+                "自然日窗口）在长假后的行为，必要时改为按交易日 count 取数。"
+            ),
+            advisory=True,
+        )
+
 
 
 def infer_strategy_benchmark(strategy_path) -> str | None:

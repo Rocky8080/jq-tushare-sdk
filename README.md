@@ -71,6 +71,8 @@ python -m jq_tushare_sdk.cli update-data \
 - `index_daily`
 - `sw_daily`
 - `index_weight`
+- `index_classify`
+- `index_member`
 - `income`
 
 ## Check Data
@@ -108,6 +110,8 @@ python -m jq_tushare_sdk.cli backtest \
 运行回测前会先检查本地缓存；如发现可定位的缺口，会使用 `TUSHARE_TOKEN` 自动补齐并复查，复查仍失败时才停止回测并输出原因。检查会识别策略中静态可推断的 `get_price(count=...)`、`attribute_history(..., count)` 和 `history(count, ...)` 历史窗口，并为 ETF/基金价格和基准指数补齐回测开始日前的必要 lookback。对于直接调用以及遍历模块级索引列表的循环中出现的 `get_price(count=...)` 指数依赖，系统会在执行前逐一推断并检查对应的历史数据。申万行业指数 `801xxx.XSHG` 会自动映射到 Tushare `801xxx.SI` 并使用 `sw_daily` 缓存；中证全指 `000985.XSHG` 会映射到 `000985.CSI`。
 
 `get_fundamentals(..., statDate=...)` 读取 `income` 财务数据时会按查询日过滤 `ann_date` / `f_ann_date`，避免使用未来才披露的报表。显式指定季度时严格返回该季度，尚未披露则返回空结果，便于策略按自身逻辑回退；未指定 `statDate` 时返回查询日可见的最新报表。
+
+诊断聚宽兼容差异时，可临时设置 `JQTS_DEFAULT_FQ=pre`，让未显式传入 `fq` 的 `get_price` 使用前复权；设置 `JQTS_DISABLE_PARTIAL_BAR=1` 可关闭当前交易日未完成日线的兼容处理。两项默认均不启用，不会改变现有策略行为。
 
 日频 `get_price(..., end_date=context.current_dt)` 在 09:30 会用当日开盘价构造未完成日线，`high` / `low` / `close` 等于开盘价，成交量和成交额为 0，避免读取当日收盘数据。默认 `fill_paused=True` 会用前收盘价补齐停牌交易日；`skip_paused=True` 保留稀疏历史。`run_weekly` 按回测实际经历的本周第 N 个交易日触发，包括从周中开始的首周。
 
@@ -259,7 +263,7 @@ http://127.0.0.1:8787/report.html
 
 ## Versioning
 
-当前版本：`v0.10.28`
+当前版本：`v0.10.29`
 
 版本号遵循 Semantic Versioning：
 

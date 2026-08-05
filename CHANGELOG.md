@@ -4,6 +4,24 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.29] - 2026-08-05
+
+### Added
+
+- Readiness check now warns (advisory, non-blocking) when a backtest starts right after a holiday-sized closure: strategies using natural-day short factor windows (e.g. `end_date - 5 days`) will see those factors degrade for the first one or two sessions.
+- Backtest summary and HTML report now surface "deferred rebalance" events: scheduled rebalance callbacks whose weekly/monthly rebalance was skipped by the strategy (e.g. open-gap protection / quality gate), which otherwise silently makes local fills differ from the platform by one trading day.
+- `get_industry` now resolves real SW (申万) L1 industries instead of Eastmoney `stock_basic.industry` values masquerading as `sw_l1`. New `index_member` / `index_classify` cache tables (SW2021) are backfilled by `update-data`; membership rows are indexed once per portal instance and resolved on demand, falling back to `stock_basic.industry` for stocks outside SW coverage.
+- Diagnostic environment switches can opt unspecified `get_price` calls into `fq="pre"` (`JQTS_DEFAULT_FQ=pre`) or disable partial current-day bars (`JQTS_DISABLE_PARTIAL_BAR=1`) without editing strategy source.
+
+### Fixed
+
+- `check-data`, the backtest preflight, and the Web console no longer block or trigger data updates for advisory readiness findings, and serialize the advisory flag for the Web frontend.
+- Income readiness now rejects suspiciously sparse quarters using symbol-count, adjacent-quarter, and listed-company coverage thresholds instead of treating any non-empty response as complete.
+- Reporting-deadline boundaries advance on the following calendar day so intraday backtests do not assume end-of-deadline-day filings are already available.
+- Deferred-rebalance diagnostics now capture the actual callback and simulated trade date while the callback runs, avoiding duplicate callback attribution and expensive log/date rescans.
+- The deferred-rebalance report tab is hidden when no corresponding section exists.
+- SW member updates now call Tushare's documented `index_member_all` endpoint and map its `l1_code` / `ts_code` fields into the local compatibility schema; historical lookups choose the membership active on the requested date.
+
 ## [0.10.28] - 2026-08-04
 
 ### Fixed
