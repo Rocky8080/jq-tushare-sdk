@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 import time
@@ -216,6 +217,24 @@ _API_SPECS: dict[str, ApiSpec] = {
         date_column=None,
         columns=("index_code", "con_code", "in_date", "out_date", "is_new"),
     ),
+    "index_member_all": ApiSpec(
+        table="sw_industry_member_all",
+        primary_keys=("l1_code", "l2_code", "l3_code", "ts_code", "in_date", "out_date"),
+        date_column=None,
+        columns=(
+            "l1_code",
+            "l1_name",
+            "l2_code",
+            "l2_name",
+            "l3_code",
+            "l3_name",
+            "ts_code",
+            "name",
+            "in_date",
+            "out_date",
+            "is_new",
+        ),
+    ),
     "index_classify": ApiSpec(
         table="sw_industry_classify",
         primary_keys=("index_code", "level"),
@@ -242,6 +261,7 @@ _DEFAULT_UPDATE_APIS = (
     "income",
     "index_daily",
     "index_weight",
+    "index_member_all",
 )
 _DEFAULT_INDEX_CODES = (
     "399006.SZ",
@@ -303,6 +323,12 @@ class TushareCacheBackend:
         if positive_volume and "vol" in spec.columns:
             where_sql += " AND vol > 0" if where_sql else " WHERE vol > 0"
         row_limit = 1 if latest_per_code else int(limit_per_code) if limit_per_code else None
+        requested_fields = [
+            field.strip()
+            for field in str(params.get("fields") or "").split(",")
+            if field.strip() in spec.columns
+        ]
+        select_columns = ", ".join(requested_fields) if requested_fields else "*"
         if row_limit and "ts_code" in spec.primary_keys and spec.date_column:
             sql = (
                 "SELECT * FROM ("
@@ -312,7 +338,7 @@ class TushareCacheBackend:
             )
             sql_params = [*sql_params, row_limit]
         else:
-            sql = f"SELECT * FROM {spec.table}{where_sql}"
+            sql = f"SELECT {select_columns} FROM {spec.table}{where_sql}"
         order_columns = []
         if spec.date_column:
             order_columns.append(spec.date_column)
@@ -322,7 +348,7 @@ class TushareCacheBackend:
             order_columns.append("index_code")
             if "con_code" in spec.columns:
                 order_columns.append("con_code")
-        if order_columns:
+        if order_columns and not bool(params.get("unordered", False)):
             sql += " ORDER BY " + ", ".join(order_columns)
         frame = self._read_sql(sql, sql_params)
         frame = frame.drop(columns=["_row_number"], errors="ignore")
@@ -415,6 +441,14 @@ class TushareCacheBackend:
                 )
             return self._update_sw_members(params)
 
+        if api_name == "index_member_all":
+            if not any(params.get(key) for key in ("l1_code", "l2_code", "l3_code", "ts_code")):
+                return sum(
+                    self.update_data(api_name, l1_code=code)
+                    for code in self._fetch_sw_l1_codes()
+                )
+            return self._update_sw_members_all(params)
+
         if api_name == "index_weight" and "index_code" not in params:
             return sum(
                 self.update_data(api_name, start_date=start_date, end_date=end_date, index_code=code)
@@ -489,6 +523,42 @@ class TushareCacheBackend:
             total += self.cache_data("index_member", frame)
         return total
 
+    def _update_sw_members_all(self, params: dict) -> int:
+        """Cache the complete SW2021 L1/L2/L3 membership payload."""
+        payload = {
+            key: str(params[key])
+            for key in ("l1_code", "l2_code", "l3_code", "ts_code")
+            if params.get(key)
+        }
+        statuses = [str(params["is_new"])] if params.get("is_new") else ["Y", "N"]
+        pro = self._pro_api()
+        total = 0
+        for status in statuses:
+            self._wait_for_rate_limit()
+            data = pro.index_member_all(**payload, is_new=status)
+            if data is None or data.empty:
+                continue
+            frame = data.copy()
+            frame["is_new"] = status
+            text_columns = [
+                "l1_code",
+                "l1_name",
+                "l2_code",
+                "l2_name",
+                "l3_code",
+                "l3_name",
+                "ts_code",
+                "name",
+                "in_date",
+                "out_date",
+                "is_new",
+            ]
+            for column in text_columns:
+                if column in frame.columns:
+                    frame[column] = frame[column].fillna("").astype(str)
+            total += self.cache_data("index_member_all", frame)
+        return total
+
     def _fetch_sw_l1_codes(self) -> list[str]:
         """申万一级行业指数代码（SW2021），从本地缓存读取，缺失则拉取。"""
         try:
@@ -555,7 +625,7 @@ class TushareCacheBackend:
     def _create_table_sql(self, spec: ApiSpec) -> str:
         column_defs = []
         for column in spec.columns:
-            if column.endswith("_date") or column in {"ts_code", "index_code", "con_code", "exchange", "symbol", "name", "industry", "market", "list_status", "report_type", "comp_type", "is_hs", "area", "fullname", "enname", "cnspell", "curr_type", "delist_date", "act_name", "act_ent_type", "is_new", "src", "level"}:
+            if column.endswith("_date") or column.endswith("_code") or column.endswith("_name") or column in {"ts_code", "index_code", "con_code", "exchange", "symbol", "name", "industry", "market", "list_status", "report_type", "comp_type", "is_hs", "area", "fullname", "enname", "cnspell", "curr_type", "delist_date", "act_name", "act_ent_type", "is_new", "src", "level"}:
                 sql_type = "TEXT"
             elif column == "is_open":
                 sql_type = "INTEGER"
@@ -709,12 +779,21 @@ class TushareCacheBackend:
             if self._read_conn is None:
                 uri = Path(self.cache_db).resolve().as_uri() + "?mode=ro"
                 conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+                cache_mb = self._sqlite_memory_mb("JQTS_SQLITE_CACHE_MB", 512)
+                mmap_mb = self._sqlite_memory_mb("JQTS_SQLITE_MMAP_MB", 2048)
                 conn.execute("PRAGMA query_only=ON")
                 conn.execute("PRAGMA temp_store=MEMORY")
-                conn.execute("PRAGMA cache_size=-131072")
-                conn.execute("PRAGMA mmap_size=268435456")
+                conn.execute("PRAGMA busy_timeout=30000")
+                conn.execute(f"PRAGMA cache_size=-{cache_mb * 1024}")
+                conn.execute(f"PRAGMA mmap_size={mmap_mb * 1024 * 1024}")
                 self._read_conn = conn
             return self._read_conn
+
+    def _sqlite_memory_mb(self, env_name: str, default: int) -> int:
+        try:
+            return max(0, int(os.environ.get(env_name, default)))
+        except (TypeError, ValueError):
+            return int(default)
 
     def close(self) -> None:
         with self._read_lock:

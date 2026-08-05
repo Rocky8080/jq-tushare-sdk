@@ -1,5 +1,6 @@
 import os
 import time
+from collections import OrderedDict
 from datetime import date, datetime
 from types import SimpleNamespace
 from typing import Iterable
@@ -70,12 +71,24 @@ class DataPortal:
         self._price_count_group_cache = {}
         self._date_range_cache = {}
         self._date_range_group_cache = {}
-        self._price_result_cache = {}
+        self._price_result_cache = OrderedDict()
+        try:
+            self._price_result_cache_row_budget = max(
+                0,
+                int(os.environ.get("JQTS_PRICE_RESULT_CACHE_ROWS", "500000")),
+            )
+        except ValueError:
+            self._price_result_cache_row_budget = 500000
+        self._price_result_cache_rows = 0
+        self._price_result_cache_peak_rows = 0
+        self._price_result_cache_evictions = 0
         self._fetch_cache = {}
         self._security_metadata_cache = None
         self._industry_cache = None
         self._sw_industry_cache = None
+        self._sw_industry_all_cache = None
         self._sw_members_index = None
+        self._sw_members_all_index = None
         self._sw_l1_name_by_code = None
         self._valuation_cache = {}
         self._portal_calls = {"get_price": {"count": 0, "seconds": 0.0}}
@@ -168,6 +181,7 @@ class DataPortal:
         cached_result = self._price_result_cache.get(result_cache_key) if self.optimize_data else None
         if cached_result is not None:
             self._result_cache_hits += 1
+            self._price_result_cache.move_to_end(result_cache_key)
             return cached_result.copy()
         if self.optimize_data:
             self._result_cache_misses += 1
@@ -265,8 +279,27 @@ class DataPortal:
         finally:
             self._format_seconds += time.perf_counter() - format_started
         if self.optimize_data:
-            self._price_result_cache[result_cache_key] = result.copy()
+            self._cache_price_result(result_cache_key, result)
         return result
+
+    def _cache_price_result(self, cache_key, result: pd.DataFrame) -> None:
+        row_count = len(result)
+        budget = self._price_result_cache_row_budget
+        if budget <= 0 or row_count > budget:
+            return
+        previous = self._price_result_cache.pop(cache_key, None)
+        if previous is not None:
+            self._price_result_cache_rows -= len(previous)
+        self._price_result_cache[cache_key] = result.copy()
+        self._price_result_cache_rows += row_count
+        self._price_result_cache_peak_rows = max(
+            self._price_result_cache_peak_rows,
+            self._price_result_cache_rows,
+        )
+        while self._price_result_cache_rows > budget:
+            _, evicted = self._price_result_cache.popitem(last=False)
+            self._price_result_cache_rows -= len(evicted)
+            self._price_result_cache_evictions += 1
 
     def _legacy_price_frame(
         self,
@@ -310,6 +343,11 @@ class DataPortal:
             "result_cache": {
                 "hits": self._result_cache_hits,
                 "misses": self._result_cache_misses,
+                "entries": len(self._price_result_cache),
+                "rows": self._price_result_cache_rows,
+                "peak_rows": self._price_result_cache_peak_rows,
+                "row_budget": self._price_result_cache_row_budget,
+                "evictions": self._price_result_cache_evictions,
             },
             "canonical_fallbacks": self._canonical_fallbacks,
             "canonical_cache": (
@@ -461,7 +499,24 @@ class DataPortal:
     def get_industry(self, securities, date=None):
         codes = self._normalize_securities(securities)
         industry_by_code = self._industry_map()
-        sw_by_code = self._sw_l1_industry_map(codes, date=date)
+        if os.environ.get("JQTS_INDUSTRY_COMPAT") == "stock_basic_as_sw_l1":
+            missing = [code for code in codes if code not in industry_by_code]
+            if missing:
+                raise NotImplementedError(
+                    "stock_basic backend data does not include requested security industry: "
+                    + ", ".join(missing)
+                )
+            return {
+                code: {
+                    "sw_l1": {
+                        "industry_code": industry_by_code[code],
+                        "industry_name": industry_by_code[code],
+                    },
+                    "industry_name": industry_by_code[code],
+                }
+                for code in codes
+            }
+        sw_by_code = self._sw_industry_map(codes, date=date)
         missing_codes = [
             code
             for code in codes
@@ -474,18 +529,104 @@ class DataPortal:
             )
         result = {}
         for code in codes:
-            sw = sw_by_code.get(code) or {}
+            sw_levels = sw_by_code.get(code) or {}
             fallback = industry_by_code.get(code, "")
-            industry_name = sw.get("industry_name") or fallback
-            industry_code = sw.get("industry_code") or fallback
-            result[code] = {
-                "sw_l1": {
+            l1 = sw_levels.get("sw_l1") or {}
+            industry_name = l1.get("industry_name") or fallback
+            industry_code = l1.get("industry_code") or fallback
+            if not l1:
+                sw_levels = dict(sw_levels)
+                sw_levels["sw_l1"] = {
                     "industry_code": industry_code,
                     "industry_name": industry_name,
-                },
-                "industry_name": industry_name,
-            }
+                }
+            result[code] = dict(sw_levels)
+            result[code]["industry_name"] = industry_name
         return result
+
+    def _sw_industry_map(self, codes=None, date=None) -> dict[str, dict[str, dict[str, str]]]:
+        """Return date-sensitive SW2021 L1/L2/L3 membership when cached.
+
+        The complete Tushare ``index_member_all`` payload is used when present.
+        Older caches continue to resolve L1 through ``index_member`` so adding
+        L2 support does not silently change an existing L1-only backtest.
+        """
+        if self._sw_industry_all_cache is not None and date is None:
+            return self._sw_industry_all_cache
+        if self._sw_members_all_index is None:
+            try:
+                members = self._fetch("index_member_all")
+            except Exception:
+                members = None
+            index: dict[str, list[dict[str, str]]] = {}
+            required = {"l1_code", "l2_code", "ts_code"}
+            if members is not None and not members.empty and required.issubset(members.columns):
+                for _, row in members.iterrows():
+                    raw_code = str(row.get("ts_code") or "")
+                    if not raw_code:
+                        continue
+                    index.setdefault(raw_code, []).append(
+                        {
+                            "l1_code": str(row.get("l1_code") or ""),
+                            "l1_name": str(row.get("l1_name") or ""),
+                            "l2_code": str(row.get("l2_code") or ""),
+                            "l2_name": str(row.get("l2_name") or ""),
+                            "l3_code": str(row.get("l3_code") or ""),
+                            "l3_name": str(row.get("l3_name") or ""),
+                            "in_date": self._membership_date(row.get("in_date")),
+                            "out_date": self._membership_date(row.get("out_date")),
+                            "is_new": str(row.get("is_new") or ""),
+                        }
+                    )
+            self._sw_members_all_index = index
+
+        index = self._sw_members_all_index or {}
+        asof = normalize_date(date) if date is not None else None
+        target_codes = [to_tushare_code(code) for code in codes] if codes else list(index)
+        result: dict[str, dict[str, dict[str, str]]] = {}
+        for raw_code in target_codes:
+            value = self._sw_levels_for(index.get(raw_code, []), asof)
+            if value:
+                result[to_joinquant_code(raw_code)] = value
+
+        legacy = self._sw_l1_industry_map(codes, date=date)
+        for code, value in legacy.items():
+            result.setdefault(code, {"sw_l1": value})
+        if date is None:
+            self._sw_industry_all_cache = result
+        return result
+
+    @staticmethod
+    def _sw_levels_for(
+        entries: list[dict[str, str]],
+        asof: str | None,
+    ) -> dict[str, dict[str, str]] | None:
+        candidates = []
+        for entry in entries:
+            in_date = entry.get("in_date", "")
+            out_date = entry.get("out_date", "")
+            if asof is None:
+                if out_date and entry.get("is_new") != "Y":
+                    continue
+            else:
+                if in_date and asof < in_date:
+                    continue
+                if out_date and asof >= out_date:
+                    continue
+            candidates.append(entry)
+        if not candidates:
+            return None
+        selected = max(candidates, key=lambda item: item.get("in_date", ""))
+        result = {}
+        for level in ("l1", "l2", "l3"):
+            code = selected.get(f"{level}_code", "")
+            name = selected.get(f"{level}_name", "")
+            if code and name:
+                result[f"sw_{level}"] = {
+                    "industry_code": code.split(".")[0],
+                    "industry_name": name,
+                }
+        return result or None
 
     def _sw_l1_industry_map(self, codes=None, date=None) -> dict[str, dict[str, str]]:
         """Return JoinQuant security to SW L1 code/name as of ``date``.

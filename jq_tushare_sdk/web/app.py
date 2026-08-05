@@ -8,10 +8,15 @@ import json
 import math
 import mimetypes
 import os
+import plistlib
 import re
+import signal
 import shutil
 import sqlite3
+import subprocess
+import sys
 import threading
+import time
 import traceback
 import uuid
 from dataclasses import dataclass
@@ -20,6 +25,7 @@ from html import escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable
 from urllib.parse import unquote, urlparse
 
@@ -177,6 +183,7 @@ class BacktestJobManager:
         self._lock = threading.Lock()
         self._jobs: dict[str, dict] = {}
         self._cancel_events: dict[str, threading.Event] = {}
+        self._processes: dict[str, subprocess.Popen] = {}
 
     def start(self, request: BacktestRequest) -> dict:
         config = self._config_from_request(request)
@@ -257,12 +264,7 @@ class BacktestJobManager:
         )
         try:
             if self._uses_default_runner:
-                manifest = self.runner(
-                    config,
-                    progress_callback=lambda percent, stage, detail=None: self._handle_progress(
-                        job_id, cancel_event, percent, stage, detail
-                    ),
-                )
+                manifest = self._run_subprocess_backtest(job_id, config, cancel_event)
             else:
                 manifest = self.runner(config)
         except BacktestCancelled:
@@ -292,6 +294,246 @@ class BacktestJobManager:
             run_dir=str(manifest.run_dir),
             report_path=f"{manifest.run_id}/reports/report.html",
         )
+
+    def _run_subprocess_backtest(
+        self,
+        job_id: str,
+        config: BacktestConfig,
+        cancel_event: threading.Event,
+    ):
+        job_dir = self.project_root / ".jqts_web" / "jobs" / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        config_path = job_dir / "config.json"
+        progress_path = job_dir / "progress.json"
+        result_path = job_dir / "result.json"
+        stdout_path = job_dir / "worker.stdout.log"
+        stderr_path = job_dir / "worker.stderr.log"
+        _write_json_atomic(config_path, config.to_json_dict())
+
+        command = [
+            sys.executable,
+            "-m",
+            "jq_tushare_sdk.web.worker",
+            "--config",
+            str(config_path),
+            "--progress",
+            str(progress_path),
+            "--result",
+            str(result_path),
+        ]
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONHASHSEED"] = "0"
+        if sys.platform == "darwin" and Path("/bin/launchctl").exists():
+            try:
+                return_code = self._run_launchd_worker(
+                    job_id,
+                    command,
+                    env,
+                    cancel_event,
+                    progress_path,
+                    result_path,
+                    stdout_path,
+                    stderr_path,
+                    job_dir,
+                )
+            except RuntimeError:
+                return_code = self._run_popen_worker(
+                    job_id,
+                    command,
+                    env,
+                    cancel_event,
+                    progress_path,
+                    stdout_path,
+                    stderr_path,
+                )
+        else:
+            return_code = self._run_popen_worker(
+                job_id,
+                command,
+                env,
+                cancel_event,
+                progress_path,
+                stdout_path,
+                stderr_path,
+            )
+
+        result = _read_json(result_path)
+        if cancel_event.is_set() or result.get("status") == "cancelled":
+            raise BacktestCancelled("backtest cancelled by user")
+        if return_code != 0 or result.get("status") != "completed":
+            error = str(result.get("error") or "backtest worker exited unexpectedly")
+            stderr_tail = _read_text_tail(stderr_path)
+            if stderr_tail and stderr_tail not in error:
+                error = f"{error}\n{stderr_tail}"
+            raise RuntimeError(error)
+        return SimpleNamespace(
+            run_id=str(result["run_id"]),
+            run_dir=Path(str(result["run_dir"])),
+        )
+
+    def _run_popen_worker(
+        self,
+        job_id: str,
+        command: list[str],
+        env: dict[str, str],
+        cancel_event: threading.Event,
+        progress_path: Path,
+        stdout_path: Path,
+        stderr_path: Path,
+    ) -> int:
+        with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+            process = subprocess.Popen(
+                command,
+                cwd=self.project_root,
+                env=env,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                start_new_session=True,
+            )
+            with self._lock:
+                self._processes[job_id] = process
+                self._jobs[job_id]["worker_pid"] = process.pid
+            _restore_foreground_process_policy(process.pid)
+
+            cancel_started = None
+            last_progress_mtime = None
+            try:
+                while process.poll() is None:
+                    last_progress_mtime = self._relay_worker_progress(
+                        job_id,
+                        progress_path,
+                        last_progress_mtime,
+                    )
+                    if cancel_event.is_set():
+                        if cancel_started is None:
+                            cancel_started = time.monotonic()
+                            self._update(
+                                job_id,
+                                progress_stage="正在终止回测进程",
+                                progress_detail="正在清理未完成的回测目录",
+                            )
+                            _signal_process_group(process, signal.SIGTERM)
+                        elif time.monotonic() - cancel_started >= 60:
+                            _signal_process_group(process, signal.SIGKILL)
+                    time.sleep(0.2)
+            finally:
+                with self._lock:
+                    self._processes.pop(job_id, None)
+        return int(process.returncode or 0)
+
+    def _run_launchd_worker(
+        self,
+        job_id: str,
+        command: list[str],
+        env: dict[str, str],
+        cancel_event: threading.Event,
+        progress_path: Path,
+        result_path: Path,
+        stdout_path: Path,
+        stderr_path: Path,
+        job_dir: Path,
+    ) -> int:
+        label = f"com.jq-tushare-sdk.worker.{job_id}"
+        domain = f"gui/{os.getuid()}"
+        service = f"{domain}/{label}"
+        plist_path = job_dir / "worker.plist"
+        worker_env = {
+            name: str(value)
+            for name, value in env.items()
+            if name.startswith("JQTS_")
+            or name in {"TUSHARE_TOKEN", "NO_PROXY", "no_proxy", "PYTHONHASHSEED", "PYTHONUNBUFFERED"}
+        }
+        payload = {
+            "Label": label,
+            "ProgramArguments": command,
+            "WorkingDirectory": str(self.project_root),
+            "EnvironmentVariables": worker_env,
+            "RunAtLoad": True,
+            "KeepAlive": False,
+            "ProcessType": "Interactive",
+            "StandardOutPath": str(stdout_path),
+            "StandardErrorPath": str(stderr_path),
+        }
+        with plist_path.open("wb") as handle:
+            plistlib.dump(payload, handle, sort_keys=True)
+        plist_path.chmod(0o600)
+
+        launch = subprocess.run(
+            ["/bin/launchctl", "bootstrap", domain, str(plist_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if launch.returncode != 0:
+            message = launch.stderr.strip() or launch.stdout.strip() or "launchctl bootstrap failed"
+            plist_path.unlink(missing_ok=True)
+            raise RuntimeError(message)
+
+        cancel_started = None
+        forced = False
+        last_progress_mtime = None
+        return_code = 0
+        try:
+            while True:
+                running, pid, exit_code = _launchd_worker_status(service)
+                if pid is not None:
+                    with self._lock:
+                        self._jobs[job_id]["worker_pid"] = pid
+                last_progress_mtime = self._relay_worker_progress(
+                    job_id,
+                    progress_path,
+                    last_progress_mtime,
+                )
+                if result_path.exists():
+                    return_code = exit_code or 0
+                    break
+                if not running:
+                    return_code = exit_code if exit_code is not None else 1
+                    break
+                if cancel_event.is_set():
+                    if cancel_started is None:
+                        cancel_started = time.monotonic()
+                        self._update(
+                            job_id,
+                            progress_stage="正在终止回测进程",
+                            progress_detail="正在清理未完成的回测目录",
+                        )
+                        _launchctl_signal(service, "SIGTERM")
+                    elif not forced and time.monotonic() - cancel_started >= 60:
+                        forced = True
+                        _launchctl_signal(service, "SIGKILL")
+                time.sleep(0.2)
+        finally:
+            subprocess.run(
+                ["/bin/launchctl", "bootout", service],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            plist_path.unlink(missing_ok=True)
+        return return_code
+
+    def _relay_worker_progress(
+        self,
+        job_id: str,
+        progress_path: Path,
+        previous_mtime: int | None,
+    ) -> int | None:
+        if not progress_path.exists():
+            return previous_mtime
+        mtime = progress_path.stat().st_mtime_ns
+        if mtime == previous_mtime:
+            return previous_mtime
+        progress = _read_json(progress_path)
+        if progress:
+            self._update_progress(
+                job_id,
+                progress.get("percent", 1),
+                progress.get("stage") or "运行回测",
+                progress.get("detail"),
+            )
+        return mtime
 
     def _handle_progress(
         self,
@@ -885,6 +1127,70 @@ def _close_backend(backend) -> None:
     close = getattr(backend, "close", None)
     if close is not None:
         close()
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _restore_foreground_process_policy(pid: int) -> None:
+    taskpolicy = Path("/usr/sbin/taskpolicy")
+    if not taskpolicy.exists():
+        return
+    subprocess.run(
+        [str(taskpolicy), "-B", "-t", "0", "-l", "0", "-p", str(pid)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
+def _launchd_worker_status(service: str) -> tuple[bool, int | None, int | None]:
+    result = subprocess.run(
+        ["/bin/launchctl", "print", service],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return False, None, None
+    output = result.stdout
+    pid_match = re.search(r"^\s*pid = (\d+)\s*$", output, re.MULTILINE)
+    exit_match = re.search(r"^\s*last exit code = (-?\d+)\s*$", output, re.MULTILINE)
+    exited = bool(re.search(r"^\s*job state = exited\s*$", output, re.MULTILINE))
+    return (
+        not exited,
+        int(pid_match.group(1)) if pid_match else None,
+        int(exit_match.group(1)) if exit_match else None,
+    )
+
+
+def _launchctl_signal(service: str, signal_name: str) -> None:
+    subprocess.run(
+        ["/bin/launchctl", "kill", signal_name, service],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
+def _signal_process_group(process: subprocess.Popen, sig: signal.Signals) -> None:
+    try:
+        os.killpg(process.pid, sig)
+    except ProcessLookupError:
+        return
+
+
+def _read_text_tail(path: Path, *, max_chars: int = 4000) -> str:
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8", errors="replace")[-max_chars:].strip()
 
 
 def _render_app_html(project_root: Path, cache_db: Path, output_dir: Path) -> str:

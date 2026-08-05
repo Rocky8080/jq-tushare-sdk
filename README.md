@@ -73,7 +73,20 @@ python -m jq_tushare_sdk.cli update-data \
 - `index_weight`
 - `index_classify`
 - `index_member`
+- `index_member_all`（完整保存 Tushare SW2021 的 L1/L2/L3 代码、名称和历史进出日期）
 - `income`
+
+补齐申万多级行业成员：
+
+```bash
+python -m jq_tushare_sdk.cli update-data \
+  --api index_member_all \
+  --start <START_DATE> \
+  --end <END_DATE> \
+  --cache-db data/jq_tushare_cache.db
+```
+
+本地 `get_industry` 会据此返回 `sw_l1`、`sw_l2`、`sw_l3`。需要注意：Tushare 当前分级成员是 SW2021，而聚宽行业页面列出的 `sw_l1/sw_l2` 是申万 2014，字段结构相同不代表逐股分类内容相同。诊断旧回测时可临时设置 `JQTS_INDUSTRY_COMPAT=stock_basic_as_sw_l1` 复现 0.10.29 之前的错误兼容行为；该开关会把 `stock_basic.industry` 伪装为 `sw_l1`，不得用于聚宽一致性验证或正式回测基线。
 
 ## Check Data
 
@@ -129,7 +142,11 @@ python -m jq_tushare_sdk.cli backtest \
   --no-optimize-data
 ```
 
-启用 `optimize_data` 时，回测引擎会在推导出的历史回看边界内复用按策略实际请求标的构建的规范化行情缓存。所有查询仍按当前回调的数据截止日切片，`fq="pre"` 仍使用查询截止日可见的最新复权因子；重复复权因子会压缩为变化节点，并通过整数键向量化匹配精确交易日。缓存初始化失败时自动回退到兼容查询路径。性能报告会显示因子累计扫描行数、累计变化节点数和节点占比。
+启用 `optimize_data` 时，回测引擎会在推导出的历史回看边界内按股票复用规范化行情和复权因子缓存，并通过日期数组二分定位所需区间。动态股票池只组合已有股票切片，不会因代码集合变化反复重建整组数据。所有查询仍按当前回调的数据截止日切片，`fq="pre"` 仍使用查询截止日可见的最新复权因子。缓存初始化失败时自动回退到兼容查询路径。性能报告会显示因子累计扫描行数、累计变化节点数和节点占比。
+
+SQLite 只读连接默认使用 512 MB page cache 和 2 GB mmap（映射空间按需驻留），适配较大的本地行情库。内存受限环境可通过 `JQTS_SQLITE_CACHE_MB` 和 `JQTS_SQLITE_MMAP_MB` 调低；canonical 批量读取只查询必要字段，并跳过后续仍会处理的 SQL 排序。
+
+Web 控制台会为每次回测启动独立 worker 进程；macOS 上由一次性、非保活的 `Interactive` LaunchAgent 执行，并声明 `USER_INITIATED` 线程与进程活动，避免后台 Web 服务将 CPU 密集任务降到低调度等级。回测完成后任务立即卸载，Pandas 与行情缓存占用的内存会整体释放。worker 固定 `PYTHONHASHSEED=0`，与 CLI 默认确定性回测保持一致。最终 `get_price` 结果缓存采用按行数淘汰的 LRU，默认上限为 500,000 行，可通过 `JQTS_PRICE_RESULT_CACHE_ROWS` 调整，设为 `0` 可关闭该层缓存。
 
 回测完成后会输出本次结果目录：
 
@@ -263,7 +280,7 @@ http://127.0.0.1:8787/report.html
 
 ## Versioning
 
-当前版本：`v0.10.29`
+当前版本：`v0.10.31`
 
 版本号遵循 Semantic Versioning：
 

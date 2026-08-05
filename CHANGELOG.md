@@ -4,6 +4,34 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.31] - 2026-08-06
+
+### Changed
+
+- `get_industry` can now return date-sensitive `sw_l2` and `sw_l3` entries from a new lossless `index_member_all` cache while preserving the existing L1-only fallback for older databases.
+- `update-data --api index_member_all` caches the complete Tushare SW2021 hierarchy instead of discarding L2/L3 codes and names.
+- `JQTS_INDUSTRY_COMPAT=stock_basic_as_sw_l1` is available only for reproducing pre-0.10.29 backtests; the flag deliberately restores the old, non-JoinQuant industry semantics and must not be used for platform-parity validation.
+- Web backtests now run in isolated worker processes instead of the long-lived HTTP server process. On macOS, one-shot non-keepalive `Interactive` LaunchAgents plus `USER_INITIATED` thread/process activity declarations avoid background CPU demotion; each agent is unloaded after completion so all Pandas/cache memory is released.
+- Web workers use the CLI's deterministic `PYTHONHASHSEED=0`, preserving repeatable stock/order iteration across process launches.
+- Final `get_price` DataFrame results now use a row-budgeted LRU cache (500,000 rows by default, configurable with `JQTS_PRICE_RESULT_CACHE_ROWS`) and expose entries, rows, peak rows, and evictions in performance metrics.
+- Web progress and cancellation are relayed across an atomic JSON worker protocol; cancellation first requests graceful run-directory cleanup and force-stops the isolated process only after a timeout.
+
+### Performance
+
+- The same v6.5.8 strategy, database, and 2026-06-01 through 2026-07-31 parameters completed in 173.58 seconds through the isolated worker versus 1711.86 seconds in the prior long-lived Web process (9.86x faster). Final equity (1,177,961.4816), 427 transactions, 453 orders, and the daily equity curve were unchanged.
+
+## [0.10.30] - 2026-08-06
+
+### Changed
+
+- Canonical price slices now use per-security date arrays and binary search instead of rebuilding an LRU view for every distinct dynamic stock group.
+- Pre-adjustment factor arrays are cached per security and refreshed only when that security's raw coverage changes, eliminating repeated full-group factor scans.
+- Canonical SQLite reads project only required columns, skip redundant SQL sorting, and default to a configurable 512 MB page cache plus 2 GB mmap (`JQTS_SQLITE_CACHE_MB` / `JQTS_SQLITE_MMAP_MB`).
+
+### Performance
+
+- A strict same-strategy/same-database A/B run for 2026-06-01 through 2026-07-31 fell from 380.0 seconds to 175.6 seconds (2.16x faster). Factor rows scanned fell from 58.4 million to 1.13 million, while orders, transactions, daily performance, final equity, and normalized target-position signals remained identical.
+
 ## [0.10.29] - 2026-08-05
 
 ### Added

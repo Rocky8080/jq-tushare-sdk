@@ -1,3 +1,4 @@
+import os
 import unittest
 from datetime import date
 from pathlib import Path
@@ -465,7 +466,11 @@ class TestDataLayer(unittest.TestCase):
                 return super().fetch(api_name, **params)
 
         backend = CountingBackend()
-        portal = DataPortal(backend)
+        portal = DataPortal(
+            backend,
+            price_cache_start="2024-01-01",
+            price_cache_end="2024-01-31",
+        )
 
         first = portal.get_price(
             ["000001.XSHE", "600000.XSHG"],
@@ -486,6 +491,10 @@ class TestDataLayer(unittest.TestCase):
         self.assertEqual(second["close"].tolist(), [20.4, 20.8])
         self.assertEqual(backend.fetch_counts["daily"], 1)
         self.assertEqual(backend.fetch_counts["adj_factor"], 1)
+        self.assertEqual(
+            portal.performance_snapshot()["canonical_cache"]["factor_rows_scanned"],
+            4,
+        )
 
     def test_canonical_factor_view_compresses_repeated_values_without_changing_prices(self):
         backend = FakeBackend()
@@ -603,6 +612,36 @@ class TestDataLayer(unittest.TestCase):
 
         self.assertEqual(second["close"].tolist(), [5.25, 10.2])
         self.assertEqual(portal.adjustment_calls, 1)
+
+    def test_get_price_result_cache_evicts_old_frames_by_row_budget(self):
+        with patch.dict(os.environ, {"JQTS_PRICE_RESULT_CACHE_ROWS": "2"}):
+            portal = DataPortal(FakeBackend())
+
+        portal.get_price(
+            "000001.XSHE",
+            start_date="20240102",
+            end_date="20240103",
+            fields=["close"],
+        )
+        portal.get_price(
+            "600000.XSHG",
+            start_date="20240102",
+            end_date="20240103",
+            fields=["close"],
+        )
+        portal.get_price(
+            "600000.XSHG",
+            start_date="20240102",
+            end_date="20240103",
+            fields=["close"],
+        )
+
+        cache = portal.performance_snapshot()["result_cache"]
+        self.assertEqual(cache["entries"], 1)
+        self.assertEqual(cache["rows"], 2)
+        self.assertEqual(cache["row_budget"], 2)
+        self.assertEqual(cache["evictions"], 1)
+        self.assertEqual(cache["hits"], 1)
 
     def test_get_trade_days_reuses_backend_fetch_cache(self):
         class CountingBackend(FakeBackend):

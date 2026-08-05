@@ -15,10 +15,74 @@ from jq_tushare_sdk import cli as cli_module
 from jq_tushare_sdk.config import BacktestConfig
 from jq_tushare_sdk.reports.html_report import JoinQuantHtmlReport
 from jq_tushare_sdk.web import app as web_app
+from jq_tushare_sdk.web import worker as web_worker
 from jq_tushare_sdk.web.app import BacktestJobManager, BacktestRequest, RunStore, discover_strategies
 
 
 class TestWebConsole(unittest.TestCase):
+    def test_launchd_worker_status_parses_running_and_exited_jobs(self):
+        running = SimpleNamespace(
+            returncode=0,
+            stdout="pid = 4321\njob state = running\nlast exit code = 0\n",
+        )
+        exited = SimpleNamespace(
+            returncode=0,
+            stdout="job state = exited\nlast exit code = 7\n",
+        )
+        with mock.patch.object(web_app.subprocess, "run", side_effect=[running, exited]):
+            self.assertEqual(
+                web_app._launchd_worker_status("gui/501/example"),
+                (True, 4321, 0),
+            )
+            self.assertEqual(
+                web_app._launchd_worker_status("gui/501/example"),
+                (False, None, 7),
+            )
+
+    def test_web_worker_writes_progress_and_completed_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            progress_path = root / "progress.json"
+            result_path = root / "result.json"
+            config = BacktestConfig(
+                strategy_path=str(root / "strategy.py"),
+                start_date="2026-06-01",
+                end_date="2026-06-30",
+                initial_cash=1000000.0,
+                cache_db=str(root / "cache.db"),
+                output_dir=str(root / "runs"),
+            )
+            config_path.write_text(json.dumps(config.to_json_dict()), encoding="utf-8")
+
+            def runner(_config, progress_callback):
+                progress_callback(42, "执行策略", "2026-06-12")
+                return SimpleNamespace(run_id="run-1", run_dir=root / "runs" / "run-1")
+
+            with mock.patch.object(web_worker, "_run_local_backtest", side_effect=runner), mock.patch.object(
+                web_worker.signal,
+                "signal",
+            ):
+                exit_code = web_worker.main(
+                    [
+                        "--config",
+                        str(config_path),
+                        "--progress",
+                        str(progress_path),
+                        "--result",
+                        str(result_path),
+                    ]
+                )
+
+            progress = json.loads(progress_path.read_text(encoding="utf-8"))
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(progress["percent"], 42)
+        self.assertEqual(progress["detail"], "2026-06-12")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["run_id"], "run-1")
+
     def test_discover_strategies_excludes_internal_and_test_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
