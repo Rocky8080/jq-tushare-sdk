@@ -86,7 +86,44 @@ python -m jq_tushare_sdk.cli update-data \
   --cache-db data/jq_tushare_cache.db
 ```
 
-本地 `get_industry` 会据此返回 `sw_l1`、`sw_l2`、`sw_l3`。需要注意：Tushare 当前分级成员是 SW2021，而聚宽行业页面列出的 `sw_l1/sw_l2` 是申万 2014，字段结构相同不代表逐股分类内容相同。诊断旧回测时可临时设置 `JQTS_INDUSTRY_COMPAT=stock_basic_as_sw_l1` 复现 0.10.29 之前的错误兼容行为；该开关会把 `stock_basic.industry` 伪装为 `sw_l1`，不得用于聚宽一致性验证或正式回测基线。
+本地 `get_industry` 会据此返回 `sw_l1`、`sw_l2`、`sw_l3`。聚宽行业表同时保存历史分类和2021年调整后的当前分类；跨平台对齐必须使用规范化的行业代码，而不是名称。诊断旧回测时可临时设置 `JQTS_INDUSTRY_COMPAT=stock_basic_as_sw_l1` 复现 0.10.29 之前的错误兼容行为；该开关会把 `stock_basic.industry` 伪装为 `sw_l1`，不得用于聚宽一致性验证或正式回测基线。
+
+### Import JoinQuant Industry Data
+
+把聚宽文档复制出的完整申万行业表导入本地SQLite：
+
+```bash
+python -m jq_tushare_sdk.cli import-jq-industry \
+  --classify path/to/joinquant_industry.txt \
+  --cache-db data/jq_tushare_cache.db
+```
+
+仅导入分类字典后，可以让Tushare逐股成员使用聚宽官方的日期敏感行业名称：
+
+```bash
+JQTS_INDUSTRY_PROVIDER=joinquant_taxonomy \
+python -m jq_tushare_sdk.cli backtest <strategy.py> \
+  --start <START_DATE> --end <END_DATE> --cash 1000000 \
+  --cache-db data/jq_tushare_cache.db
+```
+
+分类字典不能决定某只股票在某日属于哪个行业。若另有聚宽逐股成员导出，可同时
+导入JSON、JSONL、CSV或TSV；JSON可以直接使用`get_industry()`返回的
+“股票代码→行业信息”字典，快照文件需要指定`--as-of`：
+
+```bash
+python -m jq_tushare_sdk.cli import-jq-industry \
+  --classify path/to/joinquant_industry.txt \
+  --members path/to/joinquant_members.json \
+  --as-of 2026-06-01 \
+  --cache-db data/jq_tushare_cache.db
+
+JQTS_INDUSTRY_PROVIDER=joinquant_full \
+python -m jq_tushare_sdk.cli backtest <strategy.py> ...
+```
+
+`joinquant_full`在所请求股票或日期没有导入成员记录时会明确报错，不会静默回退
+到Tushare或`stock_basic.industry`。
 
 ## Check Data
 
@@ -123,6 +160,8 @@ python -m jq_tushare_sdk.cli backtest \
 运行回测前会先检查本地缓存；如发现可定位的缺口，会使用 `TUSHARE_TOKEN` 自动补齐并复查，复查仍失败时才停止回测并输出原因。检查会识别策略中静态可推断的 `get_price(count=...)`、`attribute_history(..., count)` 和 `history(count, ...)` 历史窗口，并为 ETF/基金价格和基准指数补齐回测开始日前的必要 lookback。对于直接调用以及遍历模块级索引列表的循环中出现的 `get_price(count=...)` 指数依赖，系统会在执行前逐一推断并检查对应的历史数据。申万行业指数 `801xxx.XSHG` 会自动映射到 Tushare `801xxx.SI` 并使用 `sw_daily` 缓存；中证全指 `000985.XSHG` 会映射到 `000985.CSI`。
 
 `get_fundamentals(..., statDate=...)` 读取 `income` 财务数据时会按查询日过滤 `ann_date` / `f_ann_date`，避免使用未来才披露的报表。显式指定季度时严格返回该季度，尚未披露则返回空结果，便于策略按自身逻辑回退；未指定 `statDate` 时返回查询日可见的最新报表。
+
+`indicator.inc_revenue_year_on_year`、`indicator.inc_net_profit_year_on_year`、`indicator.inc_revenue_annual` 和 `indicator.inc_net_profit_annual` 会从查询日已披露的 `income` 报表推导收入/归母净利润同比及单季环比，不会读取查询日之后披露的数据。
 
 诊断聚宽兼容差异时，可临时设置 `JQTS_DEFAULT_FQ=pre`，让未显式传入 `fq` 的 `get_price` 使用前复权；设置 `JQTS_DISABLE_PARTIAL_BAR=1` 可关闭当前交易日未完成日线的兼容处理。两项默认均不启用，不会改变现有策略行为。
 
@@ -265,7 +304,7 @@ http://127.0.0.1:8787/report.html
 - 行情数据：`get_price`、`attribute_history`、`history`，支持股票、基金、常用宽基指数及申万行业指数日线
 - 基本面数据：`get_fundamentals`、`get_fundamentals_continuously`
 - 标的查询：`get_index_stocks`、`get_all_securities`、`get_security_info`、`get_current_data`、`get_industry`
-- 查询对象：`query`、`valuation`、`income`
+- 查询对象：`query`、`valuation`、`income`、`indicator`
 - 交易接口：`order`、`order_value`、`order_target`、`order_target_value`
 - 交易成本与滑点：支持 `OrderCost(..., close_today_commission=0)`、`PriceRelatedSlippage` 和 `FixedSlippage`
 - 输出结果：日志、订单、成交、每日收益、HTML 报告
@@ -280,7 +319,7 @@ http://127.0.0.1:8787/report.html
 
 ## Versioning
 
-当前版本：`v0.10.31`
+当前版本：`v0.10.32`
 
 版本号遵循 Semantic Versioning：
 

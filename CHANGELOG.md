@@ -4,6 +4,26 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.32] - 2026-08-06
+
+### Added
+
+- `import-jq-industry` imports JoinQuant's dated SW L1/L2/L3 classification table into SQLite with a source SHA-256 audit trail.
+- Optional member imports accept JoinQuant JSON, JSONL, CSV, or TSV exports and populate a separate dated stock-membership table.
+- `JQTS_INDUSTRY_PROVIDER=joinquant_taxonomy` keeps Tushare membership but emits JoinQuant's official dated industry names; `joinquant_full` requires and uses imported JoinQuant stock membership.
+- JoinQuant-compatible `indicator` fundamentals expose disclosed revenue/profit YoY and sequential growth derived from the local income cache.
+
+### Changed
+
+- JoinQuant `851251` and Tushare `851251.SI` industry codes are normalized to one key. Industry names are no longer treated as cross-provider identifiers.
+- Corrected the documentation: JoinQuant's industry table contains historical classifications and the post-2021 hierarchy, rather than only SW2014.
+- Snapshot member imports now require a dated `--as-of` boundary, and `joinquant_full` never falls back to `stock_basic.industry` when imported L1 data is incomplete.
+
+### Validation
+
+- Imported 700 real JoinQuant classification rows (31 active L1, 134 L2, 346 L3) from the supplied official table.
+- On the v6.5.8 2026-06-01 through 2026-07-31 L2 backtest, `joinquant_taxonomy` produced byte-identical performance, orders, and transactions to the Tushare-name baseline, confirming that taxonomy-name alignment alone does not change portfolio grouping or restore the old `stock_basic.industry` return.
+
 ## [0.10.31] - 2026-08-06
 
 ### Changed

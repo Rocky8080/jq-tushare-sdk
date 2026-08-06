@@ -21,6 +21,7 @@ from jq_tushare_sdk.data.code_map import (
     to_tushare_code,
 )
 from jq_tushare_sdk.data.joinquant_fields import PRICE_FIELD_MAP
+from jq_tushare_sdk.data.joinquant_industry import normalize_industry_code
 
 
 class JoinQuantDateStr(str):
@@ -90,6 +91,17 @@ class DataPortal:
         self._sw_members_index = None
         self._sw_members_all_index = None
         self._sw_l1_name_by_code = None
+        self._jq_classification_cache = {}
+        self._jq_members_index = None
+        self._industry_provider = os.environ.get("JQTS_INDUSTRY_PROVIDER", "tushare").strip()
+        if self._industry_provider not in {
+            "tushare",
+            "joinquant_taxonomy",
+            "joinquant_full",
+        }:
+            raise ValueError(
+                "JQTS_INDUSTRY_PROVIDER must be tushare, joinquant_taxonomy, or joinquant_full"
+            )
         self._valuation_cache = {}
         self._portal_calls = {"get_price": {"count": 0, "seconds": 0.0}}
         self._result_cache_hits = 0
@@ -516,7 +528,19 @@ class DataPortal:
                 }
                 for code in codes
             }
-        sw_by_code = self._sw_industry_map(codes, date=date)
+        if self._industry_provider == "joinquant_full":
+            sw_by_code = self._jq_industry_map(codes, date=date)
+            missing_full = [code for code in codes if code not in sw_by_code]
+            if missing_full:
+                raise NotImplementedError(
+                    "JoinQuant member cache does not include requested security/date: "
+                    + ", ".join(missing_full)
+                    + "; import a JoinQuant member export before using joinquant_full"
+                )
+        else:
+            sw_by_code = self._sw_industry_map(codes, date=date)
+            if self._industry_provider == "joinquant_taxonomy":
+                sw_by_code = self._apply_jq_taxonomy(sw_by_code, date=date)
         missing_codes = [
             code
             for code in codes
@@ -535,6 +559,11 @@ class DataPortal:
             industry_name = l1.get("industry_name") or fallback
             industry_code = l1.get("industry_code") or fallback
             if not l1:
+                if self._industry_provider == "joinquant_full":
+                    raise NotImplementedError(
+                        "JoinQuant member/classification cache does not provide SW L1 for "
+                        + code
+                    )
                 sw_levels = dict(sw_levels)
                 sw_levels["sw_l1"] = {
                     "industry_code": industry_code,
@@ -542,6 +571,118 @@ class DataPortal:
                 }
             result[code] = dict(sw_levels)
             result[code]["industry_name"] = industry_name
+        return result
+
+    def _apply_jq_taxonomy(self, industry_map, date=None):
+        """Apply JoinQuant's official names to dated Tushare membership codes."""
+        names = self._jq_classification_names(date)
+        if not names:
+            raise NotImplementedError(
+                "JoinQuant classification cache is empty; run import-jq-industry first"
+            )
+        result = {}
+        for security, levels in industry_map.items():
+            mapped = {}
+            for api_level, jq_level in (("sw_l1", "L1"), ("sw_l2", "L2"), ("sw_l3", "L3")):
+                value = levels.get(api_level) or {}
+                code = normalize_industry_code(value.get("industry_code"))
+                if not code:
+                    continue
+                mapped[api_level] = {
+                    "industry_code": code,
+                    "industry_name": names.get((jq_level, code), value.get("industry_name", "")),
+                }
+            if mapped:
+                result[security] = mapped
+        return result
+
+    def _jq_classification_names(self, date=None) -> dict[tuple[str, str], str]:
+        asof = normalize_date(date) if date is not None else None
+        cache_key = asof or "latest"
+        if cache_key in self._jq_classification_cache:
+            return self._jq_classification_cache[cache_key]
+        try:
+            frame = self._fetch("jq_industry_classify")
+        except Exception:
+            frame = None
+        names: dict[tuple[str, str], str] = {}
+        if frame is not None and not frame.empty:
+            candidates: dict[tuple[str, str], list[dict[str, str]]] = {}
+            for _, row in frame.iterrows():
+                level = str(row.get("level") or "")
+                code = normalize_industry_code(row.get("industry_code"))
+                start = self._membership_date(row.get("start_date"))
+                end = self._membership_date(row.get("end_date"))
+                if not level or not code:
+                    continue
+                if asof is None:
+                    if end:
+                        continue
+                elif (start and asof < start) or (end and asof > end):
+                    continue
+                candidates.setdefault((level, code), []).append(
+                    {"name": str(row.get("industry_name") or ""), "start": start}
+                )
+            for key, values in candidates.items():
+                selected = max(values, key=lambda item: item["start"])
+                if selected["name"]:
+                    names[key] = selected["name"]
+        self._jq_classification_cache[cache_key] = names
+        return names
+
+    def _jq_industry_map(self, codes, date=None):
+        """Return imported JoinQuant stock membership with official dated names."""
+        if self._jq_members_index is None:
+            try:
+                frame = self._fetch("jq_industry_member")
+            except Exception:
+                frame = None
+            index = {}
+            if frame is not None and not frame.empty:
+                for _, row in frame.iterrows():
+                    security = str(row.get("security") or "")
+                    if not security:
+                        continue
+                    index.setdefault(security, []).append(
+                        {
+                            "l1_code": normalize_industry_code(row.get("sw_l1_code")),
+                            "l2_code": normalize_industry_code(row.get("sw_l2_code")),
+                            "l3_code": normalize_industry_code(row.get("sw_l3_code")),
+                            "in_date": self._membership_date(row.get("in_date")),
+                            "out_date": self._membership_date(row.get("out_date")),
+                        }
+                    )
+            self._jq_members_index = index
+
+        asof = normalize_date(date) if date is not None else None
+        names = self._jq_classification_names(date)
+        result = {}
+        for security in codes:
+            candidates = []
+            for entry in (self._jq_members_index or {}).get(security, []):
+                in_date = entry.get("in_date", "")
+                out_date = entry.get("out_date", "")
+                if asof is None:
+                    if out_date:
+                        continue
+                elif (in_date and asof < in_date) or (out_date and asof >= out_date):
+                    continue
+                candidates.append(entry)
+            if not candidates:
+                continue
+            selected = max(candidates, key=lambda item: item.get("in_date", ""))
+            levels = {}
+            for api_level, raw_level, jq_level in (
+                ("sw_l1", "l1", "L1"),
+                ("sw_l2", "l2", "L2"),
+                ("sw_l3", "l3", "L3"),
+            ):
+                code = selected.get(f"{raw_level}_code", "")
+                name = names.get((jq_level, code), "")
+                if code and name:
+                    levels[api_level] = {"industry_code": code, "industry_name": name}
+            if levels:
+                result[security] = levels
         return result
 
     def _sw_industry_map(self, codes=None, date=None) -> dict[str, dict[str, dict[str, str]]]:
@@ -740,7 +881,7 @@ class DataPortal:
             | {expr.field.table for expr in q.filters}
             | {ordering.field.table for ordering in q.ordering}
         )
-        unsupported_tables = sorted(table_names - {"valuation", "income"})
+        unsupported_tables = sorted(table_names - {"valuation", "income", "indicator"})
         if unsupported_tables:
             names = ", ".join(unsupported_tables)
             raise NotImplementedError(
@@ -763,6 +904,10 @@ class DataPortal:
                 )
                 income_df["code"] = [to_joinquant_code(code) for code in income_df["code"].tolist()]
                 frames.append(income_df)
+        if "indicator" in table_names:
+            indicator_df = self._income_growth_indicator_frame(date)
+            if not indicator_df.empty:
+                frames.append(indicator_df)
         if not frames:
             return pd.DataFrame(columns=[self._fundamental_column_name(field) for field in q.fields])
         result = frames[0]
@@ -1171,6 +1316,162 @@ class DataPortal:
         frame = self._filter_income_asof(self._fetch("income", period=period), date)
         return frame, period
 
+    def _income_growth_indicator_frame(self, date=None) -> pd.DataFrame:
+        """Derive JoinQuant-style disclosed YoY indicators from cached income reports."""
+        visible = self._filter_income_asof(self._fetch("income"), date)
+        required = {"ts_code", "end_date", "total_revenue", "n_income_attr_p"}
+        if visible.empty or not required.issubset(set(visible.columns)):
+            return pd.DataFrame(
+                columns=[
+                    "code",
+                    "inc_revenue_year_on_year",
+                    "inc_net_profit_year_on_year",
+                    "inc_revenue_annual",
+                    "inc_net_profit_annual",
+                ]
+            )
+
+        reports = visible.copy()
+        reports["end_date"] = reports["end_date"].astype(str).str.replace("-", "", regex=False).str[:8]
+        reports = reports[reports["end_date"].str.len() == 8]
+        reports = reports.sort_values(
+            [
+                column
+                for column in (
+                    "ts_code",
+                    "end_date",
+                    "f_ann_date",
+                    "ann_date",
+                    "report_type",
+                )
+                if column in reports.columns
+            ]
+        )
+        reports = reports.groupby(["ts_code", "end_date"], group_keys=False).tail(1)
+
+        def previous_cumulative_end(value: str) -> str | None:
+            year, month_day = int(value[:4]), value[4:]
+            return {
+                "0630": f"{year:04d}0331",
+                "0930": f"{year:04d}0630",
+                "1231": f"{year:04d}0930",
+            }.get(month_day)
+
+        reports["previous_cumulative_end_date"] = reports["end_date"].map(
+            previous_cumulative_end
+        )
+        previous_cumulative = reports[
+            ["ts_code", "end_date", "total_revenue", "n_income_attr_p"]
+        ].rename(
+            columns={
+                "end_date": "previous_cumulative_end_date",
+                "total_revenue": "previous_cumulative_revenue",
+                "n_income_attr_p": "previous_cumulative_profit",
+            }
+        )
+        reports = reports.merge(
+            previous_cumulative,
+            on=["ts_code", "previous_cumulative_end_date"],
+            how="left",
+        )
+        reports["single_quarter_revenue"] = pd.to_numeric(
+            reports["total_revenue"], errors="coerce"
+        ) - pd.to_numeric(
+            reports["previous_cumulative_revenue"], errors="coerce"
+        ).fillna(0.0)
+        reports["single_quarter_profit"] = pd.to_numeric(
+            reports["n_income_attr_p"], errors="coerce"
+        ) - pd.to_numeric(
+            reports["previous_cumulative_profit"], errors="coerce"
+        ).fillna(0.0)
+
+        latest = reports.groupby("ts_code", group_keys=False).tail(1).copy()
+        latest["prior_end_date"] = latest["end_date"].map(
+            lambda value: f"{int(value[:4]) - 1:04d}{value[4:]}"
+        )
+
+        def previous_quarter_end(value: str) -> str:
+            year, month_day = int(value[:4]), value[4:]
+            return {
+                "0331": f"{year - 1:04d}1231",
+                "0630": f"{year:04d}0331",
+                "0930": f"{year:04d}0630",
+                "1231": f"{year:04d}0930",
+            }[month_day]
+
+        latest["previous_quarter_end_date"] = latest["end_date"].map(
+            previous_quarter_end
+        )
+
+        prior = reports[
+            ["ts_code", "end_date", "total_revenue", "n_income_attr_p"]
+        ].rename(
+            columns={
+                "end_date": "prior_end_date",
+                "total_revenue": "prior_total_revenue",
+                "n_income_attr_p": "prior_n_income_attr_p",
+            }
+        )
+        result = latest.merge(prior, on=["ts_code", "prior_end_date"], how="left")
+        previous_quarter = reports[
+            [
+                "ts_code",
+                "end_date",
+                "single_quarter_revenue",
+                "single_quarter_profit",
+            ]
+        ].rename(
+            columns={
+                "end_date": "previous_quarter_end_date",
+                "single_quarter_revenue": "previous_quarter_revenue",
+                "single_quarter_profit": "previous_quarter_profit",
+            }
+        )
+        result = result.merge(
+            previous_quarter,
+            on=["ts_code", "previous_quarter_end_date"],
+            how="left",
+        )
+
+        current_revenue = pd.to_numeric(result["total_revenue"], errors="coerce")
+        prior_revenue = pd.to_numeric(result["prior_total_revenue"], errors="coerce")
+        current_profit = pd.to_numeric(result["n_income_attr_p"], errors="coerce")
+        prior_profit = pd.to_numeric(result["prior_n_income_attr_p"], errors="coerce")
+        result["inc_revenue_year_on_year"] = (
+            (current_revenue / prior_revenue.replace(0, pd.NA) - 1.0) * 100.0
+        )
+        result["inc_net_profit_year_on_year"] = (
+            (current_profit - prior_profit) / prior_profit.abs().replace(0, pd.NA) * 100.0
+        )
+        single_revenue = pd.to_numeric(result["single_quarter_revenue"], errors="coerce")
+        previous_quarter_revenue = pd.to_numeric(
+            result["previous_quarter_revenue"], errors="coerce"
+        )
+        single_profit = pd.to_numeric(result["single_quarter_profit"], errors="coerce")
+        previous_quarter_profit = pd.to_numeric(
+            result["previous_quarter_profit"], errors="coerce"
+        )
+        result["inc_revenue_annual"] = (
+            (single_revenue - previous_quarter_revenue)
+            / previous_quarter_revenue.abs().replace(0, pd.NA)
+            * 100.0
+        )
+        result["inc_net_profit_annual"] = (
+            (single_profit - previous_quarter_profit)
+            / previous_quarter_profit.abs().replace(0, pd.NA)
+            * 100.0
+        )
+        result["code"] = [to_joinquant_code(code) for code in result["ts_code"].tolist()]
+        return result[
+            [
+                "code",
+                "inc_revenue_year_on_year",
+                "inc_net_profit_year_on_year",
+                "inc_revenue_annual",
+                "inc_net_profit_annual",
+            ]
+        ].reset_index(drop=True)
+
     def _filter_income_asof(self, income_df: pd.DataFrame, date=None) -> pd.DataFrame:
         if income_df.empty or date is None:
             return income_df
@@ -1342,6 +1643,14 @@ class DataPortal:
                 "code": "code",
                 "np_parent_company_owners": "np_parent_company_owners",
                 "total_operating_revenue": "total_operating_revenue",
+            }.get(name, name)
+        if table == "indicator":
+            return {
+                "code": "code",
+                "inc_revenue_year_on_year": "inc_revenue_year_on_year",
+                "inc_net_profit_year_on_year": "inc_net_profit_year_on_year",
+                "inc_revenue_annual": "inc_revenue_annual",
+                "inc_net_profit_annual": "inc_net_profit_annual",
             }.get(name, name)
         return name
 

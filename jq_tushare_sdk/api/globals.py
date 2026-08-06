@@ -1,5 +1,5 @@
 from jq_tushare_sdk.api import jqdata
-from jq_tushare_sdk.api.finance_tables import balance, cash_flow, income, valuation
+from jq_tushare_sdk.api.finance_tables import balance, cash_flow, income, indicator, valuation
 from jq_tushare_sdk.api.query import query
 from jq_tushare_sdk.broker.costs import CostModel
 
@@ -136,6 +136,7 @@ def exported_globals() -> dict:
         "query": query,
         "valuation": valuation,
         "income": income,
+        "indicator": indicator,
         "balance": balance,
         "cash_flow": cash_flow,
         "record": record,

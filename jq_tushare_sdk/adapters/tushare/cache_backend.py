@@ -249,6 +249,34 @@ _API_SPECS: dict[str, ApiSpec] = {
             "src",
         ),
     ),
+    "jq_industry_classify": ApiSpec(
+        table="jq_industry_classify",
+        primary_keys=("industry_code", "start_date"),
+        date_column=None,
+        columns=(
+            "industry_code",
+            "industry_name",
+            "level",
+            "start_date",
+            "end_date",
+            "parent_code",
+            "source_sha256",
+        ),
+    ),
+    "jq_industry_member": ApiSpec(
+        table="jq_industry_member",
+        primary_keys=("security", "in_date", "out_date"),
+        date_column=None,
+        columns=(
+            "security",
+            "sw_l1_code",
+            "sw_l2_code",
+            "sw_l3_code",
+            "in_date",
+            "out_date",
+            "source_sha256",
+        ),
+    ),
 }
 
 _DEFAULT_UPDATE_APIS = (
@@ -625,7 +653,7 @@ class TushareCacheBackend:
     def _create_table_sql(self, spec: ApiSpec) -> str:
         column_defs = []
         for column in spec.columns:
-            if column.endswith("_date") or column.endswith("_code") or column.endswith("_name") or column in {"ts_code", "index_code", "con_code", "exchange", "symbol", "name", "industry", "market", "list_status", "report_type", "comp_type", "is_hs", "area", "fullname", "enname", "cnspell", "curr_type", "delist_date", "act_name", "act_ent_type", "is_new", "src", "level"}:
+            if column.endswith("_date") or column.endswith("_code") or column.endswith("_name") or column in {"ts_code", "index_code", "con_code", "security", "source_sha256", "exchange", "symbol", "name", "industry", "market", "list_status", "report_type", "comp_type", "is_hs", "area", "fullname", "enname", "cnspell", "curr_type", "delist_date", "act_name", "act_ent_type", "is_new", "src", "level"}:
                 sql_type = "TEXT"
             elif column == "is_open":
                 sql_type = "INTEGER"

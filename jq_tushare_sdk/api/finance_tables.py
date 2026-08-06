@@ -11,5 +11,6 @@ class FinanceTable:
 
 valuation = FinanceTable("valuation")
 income = FinanceTable("income")
+indicator = FinanceTable("indicator")
 balance = FinanceTable("balance")
 cash_flow = FinanceTable("cash_flow")

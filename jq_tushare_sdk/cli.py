@@ -6,6 +6,7 @@ from jq_tushare_sdk.adapters.tushare.cache_backend import TushareCacheBackend
 from jq_tushare_sdk.config import BacktestConfig
 from jq_tushare_sdk.data.readiness import DataReadinessCheck
 from jq_tushare_sdk.data.readiness import update_missing_data
+from jq_tushare_sdk.data.joinquant_industry import import_joinquant_industry
 from jq_tushare_sdk.reports.refresher import refresh_backtest_report
 from jq_tushare_sdk.runtime.engine import BacktestEngine
 from jq_tushare_sdk.web.app import serve_web_console
@@ -35,6 +36,12 @@ def build_parser():
     update_data.add_argument("--api", action="append", dest="apis")
     update_data.add_argument("--ts-code", "--ts_code", dest="ts_code")
     _add_cache_args(update_data)
+
+    import_industry = subparsers.add_parser("import-jq-industry")
+    import_industry.add_argument("--classify", required=True)
+    import_industry.add_argument("--members")
+    import_industry.add_argument("--as-of")
+    import_industry.add_argument("--cache-db", required=True)
 
     refresh_report = subparsers.add_parser("refresh-report")
     refresh_report.add_argument("run_dir")
@@ -97,6 +104,21 @@ def main(argv=None):
             return 0
         finally:
             _close_backend(backend)
+
+    if args.command == "import-jq-industry":
+        result = import_joinquant_industry(
+            args.cache_db,
+            classify_path=args.classify,
+            members_path=args.members,
+            as_of=args.as_of,
+        )
+        print(f"JoinQuant classification: {result['classification_rows']} rows")
+        active = result["active_counts"]
+        print(f"Active classification: L1={active['L1']}, L2={active['L2']}, L3={active['L3']}")
+        print(f"JoinQuant members: {result['member_rows']} rows")
+        print(f"Available provider mode: {result['membership_mode']}")
+        print(f"Classification SHA-256: {result['classification_sha256']}")
+        return 0
 
     if args.command == "refresh-report":
         backend = TushareCacheBackend(
