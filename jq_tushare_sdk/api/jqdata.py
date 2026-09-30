@@ -138,14 +138,14 @@ def get_index_stocks(index_symbol, date=None):
 def get_all_securities(types=None, date=None):
     return runtime_state().data_portal.get_all_securities(
         types=types,
-        date=_context_data_date(date) if date is not None else date,
+        date=_context_data_date(date) if date is not None else _context_current_date(),
     )
 
 
 def get_security_info(security):
     portal = runtime_state().data_portal
     if hasattr(portal, "get_security_info"):
-        return portal.get_security_info(security)
+        return portal.get_security_info(security, as_of=_context_current_date())
     raise NotImplementedError("JoinQuant API is not implemented locally: get_security_info")
 
 

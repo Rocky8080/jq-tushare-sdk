@@ -4,6 +4,7 @@ from typing import Callable
 
 from jq_tushare_sdk import __version__
 from jq_tushare_sdk.config import BacktestConfig, RunManifest
+from jq_tushare_sdk.data.industry_provenance import industry_provenance
 
 
 class OutputManager:
@@ -80,6 +81,7 @@ class OutputManager:
             "git_commit": config.git_commit,
             "benchmark": config.benchmark,
             "cache_mode": config.cache_mode,
+            "industry_provenance": industry_provenance(config.cache_db),
         }
 
     def _write_json(self, path: Path, payload: dict) -> None:

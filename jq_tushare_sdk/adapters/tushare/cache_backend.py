@@ -29,6 +29,26 @@ class ApiSpec:
 
 
 _API_SPECS: dict[str, ApiSpec] = {
+    "bse_mapping": ApiSpec(
+        "bse_mapping", ("o_code",), None, ("name", "o_code", "n_code", "list_date"),
+    ),
+    "stock_st": ApiSpec(
+        "stock_st", ("ts_code", "trade_date"), "trade_date",
+        ("ts_code", "name", "trade_date", "type", "type_name"),
+    ),
+    "stk_limit": ApiSpec(
+        "stk_limit", ("ts_code", "trade_date"), "trade_date",
+        ("ts_code", "trade_date", "pre_close", "up_limit", "down_limit"),
+    ),
+    "namechange": ApiSpec(
+        "security_name_history", ("ts_code", "start_date", "name"), "start_date",
+        ("ts_code", "name", "start_date", "end_date", "ann_date", "change_reason"),
+    ),
+    # A partial per-symbol fetch is NOT evidence of a complete daily ST list.
+    "security_state_coverage": ApiSpec(
+        "security_state_coverage", ("api_name", "trade_date"), "trade_date",
+        ("api_name", "trade_date", "row_count"),
+    ),
     "daily": ApiSpec(
         table="daily_quote",
         primary_keys=("ts_code", "trade_date"),
@@ -282,6 +302,10 @@ _API_SPECS: dict[str, ApiSpec] = {
 _DEFAULT_UPDATE_APIS = (
     "stock_basic",
     "trade_cal",
+    "stock_st",
+    "stk_limit",
+    "namechange",
+    "bse_mapping",
     "daily",
     "daily_basic",
     "adj_factor",
@@ -401,6 +425,44 @@ class TushareCacheBackend:
                 payload["max_date"] = row[1]
         return payload
 
+    def security_state_gaps(self, start: str, end: str) -> dict:
+        """SQL preflight on actual cached dates/rows, not just min/max bounds."""
+        gaps = {}
+        with self._connect() as conn:
+            for api in ("stock_st", "stk_limit"):
+                rows = conn.execute(
+                    f"SELECT c.cal_date FROM trade_calendar c LEFT JOIN security_state_coverage v "
+                    f"ON v.trade_date=c.cal_date AND v.api_name=? "
+                    f"LEFT JOIN (SELECT trade_date,COUNT(*) AS n FROM {api} "
+                    "WHERE trade_date BETWEEN ? AND ? GROUP BY trade_date) a ON a.trade_date=c.cal_date "
+                    "WHERE c.exchange='SSE' AND c.is_open=1 AND c.cal_date BETWEEN ? AND ? "
+                    "AND (v.row_count IS NULL OR a.n IS NULL OR v.row_count!=a.n) ORDER BY c.cal_date",
+                    (api, start, end, start, end),
+                ).fetchall()
+                if rows:
+                    gaps[api] = [r[0] for r in rows]
+            if gaps:
+                return gaps
+            missing = conn.execute(
+                "SELECT q.ts_code,q.trade_date FROM daily_quote q LEFT JOIN stk_limit l "
+                "ON l.ts_code=q.ts_code AND l.trade_date=q.trade_date "
+                "WHERE q.trade_date BETWEEN ? AND ? AND q.vol>0 "
+                "AND (l.up_limit IS NULL OR l.down_limit IS NULL OR l.up_limit<=0 OR l.down_limit<0) LIMIT 10",
+                (start, end),
+            ).fetchall()
+            if missing:
+                gaps['stk_limit_rows'] = [list(r) for r in missing]
+            missing = conn.execute(
+                "SELECT q.ts_code,MIN(q.trade_date) FROM daily_quote q "
+                "WHERE q.trade_date BETWEEN ? AND ? AND q.vol>0 AND NOT EXISTS "
+                "(SELECT 1 FROM security_name_history n WHERE n.ts_code=q.ts_code "
+                "AND n.start_date<=q.trade_date AND (n.end_date IS NULL OR n.end_date='' OR n.end_date>=q.trade_date)) "
+                "GROUP BY q.ts_code LIMIT 20", (start, end),
+            ).fetchall()
+            if missing:
+                gaps['namechange'] = [list(r) for r in missing]
+        return gaps
+
     def cache_data(self, api_name: str, data: pd.DataFrame) -> int:
         if data is None or data.empty:
             return 0
@@ -426,6 +488,11 @@ class TushareCacheBackend:
         )
         rows = [tuple(row) for row in frame[columns].itertuples(index=False, name=None)]
         with self._connect() as conn:
+            if api_name in {"stock_st", "stk_limit"}:
+                conn.executemany(
+                    "DELETE FROM security_state_coverage WHERE api_name=? AND trade_date=?",
+                    [(api_name, day) for day in frame["trade_date"].unique()],
+                )
             conn.executemany(sql, rows)
             conn.commit()
         return len(rows)
@@ -433,6 +500,22 @@ class TushareCacheBackend:
     def update_data(self, api_name: str, start_date: str | None = None, end_date: str | None = None, **params) -> int:
         if self.cache_mode == "strict_local" and not self.token:
             raise ValueError("update_data requires TUSHARE_TOKEN or token even when backtest reads are strict_local")
+
+        if api_name in {"stock_st", "stk_limit"}:
+            if params.get("ts_code"):
+                data = self._security_pages(api_name, self._api_params(
+                    api_name, start_date=start_date, end_date=end_date, **params))
+                return self.cache_data(api_name, data)
+            days = ([normalize_date(params["trade_date"])] if params.get("trade_date")
+                    else self._trade_dates_for_update(start_date, end_date))
+            return sum(self._update_security_day(api_name, day) for day in days)
+
+        if api_name == "namechange":
+            # API start/end filter ANNOUNCEMENTS, not effective intervals. Fetch
+            # the full timeline so states established before the window survive.
+            data = self._security_pages(api_name, {k: v for k, v in params.items()
+                                                   if k not in {"limit", "offset"}})
+            return self.cache_data(api_name, data)
 
         if api_name == "stock_basic" and "list_status" not in params:
             return sum(
@@ -505,6 +588,52 @@ class TushareCacheBackend:
             data = data.copy()
             data["list_status"] = api_params["list_status"]
         return self.cache_data(api_name, data)
+
+    def _security_pages(self, api_name: str, params: dict) -> pd.DataFrame:
+        page_size = 1000 if api_name == "stock_st" else 5000
+        payload = {**params, "fields": ",".join(self._spec(api_name).columns)}
+        payload.pop("offset", None)
+        payload.pop("limit", None)
+        frames, seen = [], set()
+        offset = 0
+        while True:
+            self._wait_for_rate_limit()
+            page = getattr(self._pro_api(), api_name)(**payload, limit=page_size, offset=offset)
+            if page is None:
+                raise ValueError(f"{api_name} returned no response; coverage not established")
+            if page.empty:
+                break
+            keys = set(map(tuple, page[list(self._spec(api_name).primary_keys)].values.tolist()))
+            if keys.issubset(seen) or (api_name != "namechange" and seen.intersection(keys)):
+                raise ValueError(f"{api_name} returned overlapping pages; refusing partial history")
+            seen.update(keys)
+            frames.append(page)
+            offset += len(page)
+            if len(page) < page_size:
+                break
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=self._spec(api_name).columns)
+
+    def _update_security_day(self, api_name: str, day: str) -> int:
+        frame = self._security_pages(api_name, {"trade_date": day})
+        # An empty historical ST response can mean provider history is missing.
+        # Do not silently interpret that as a market with no ST securities.
+        if frame.empty or set(frame["trade_date"].astype(str)) != {day}:
+            raise ValueError(f"{api_name} has no valid complete snapshot for {day}")
+        spec = self._spec(api_name)
+        frame = self._normalize_frame(api_name, frame, spec)
+        columns = list(frame.columns)
+        rows = list(frame.where(pd.notna(frame), None).itertuples(index=False, name=None))
+        with self._connect() as conn:
+            # Replace exactly one completed snapshot atomically, retaining other days.
+            conn.execute(f"DELETE FROM {spec.table} WHERE trade_date=?", (day,))
+            conn.executemany(
+                f"INSERT INTO {spec.table} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})", rows)
+            conn.execute(
+                "INSERT OR REPLACE INTO security_state_coverage(api_name,trade_date,row_count) VALUES (?,?,?)",
+                (api_name, day, len(rows)),
+            )
+            conn.commit()
+        return len(rows)
 
     def _update_income_period(self, period: str) -> int:
         api_params = self._api_params("income", period=period, fields=_INCOME_UPDATE_FIELDS)
@@ -653,7 +782,7 @@ class TushareCacheBackend:
     def _create_table_sql(self, spec: ApiSpec) -> str:
         column_defs = []
         for column in spec.columns:
-            if column.endswith("_date") or column.endswith("_code") or column.endswith("_name") or column in {"ts_code", "index_code", "con_code", "security", "source_sha256", "exchange", "symbol", "name", "industry", "market", "list_status", "report_type", "comp_type", "is_hs", "area", "fullname", "enname", "cnspell", "curr_type", "delist_date", "act_name", "act_ent_type", "is_new", "src", "level"}:
+            if column.endswith("_date") or column.endswith("_code") or column.endswith("_name") or column in {"type", "change_reason", "ts_code", "index_code", "con_code", "security", "source_sha256", "exchange", "symbol", "name", "industry", "market", "list_status", "report_type", "comp_type", "is_hs", "area", "fullname", "enname", "cnspell", "curr_type", "delist_date", "act_name", "act_ent_type", "is_new", "src", "level"}:
                 sql_type = "TEXT"
             elif column == "is_open":
                 sql_type = "INTEGER"
@@ -720,7 +849,7 @@ class TushareCacheBackend:
         frame = frame[columns].copy()
         for column in spec.columns:
             if column in frame.columns and (column.endswith("_date") or column in spec.primary_keys):
-                frame[column] = frame[column].astype(str)
+                frame[column] = frame[column].fillna("").astype(str)
         return frame.drop_duplicates(subset=list(spec.primary_keys), keep="last").reset_index(drop=True)
 
     def _project_fields(self, frame: pd.DataFrame, fields) -> pd.DataFrame:
@@ -740,6 +869,7 @@ class TushareCacheBackend:
             payload.setdefault("exchange", "SSE")
         if api_name == "stock_basic":
             payload.setdefault("list_status", "L")
+            payload.setdefault("fields", ",".join(self._spec(api_name).columns))
         if api_name == "income" and "period" in payload:
             payload["period"] = self._period_to_end_date(payload["period"])
         return payload

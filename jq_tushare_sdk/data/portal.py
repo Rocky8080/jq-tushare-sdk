@@ -22,6 +22,7 @@ from jq_tushare_sdk.data.code_map import (
 )
 from jq_tushare_sdk.data.joinquant_fields import PRICE_FIELD_MAP
 from jq_tushare_sdk.data.joinquant_industry import normalize_industry_code
+from jq_tushare_sdk.data.security_state import HistoricalSecurityState
 
 
 class JoinQuantDateStr(str):
@@ -85,6 +86,7 @@ class DataPortal:
         self._price_result_cache_evictions = 0
         self._fetch_cache = {}
         self._security_metadata_cache = None
+        self._historical_security_state = HistoricalSecurityState(backend)
         self._industry_cache = None
         self._sw_industry_cache = None
         self._sw_industry_all_cache = None
@@ -408,11 +410,17 @@ class DataPortal:
         if df.empty:
             return pd.DataFrame()
         result = df.copy()
+        if date is not None:
+            day = normalize_date(date)
+            ends = result["delist_date"].fillna("")
+            result = result[(result["list_date"] <= day) & ((ends == "") | (ends >= day))].copy()
+            historical_names = self._historical_security_state.names_on(day)
+            result["name"] = [historical_names.get(code, code) for code in result["ts_code"]]
         if "ts_code" in result.columns:
             result.index = [to_joinquant_code(code) for code in result["ts_code"].tolist()]
         return result
 
-    def get_security_info(self, security):
+    def get_security_info(self, security, as_of=None):
         code = to_joinquant_code(security)
         metadata_by_code = self._security_metadata_map()
         if code not in metadata_by_code:
@@ -421,18 +429,25 @@ class DataPortal:
             )
         metadata = metadata_by_code[code]
         name = str(metadata.get("name") or code)
+        if as_of is not None:
+            name = self._historical_security_state.names_on(normalize_date(as_of)).get(to_tushare_code(code), code)
+        delist = metadata.get("delist_date")
+        end_date = (datetime.strptime(normalize_date(delist), "%Y%m%d").date()
+                    if delist and not pd.isna(delist) else date(2200, 1, 1))
         return SimpleNamespace(
             code=code,
             display_name=name,
             name=name,
             start_date=self._security_start_date(metadata, code),
-            end_date=date(2200, 1, 1),
+            end_date=end_date,
             type="stock",
         )
 
     def get_current_data(self, securities=None, date=None):
         metadata_by_code = self._security_metadata_map()
-        codes = securities or list(metadata_by_code)
+        codes = securities if securities is not None else list(self.get_all_securities(date=date).index)
+        if securities is None:
+            codes += [code for code in metadata_by_code if is_tushare_fund_code(code) and code not in codes]
         if isinstance(codes, str):
             codes = [codes]
         else:
@@ -495,16 +510,28 @@ class DataPortal:
                     limit_reference = self._float_value(rows.iloc[-2].get("close"), last_price)
                 else:
                     limit_reference = last_price
-            is_st = self._is_st_name(name)
-            limit_ratio = self._limit_ratio(code, is_st)
+            state_day = normalize_date(date) if date is not None else row_date if row is not None else None
+            if not is_tushare_fund_code(code):
+                if state_day is None:
+                    raise ValueError(f"No date available for historical security state: {code}")
+                name, is_st, high_limit, low_limit, name_source = self._historical_security_state.resolve(
+                    to_tushare_code(code), state_day, paused=paused)
+            else:
+                # This repair covers A-share historical state; legacy fund limits
+                # remain separate and must not infer an ST status from their names.
+                is_st = False
+                name_source = "fund_metadata"
+                high_limit = round(limit_reference * 1.1, 2) if limit_reference else 0.0
+                low_limit = round(limit_reference * .9, 2) if limit_reference else 0.0
             current[code] = SimpleNamespace(
                 is_st=is_st,
                 paused=paused,
                 last_price=last_price,
-                high_limit=round(limit_reference * (1 + limit_ratio), 2) if limit_reference else 0.0,
-                low_limit=round(limit_reference * (1 - limit_ratio), 2) if limit_reference else 0.0,
+                high_limit=high_limit,
+                low_limit=low_limit,
                 day_open=day_open,
                 name=name,
+                name_source=name_source,
             )
         return current
 

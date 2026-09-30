@@ -1,6 +1,7 @@
 import csv
 import json
 import math
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -103,6 +104,67 @@ class TestOutputManager(unittest.TestCase):
             self.assertEqual(payload["cache_db"], "/data/cache.db")
             self.assertEqual(payload["git_commit"], "abc1234")
             self.assertEqual(payload["sdk_version"], jq_tushare_sdk.__version__)
+
+    def test_manifest_records_industry_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_db = Path(tmp) / "cache.db"
+            import sqlite3
+
+            with sqlite3.connect(cache_db) as connection:
+                connection.execute(
+                    "CREATE TABLE sw_industry_member_all (l1_code TEXT, ts_code TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO sw_industry_member_all VALUES ('801080.SI', '300001.SZ')"
+                )
+                connection.execute(
+                    "CREATE TABLE jq_industry_classify "
+                    "(industry_code TEXT, source_sha256 TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO jq_industry_classify VALUES ('801080', 'abc123def456')"
+                )
+
+            config = BacktestConfig(
+                strategy_path="/repo/strategy.py",
+                start_date="2024-01-01",
+                end_date="2024-01-31",
+                initial_cash=500000.0,
+                cache_db=str(cache_db),
+                output_dir=tmp,
+                strategy_name="demo",
+            )
+            with patch.dict(
+                os.environ,
+                {"JQTS_INDUSTRY_PROVIDER": "joinquant_taxonomy"},
+                clear=False,
+            ):
+                manifest = OutputManager(clock=lambda: "20260702-150000").create_run(config)
+            payload = json.loads((manifest.run_dir / "manifest.json").read_text(encoding="utf-8"))
+
+            provenance = payload["industry_provenance"]
+            self.assertEqual(provenance["provider"], "joinquant_taxonomy")
+            self.assertEqual(provenance["compat"], "")
+            self.assertEqual(provenance["sw_member_all_rows"], 1)
+            self.assertEqual(provenance["jq_classification_sha256"], "abc123def456")
+            self.assertIsNone(provenance["jq_member_sha256"])
+
+    def test_manifest_industry_provenance_tolerates_missing_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = BacktestConfig(
+                strategy_path="/repo/strategy.py",
+                start_date="2024-01-01",
+                end_date="2024-01-31",
+                initial_cash=500000.0,
+                cache_db=str(Path(tmp) / "missing.db"),
+                output_dir=tmp,
+                strategy_name="demo",
+            )
+            manifest = OutputManager(clock=lambda: "20260702-150000").create_run(config)
+            payload = json.loads((manifest.run_dir / "manifest.json").read_text(encoding="utf-8"))
+            provenance = payload["industry_provenance"]
+            self.assertEqual(provenance["provider"], "tushare")
+            self.assertIsNone(provenance["sw_member_all_rows"])
 
     def test_create_run_atomically_claims_run_directory(self):
         with tempfile.TemporaryDirectory() as tmp:

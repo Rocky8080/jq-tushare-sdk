@@ -125,6 +125,71 @@ python -m jq_tushare_sdk.cli backtest <strategy.py> ...
 `joinquant_full`在所请求股票或日期没有导入成员记录时会明确报错，不会静默回退
 到Tushare或`stock_basic.industry`。
 
+可在聚宽研究环境导出逐股成员。研究环境只支持 ipynb，请使用
+`scripts/export_joinquant_members.ipynb`（上传后在文件面板下载输出；同目录的
+`export_joinquant_members.py` 是同一代码的 .py 形式，供本地参考）：
+
+```python
+# notebook「参数配置」单元
+AS_OF = '2026-06-01'   # 单日快照：与 get_industry 返回的"股票→行业信息"字典一致
+# 或区间模式（含历史成员变更，每行带 in_date/out_date）：
+START = '2026-04-01'; END = '2026-07-31'; STEP_DAYS = 1
+```
+
+研究环境的 API 可用性取决于账号和权限。notebook 会探测 `get_industry` /
+`get_industry_stocks`；没有可用成员 API 时明确停止，请改用下面的本地脚本。
+默认每日快照；`STEP_DAYS > 1` 只能近似还原采样间的成员变化。区间快照不延伸
+到请求结束日之后；单日快照导入必须提供相同日期的 `--as-of`。
+
+**推荐路径：本机安装聚宽官方 JQData SDK（jqdatasdk）**，用聚宽账号直接调用
+完整的行业成员接口：
+
+```bash
+pip install jqdatasdk
+python scripts/export_joinquant_members_local.py \
+  --username <聚宽账号> \
+  --as-of 2026-06-01 --output jq_members.json
+# 或区间模式（含历史成员变更）：
+python scripts/export_joinquant_members_local.py \
+  --username <聚宽账号> \
+  --start 2026-04-01 --end 2026-07-31 --step-days 1 \
+  --output jq_members.json
+```
+
+导入后即可 `JQTS_INDUSTRY_PROVIDER=joinquant_full` 回测，让本地与聚宽平台使用
+同一份逐股成员数据。
+
+密码在终端隐藏输入，不建议使用 `--password`，以免进入 shell 历史或进程列表。
+
+### Industry Provenance（行业口径溯源）
+
+`get_industry` 的行业口径由 `JQTS_INDUSTRY_PROVIDER`、`JQTS_INDUSTRY_COMPAT` 与
+本地缓存中存在的 SW 表共同决定；不同口径下同一策略的行业分组、仓位风控与收益可能
+完全不同。每次回测会把生效口径写入 `manifest.json` 的 `industry_provenance` 字段
+（provider、compat、SW 成员表行数、导入的聚宽分类/成员 SHA-256）：
+
+- `scripts/compare_backtest_runs.py` 在两侧行业口径不一致（或仅一侧记录）时拒绝对比，
+  避免把行业数据差异误判为策略改动。
+- Readiness 检查在策略调用 `get_industry` 且所配置 provider 的表缺失时阻塞回测，
+  不再静默回退到东财 `stock_basic.industry`（`JQTS_INDUSTRY_COMPAT=stock_basic_as_sw_l1`
+  诊断开关除外）。
+
+溯源检查不是整个数据库的内容校验：相同的表行数不保证成员内容相同。
+严谨对照仍需冻结同一份缓存、策略文件和参数。
+
+### Historical Security State（历史股票状态）
+
+历史股票名称、ST 状态及涨跌停价格改为使用当日 `stock_st`、官方 `stk_limit`
+和有效期内的 `namechange`，不再由当前股票名称或固定涨跌幅比例推测。
+CLI 与网页回测均在准备阶段检查并自动补齐每日完整快照，包含开始前一个交易日。
+补数需要相应 Tushare 权限；缺少权限或完整快照会明确报错，不会静默伪造状态。
+历史名称缺失时使用证券代码标签；基金限价仍保留旧近似口径。
+升级后历史回测可能因修正 ST/限价而改变结果，比较两组策略时应使用相同 SDK 和缓存。
+详情见 [历史状态数据说明](docs/historical_security_state.md)。
+
+注意：0.10.29 之前版本的本地回测使用东财 `stock_basic.industry` 冒充 `sw_l1`，
+与聚宽平台（申万口径）**不可直接比较**；0.10.29 起默认使用真实 SW2021 成员。
+
 ## Check Data
 
 如需单独诊断，可在运行回测前检查本地缓存是否齐备：
@@ -319,7 +384,7 @@ http://127.0.0.1:8787/report.html
 
 ## Versioning
 
-当前版本：`v0.10.32`
+当前版本：`v0.10.33`
 
 版本号遵循 Semantic Versioning：
 

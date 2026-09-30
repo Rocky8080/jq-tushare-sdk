@@ -56,6 +56,27 @@ def is_tushare_fund_code(code: str) -> bool:
     return False
 
 
+_A_SHARE_SH_PREFIXES = ("600", "601", "603", "605", "688", "689")
+_A_SHARE_SZ_PREFIXES = ("000", "001", "002", "003", "300", "301")
+
+
+def is_tushare_a_share_code(code: str) -> bool:
+    """Return whether ``code`` is a Shanghai/Shenzhen A-share symbol.
+
+    Excludes B-shares (``200xxx.SZ`` / ``900xxx.SH``), which trade in
+    ``daily`` but are not part of the ``stock_basic`` A-share universe.
+    """
+    raw = to_tushare_code(code)
+    if "." not in raw:
+        return False
+    symbol, exchange = raw.split(".", 1)
+    if exchange == "SH":
+        return symbol.startswith(_A_SHARE_SH_PREFIXES)
+    if exchange == "SZ":
+        return symbol.startswith(_A_SHARE_SZ_PREFIXES)
+    return False
+
+
 def is_tushare_index_code(code: str) -> bool:
     raw = to_tushare_code(code)
     if is_tushare_sw_index_code(raw):

@@ -83,11 +83,101 @@ def _first_difference(expected, actual):
     return None
 
 
-def main() -> int:
+def _industry_provenance(run_dir: Path) -> dict | None:
+    """Read industry provenance from a run, falling back to config.json.
+
+    Returns ``None`` when the run predates provenance recording, in which case
+    the semantic cannot be reconstructed from the artifacts alone.
+    """
+    manifest_path = run_dir / "manifest.json"
+    if manifest_path.is_file():
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        provenance = payload.get("industry_provenance")
+        if isinstance(provenance, dict):
+            return provenance
+    config_path = run_dir / "config.json"
+    if config_path.is_file():
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        provenance = payload.get("industry_provenance")
+        if isinstance(provenance, dict):
+            return provenance
+    return None
+
+
+def _provenance_signature(provenance: dict | None) -> tuple | None:
+    if provenance is None:
+        return None
+    provider = provenance.get("provider")
+    compat = provenance.get("compat", "")
+    if compat == "stock_basic_as_sw_l1":
+        return (compat,)
+    if provider == "joinquant_full":
+        return (provider, compat, provenance.get("jq_classification_sha256"), provenance.get("jq_member_sha256"))
+    # Counts may grow without changing the provider, but an empty member table
+    # switches the portal's lookup path and must not compare as the same semantic.
+    membership = tuple(
+        bool(provenance.get(field)) if provenance.get(field) is not None else None
+        for field in ("sw_member_all_rows", "sw_member_rows")
+    )
+    taxonomy = provenance.get("jq_classification_sha256") if provider == "joinquant_taxonomy" else None
+    return (provider, compat, membership, taxonomy)
+
+
+def _check_provenance_comparable(baseline: Path, candidate: Path) -> None:
+    """Refuse cross-semantic comparisons before comparing any artifacts."""
+    baseline_prov = _industry_provenance(baseline)
+    candidate_prov = _industry_provenance(candidate)
+    if _provenance_signature(baseline_prov) is None and _provenance_signature(candidate_prov) is None:
+        print(
+            json.dumps(
+                {
+                    "warning": (
+                        "Neither run records industry provenance (pre-0.10.33 runs); "
+                        "industry semantic is not comparable."
+                    )
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
+    if _provenance_signature(baseline_prov) is None or _provenance_signature(candidate_prov) is None:
+        print(
+            json.dumps(
+                {
+                    "equivalent": False,
+                    "file": "manifest.json",
+                    "reason": (
+                        "industry provenance missing on one run; "
+                        "cannot establish comparable industry semantics"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        )
+        raise SystemExit(1)
+    if _provenance_signature(baseline_prov) != _provenance_signature(candidate_prov):
+        print(
+            json.dumps(
+                {
+                    "equivalent": False,
+                    "file": "manifest.json",
+                    "reason": "industry provenance differs",
+                    "baseline": baseline_prov,
+                    "candidate": candidate_prov,
+                },
+                ensure_ascii=False,
+            )
+        )
+        raise SystemExit(1)
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Compare transparent backtest run artifacts.")
     parser.add_argument("baseline", type=Path)
     parser.add_argument("candidate", type=Path)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    _check_provenance_comparable(args.baseline, args.candidate)
 
     for name, baseline_path, loader in _comparisons(args.baseline):
         candidate_path = args.candidate / baseline_path.relative_to(args.baseline)

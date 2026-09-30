@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from jq_tushare_sdk.data.code_map import is_tushare_a_share_code
 from jq_tushare_sdk.data.code_map import is_tushare_fund_code
 from jq_tushare_sdk.data.code_map import is_tushare_index_code
 from jq_tushare_sdk.data.code_map import is_tushare_sw_index_code
@@ -10,6 +11,8 @@ from jq_tushare_sdk.data.code_map import normalize_date
 from jq_tushare_sdk.data.code_map import to_tushare_code
 from jq_tushare_sdk.data.income_periods import income_period_end
 from jq_tushare_sdk.data.income_periods import required_income_periods
+from jq_tushare_sdk.data.industry_provenance import effective_industry_compat
+from jq_tushare_sdk.data.industry_provenance import effective_industry_provider
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,9 @@ _UPDATE_PRIORITY = {
     "sw_daily": 8,
     "index_weight": 9,
     "income": 10,
+    "stock_st": 11,
+    "stk_limit": 12,
+    "namechange": 13,
 }
 _MARKET_DAILY_APIS = {"daily", "daily_basic", "adj_factor", "fund_adj", "index_daily"}
 _PRICE_LOOKBACK_APIS = {"daily", "adj_factor", "fund_adj"}
@@ -96,6 +102,10 @@ class DataReadinessCheck:
         if fund_issue is not None:
             issues.append(fund_issue)
         for api_name in apis:
+            if api_name in {"stock_st", "stk_limit", "namechange"}:
+                # Checked together below, including complete snapshot markers
+                # and effective names established BEFORE the requested window.
+                continue
             if api_name == "index_daily":
                 issue = self._check_required_indexes(config, price_market_start, price_market_end)
                 if issue is not None:
@@ -131,7 +141,7 @@ class DataReadinessCheck:
                 )
                 continue
             if api_name == "stock_basic":
-                issue = self._check_stock_basic_statuses()
+                issue = self._check_stock_basic_statuses(market_start, market_end)
                 if issue is not None:
                     issues.append(issue)
                 continue
@@ -158,9 +168,49 @@ class DataReadinessCheck:
                         update_requests=(_update_request(api_name, str(max_date), check_end),),
                     )
                 )
+        industry_issue = self._check_industry_provenance(config)
+        if industry_issue is not None:
+            issues.append(industry_issue)
+        if {"stock_st", "stk_limit", "namechange"}.intersection(apis):
+            check = getattr(self.backend, "security_state_gaps", None)
+            if check is not None:
+                state_start = market_start
+                calendar = self.backend.fetch(
+                    "trade_cal",
+                    start_date=(datetime.strptime(start, "%Y%m%d") - timedelta(days=30)).strftime("%Y%m%d"),
+                    end_date=start,
+                )
+                if {"cal_date", "is_open"}.issubset(calendar.columns):
+                    previous = calendar.loc[
+                        (calendar["is_open"].astype(str) == "1")
+                        & (calendar["cal_date"].astype(str) < start), "cal_date"
+                    ]
+                    if not previous.empty:
+                        state_start = min(state_start, str(previous.max()))
+                gaps = check(state_start, market_end)
+                missing_names = gaps.pop("namechange", None)
+                if missing_names:
+                    issues.append(ReadinessIssue(
+                        api_name="namechange",
+                        message=f"Some historical name labels are missing: {missing_names}. Complete daily ST status is still required; code labels replace unknown names.",
+                        suggestion="Repair provider namechange timelines where available; never substitute current names.",
+                        advisory=True,
+                    ))
+                if gaps:
+                    issues.append(ReadinessIssue(
+                        api_name="security_state",
+                        message=f"Historical security state incomplete: {str(gaps)[:1500]}",
+                        suggestion="Update stock_st/stk_limit for every trade day and repair missing namechange timelines; current stock names cannot substitute.",
+                        update_requests=tuple(_update_request(api, state_start, market_end)
+                                              for api in ("stock_st", "stk_limit", "namechange")),
+                    ))
         return issues
 
-    def _check_stock_basic_statuses(self) -> ReadinessIssue | None:
+    def _check_stock_basic_statuses(
+        self,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> ReadinessIssue | None:
         try:
             frame = self.backend.fetch("stock_basic")
         except Exception:
@@ -174,15 +224,146 @@ class DataReadinessCheck:
                 if str(value).strip()
             }
             missing = sorted(_REQUIRED_STOCK_BASIC_LIST_STATUSES - present)
-        if not missing:
+
+        missing_symbols = self._stock_basic_missing_market_symbols(frame, start, end)
+        if not missing and not missing_symbols:
             return None
-        names = ", ".join(missing)
+
+        details = []
+        if missing:
+            details.append(f"list_status {', '.join(missing)}")
+        if missing_symbols:
+            preview = ", ".join(missing_symbols[:10])
+            suffix = f" and {len(missing_symbols) - 10} more" if len(missing_symbols) > 10 else ""
+            details.append(f"market securities {preview}{suffix}")
         return ReadinessIssue(
             api_name="stock_basic",
-            message=f"stock_basic is missing list_status {names} for historical backtests.",
+            message=f"stock_basic is missing {'; '.join(details)} for this backtest.",
             suggestion="python update_data.py --api stock_basic",
             update_requests=(_update_request("stock_basic"),),
         )
+
+    def _stock_basic_missing_market_symbols(
+        self,
+        stock_basic,
+        start: str | None,
+        end: str | None,
+    ) -> list[str]:
+        if (
+            stock_basic is None
+            or stock_basic.empty
+            or "ts_code" not in stock_basic.columns
+            or not start
+            or not end
+        ):
+            return []
+
+        known = {
+            str(value).strip()
+            for value in stock_basic["ts_code"].tolist()
+            if str(value).strip()
+        }
+        recent_start = max(
+            str(start),
+            (datetime.strptime(str(end), "%Y%m%d") - timedelta(days=14)).strftime("%Y%m%d"),
+        )
+        observed = set()
+        for api_name in ("daily", "daily_basic"):
+            try:
+                frame = self.backend.fetch(
+                    api_name,
+                    start_date=recent_start,
+                    end_date=end,
+                    fields="ts_code",
+                )
+            except Exception:
+                continue
+            if frame is None or frame.empty or "ts_code" not in frame.columns:
+                continue
+            observed.update(
+                str(value).strip()
+                for value in frame["ts_code"].tolist()
+                if str(value).strip() and is_tushare_a_share_code(value)
+            )
+        return sorted(observed - known)
+
+    def _check_industry_provenance(self, config) -> ReadinessIssue | None:
+        """Block backtests whose industry semantic would silently change.
+
+        ``get_industry`` resolves SW industries from ``JQTS_INDUSTRY_PROVIDER``
+        and whichever SW cache tables exist.  When the requested provider's
+        tables are missing, the portal silently falls back to Eastmoney
+        ``stock_basic.industry`` (pre-0.10.29 semantics), which changes
+        portfolio grouping and, for industry-diversified strategies, returns.
+        Only strategies that actually call ``get_industry`` are checked, and
+        the deliberate ``JQTS_INDUSTRY_COMPAT=stock_basic_as_sw_l1`` diagnostic
+        is never blocked.
+        """
+        if not infer_strategy_uses_get_industry(getattr(config, "strategy_path", None)):
+            return None
+        if effective_industry_compat() == "stock_basic_as_sw_l1":
+            return None
+        provider = effective_industry_provider()
+        if provider == "tushare":
+            member_all_status = self.backend.status("index_member_all")
+            member_status = self.backend.status("index_member")
+            member_all_rows = int(member_all_status.get("record_count", 0) or 0)
+            member_rows = int(member_status.get("record_count", 0) or 0)
+            if member_all_rows > 0 or member_rows > 0:
+                return None
+            return ReadinessIssue(
+                api_name="index_member_all",
+                message=(
+                    "Local cache has no SW2021 membership (index_member_all/index_member). "
+                    "get_industry would silently fall back to Eastmoney stock_basic.industry, "
+                    "which is NOT the JoinQuant/platform industry semantic."
+                ),
+                suggestion=(
+                    "python -m jq_tushare_sdk.cli update-data --api index_member_all "
+                    "--cache-db <cache_db>"
+                ),
+                update_requests=(
+                    _update_request("index_classify"),
+                    _update_request("index_member_all"),
+                ),
+            )
+        if provider == "joinquant_taxonomy":
+            status = self.backend.status("jq_industry_classify")
+            members = any(int(self.backend.status(api).get("record_count", 0) or 0) > 0
+                          for api in ("index_member_all", "index_member"))
+            if int(status.get("record_count", 0) or 0) > 0 and members:
+                return None
+            return ReadinessIssue(
+                api_name="jq_industry_classify",
+                message=(
+                    "JQTS_INDUSTRY_PROVIDER=joinquant_taxonomy requires an imported "
+                    "JoinQuant classification table and Tushare SW membership."
+                ),
+                suggestion=(
+                    "python -m jq_tushare_sdk.cli import-jq-industry "
+                    "--classify path/to/joinquant_industry.txt --cache-db <cache_db>"
+                ),
+            )
+        if provider == "joinquant_full":
+            status = self.backend.status("jq_industry_member")
+            classify = self.backend.status("jq_industry_classify")
+            if (int(status.get("record_count", 0) or 0) > 0
+                    and int(classify.get("record_count", 0) or 0) > 0):
+                return None
+            return ReadinessIssue(
+                api_name="jq_industry_member",
+                message=(
+                    "JQTS_INDUSTRY_PROVIDER=joinquant_full requires an imported "
+                    "JoinQuant classification and member tables."
+                ),
+                suggestion=(
+                    "python -m jq_tushare_sdk.cli import-jq-industry "
+                    "--classify path/to/joinquant_industry.txt "
+                    "--members path/to/joinquant_members.json --as-of <YYYY-MM-DD> "
+                    "--cache-db <cache_db>"
+                ),
+            )
+        return None
 
     def _check_required_indexes(self, config, start: str, end: str) -> ReadinessIssue | None:
         benchmark = infer_strategy_benchmark(getattr(config, "strategy_path", None)) or getattr(config, "benchmark", None)
@@ -704,6 +885,30 @@ def infer_strategy_fund_symbols(strategy_path) -> list[str]:
                 symbols.append(value)
                 seen.add(value)
     return symbols
+
+
+def infer_strategy_uses_get_industry(strategy_path) -> bool:
+    """Return whether the strategy calls ``get_industry`` anywhere.
+
+    ``False`` for missing or unparseable files so readiness checks do not
+    block strategies whose industry usage cannot be established.
+    """
+    if not strategy_path:
+        return False
+    path = Path(strategy_path)
+    if not path.is_file():
+        return False
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and (
+            _is_name(node.func, "get_industry")
+            or isinstance(node.func, ast.Attribute) and node.func.attr == "get_industry"
+        ):
+            return True
+    return False
 
 
 def infer_strategy_price_lookback_start(strategy_path, start_date: str) -> str:

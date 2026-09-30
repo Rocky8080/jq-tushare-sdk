@@ -18,6 +18,10 @@ _REQUIRED_LOCAL_APIS = [
     "adj_factor",
     "index_weight",
     "stock_basic",
+    "stock_st",
+    "stk_limit",
+    "namechange",
+    "bse_mapping",
     "index_daily",
     "income",
 ]

@@ -1562,6 +1562,213 @@ class TestDataLayer(unittest.TestCase):
         self.assertIn("list_status D", issues[0].message)
         self.assertEqual(issues[0].update_requests[0].api_name, "stock_basic")
 
+    def test_readiness_ignores_b_shares_in_stock_basic_missing_symbols(self):
+        class FullStatusBackend(FakeBackend):
+            def fetch(self, api_name, **params):
+                if api_name == "stock_basic":
+                    return pd.DataFrame(
+                        [
+                            {
+                                "ts_code": "000001.SZ",
+                                "name": "平安银行",
+                                "list_status": "L",
+                            },
+                            {
+                                "ts_code": "600000.SH",
+                                "name": "浦发银行",
+                                "list_status": "L",
+                            },
+                            {
+                                "ts_code": "000004.SZ",
+                                "name": "国华网安",
+                                "list_status": "D",
+                            },
+                        ]
+                    )
+                if api_name in ("daily", "daily_basic"):
+                    return pd.DataFrame(
+                        [
+                            {"ts_code": "000001.SZ", "trade_date": "20250102"},
+                            {"ts_code": "600000.SH", "trade_date": "20250102"},
+                            {"ts_code": "200011.SZ", "trade_date": "20250102"},
+                            {"ts_code": "900901.SH", "trade_date": "20250102"},
+                        ]
+                    )
+                return super().fetch(api_name, **params)
+
+            def status(self, api_name):
+                if api_name == "stock_basic":
+                    return {"exists": True, "record_count": 3}
+                return super().status(api_name)
+
+        config = BacktestConfig(
+            strategy_path="strategy.py",
+            start_date="2025-01-02",
+            end_date="2025-12-02",
+            initial_cash=1000000.0,
+            cache_db="/tmp/cache.db",
+        )
+
+        issues = DataReadinessCheck(FullStatusBackend()).check_required(config, ["stock_basic"])
+
+        self.assertEqual(issues, [])
+        self.assertNotIn("200011.SZ", str(issues))
+
+    def test_readiness_blocks_sw_fallback_for_get_industry_strategy(self):
+        class NoSwBackend(FakeBackend):
+            def status(self, api_name):
+                if api_name in {"index_member_all", "index_member"}:
+                    return {"exists": False, "record_count": 0}
+                return super().status(api_name)
+
+        with TemporaryDirectory() as tmp:
+            strategy_path = Path(tmp) / "industry_strategy.py"
+            strategy_path.write_text(
+                """
+def filter_industry(context):
+    info = get_industry(context.portfolio.positions.keys(), date=context.current_dt)
+    return info
+""",
+                encoding="utf-8",
+            )
+            config = BacktestConfig(
+                strategy_path=str(strategy_path),
+                start_date="2025-01-02",
+                end_date="2025-12-02",
+                initial_cash=1000000.0,
+                cache_db="/tmp/cache.db",
+            )
+
+            issues = DataReadinessCheck(NoSwBackend()).check_required(config, ["stock_basic"])
+
+        self.assertTrue(
+            any(issue.api_name == "index_member_all" for issue in issues),
+            [issue.api_name for issue in issues],
+        )
+        fallback_issue = next(issue for issue in issues if issue.api_name == "index_member_all")
+        self.assertIn("fall back", fallback_issue.message)
+        self.assertIn("index_member_all", fallback_issue.suggestion)
+        request_names = [request.api_name for request in fallback_issue.update_requests]
+        self.assertIn("index_member_all", request_names)
+
+    def test_readiness_skips_industry_check_without_get_industry(self):
+        class NoSwBackend(FakeBackend):
+            def status(self, api_name):
+                if api_name in {"index_member_all", "index_member"}:
+                    return {"exists": False, "record_count": 0}
+                return super().status(api_name)
+
+        with TemporaryDirectory() as tmp:
+            strategy_path = Path(tmp) / "plain_strategy.py"
+            strategy_path.write_text(
+                """
+def select_stock(context):
+    return get_index_stocks('399006.XSHE')
+""",
+                encoding="utf-8",
+            )
+            config = BacktestConfig(
+                strategy_path=str(strategy_path),
+                start_date="2025-01-02",
+                end_date="2025-12-02",
+                initial_cash=1000000.0,
+                cache_db="/tmp/cache.db",
+            )
+
+            issues = DataReadinessCheck(NoSwBackend()).check_required(config, ["stock_basic"])
+
+        self.assertFalse(any(issue.api_name == "index_member_all" for issue in issues))
+
+    def test_readiness_blocks_missing_joinquant_classification(self):
+        class NoJqBackend(FakeBackend):
+            def status(self, api_name):
+                if api_name == "jq_industry_classify":
+                    return {"exists": False, "record_count": 0}
+                return super().status(api_name)
+
+        with TemporaryDirectory() as tmp:
+            strategy_path = Path(tmp) / "industry_strategy.py"
+            strategy_path.write_text(
+                "def f(context):\n    return get_industry(['000001.XSHE'], date=context.current_dt)\n",
+                encoding="utf-8",
+            )
+            config = BacktestConfig(
+                strategy_path=str(strategy_path),
+                start_date="2025-01-02",
+                end_date="2025-12-02",
+                initial_cash=1000000.0,
+                cache_db="/tmp/cache.db",
+            )
+
+            with patch.dict(
+                os.environ,
+                {"JQTS_INDUSTRY_PROVIDER": "joinquant_taxonomy"},
+                clear=False,
+            ):
+                issues = DataReadinessCheck(NoJqBackend()).check_required(config, ["stock_basic"])
+
+        self.assertTrue(any(issue.api_name == "jq_industry_classify" for issue in issues))
+
+    def test_readiness_blocks_missing_joinquant_members(self):
+        class NoJqBackend(FakeBackend):
+            def status(self, api_name):
+                if api_name == "jq_industry_member":
+                    return {"exists": False, "record_count": 0}
+                return super().status(api_name)
+
+        with TemporaryDirectory() as tmp:
+            strategy_path = Path(tmp) / "industry_strategy.py"
+            strategy_path.write_text(
+                "def f(context):\n    return get_industry(['000001.XSHE'], date=context.current_dt)\n",
+                encoding="utf-8",
+            )
+            config = BacktestConfig(
+                strategy_path=str(strategy_path),
+                start_date="2025-01-02",
+                end_date="2025-12-02",
+                initial_cash=1000000.0,
+                cache_db="/tmp/cache.db",
+            )
+
+            with patch.dict(
+                os.environ,
+                {"JQTS_INDUSTRY_PROVIDER": "joinquant_full"},
+                clear=False,
+            ):
+                issues = DataReadinessCheck(NoJqBackend()).check_required(config, ["stock_basic"])
+
+        self.assertTrue(any(issue.api_name == "jq_industry_member" for issue in issues))
+
+    def test_readiness_never_blocks_compat_diagnostic_switch(self):
+        class NoSwBackend(FakeBackend):
+            def status(self, api_name):
+                if api_name in {"index_member_all", "index_member"}:
+                    return {"exists": False, "record_count": 0}
+                return super().status(api_name)
+
+        with TemporaryDirectory() as tmp:
+            strategy_path = Path(tmp) / "industry_strategy.py"
+            strategy_path.write_text(
+                "def f(context):\n    return get_industry(['000001.XSHE'], date=context.current_dt)\n",
+                encoding="utf-8",
+            )
+            config = BacktestConfig(
+                strategy_path=str(strategy_path),
+                start_date="2025-01-02",
+                end_date="2025-12-02",
+                initial_cash=1000000.0,
+                cache_db="/tmp/cache.db",
+            )
+
+            with patch.dict(
+                os.environ,
+                {"JQTS_INDUSTRY_COMPAT": "stock_basic_as_sw_l1"},
+                clear=False,
+            ):
+                issues = DataReadinessCheck(NoSwBackend()).check_required(config, ["stock_basic"])
+
+        self.assertFalse(any(issue.api_name == "index_member_all" for issue in issues))
+
     def test_readiness_reports_missing_strategy_benchmark_index_daily(self):
         with TemporaryDirectory() as tmp:
             strategy_path = Path(tmp) / "benchmark_strategy.py"

@@ -4,6 +4,29 @@ All notable changes to JQ Tushare SDK are documented in this file.
 
 This project follows Semantic Versioning.
 
+## [0.10.33] - 2026-09-30
+
+### Added
+
+- Every backtest run now records an `industry_provenance` block in `manifest.json`: the effective `JQTS_INDUSTRY_PROVIDER`, the `JQTS_INDUSTRY_COMPAT` diagnostic flag, SW membership table row counts, and the imported JoinQuant classification/member source SHA-256. `scripts/compare_backtest_runs.py` refuses to compare runs whose industry semantic differs (or is recorded on only one side), so Eastmoney-`stock_basic.industry` runs (pre-0.10.29 semantics) can never be mistaken for JoinQuant/platform-consistent results.
+- Readiness now blocks a backtest that calls `get_industry` when the configured provider's tables are missing, instead of silently falling back to Eastmoney `stock_basic.industry` (the deliberate `JQTS_INDUSTRY_COMPAT=stock_basic_as_sw_l1` diagnostic is exempt). `joinquant_taxonomy` / `joinquant_full` providers require their imported classification / member tables.
+- `scripts/export_joinquant_members.ipynb`（以及同代码的 `export_joinquant_members.py` 参考版）导出聚宽研究环境的逐股行业成员，供 `import-jq-industry --members` 导入，实现 `joinquant_full` 下本地回测与聚宽平台的逐股对齐。
+- `is_tushare_a_share_code` classifies Shanghai/Shenzhen A-share symbols.
+- Historical stock state uses full daily `stock_st` snapshots, official `stk_limit` prices, effective `namechange` timelines and BSE code aliases. Completion markers prevent partial symbol downloads from being treated as a complete market snapshot.
+- CLI and web readiness check historical snapshots, including the preceding trade day, and request automatic backfill. Provider permissions remain required; missing name labels are advisory and use code labels, never current names.
+
+### Fixed
+
+- The `stock_basic` readiness missing-symbol check now ignores B-shares (`200xxx.SZ`, `900xxx.SH`) that trade in `daily` but are not part of the `stock_basic` A-share universe; previously these false positives blocked every backtest.
+- Industry readiness checks all tables required by taxonomy/full providers, including module-qualified calls. Comparison distinguishes missing SW membership from populated caches and records all imported source hashes deterministically.
+- Exporters use as-of stock universes, validate date ranges and positive sampling intervals, default to daily snapshots, and close the last membership interval at the requested window boundary. Failed API calls do not silently save partial exports; local login hides password input.
+- Historical name lookups select the latest effective interval when older intervals overlap, while rejecting conflicting names with the same effective start.
+
+### Changed
+
+- Documented that pre-0.10.29 local backtests used Eastmoney `stock_basic.industry` semantics and are not comparable with JoinQuant-platform results; 0.10.29+ defaults to real SW2021 membership.
+- Dated security lists filter listing/delisting dates and security info returns the recorded delisting date. Historical backtest results may change after ST/limit corrections; rerun both comparison arms with the same SDK and frozen cache.
+
 ## [0.10.32] - 2026-08-06
 
 ### Added

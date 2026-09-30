@@ -55,6 +55,7 @@ MANIFEST
 
 # Local Git worktrees
 .worktrees/
+.zcode/
 
 # Private strategy/program files should live outside this SDK repository.
 experiments/
