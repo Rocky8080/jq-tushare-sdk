@@ -1,3 +1,14 @@
+## [0.11.0] - 2026-10-11
+
+- 提供 `jq_tushare_sdk.daily` 公开连续日线接口与运行契约版本，保留收盘决策、次日开盘模拟成交逻辑。
+- 日线运行、就绪检查、数据补齐和缓存锁归属 SDK，内部实现不依赖策略平台。
+- 策略账户、Web 页面、邮件、持久化和进程调度迁移到同级独立项目 jq-strategy-platform，SDK 不再包含其静态资源和服务。
+- 旧 `simulation-web` 命令提供迁移提示；平台安装与数据迁移见平台 README。
+- 公开日志脱敏接口，统一包声明版本；检查点保留既有对象路径并记录后续实际 SDK 版本。
+- 包含共享缓存跨进程写入锁和策略进程只读保护，数据补齐与账户执行共用同一锁协议。
+
+迁移不重算既有策略历史；依赖本次平台拆分的应用需采用 SDK 0.11.0。验证记录见同级平台 RELEASE.md。
+
 ## [0.10.35] - 2026-10-10
 
 - Add explicit research data contracts, signed-PE/PB missing-value provenance, and announcement cutoffs for research quarterly queries.

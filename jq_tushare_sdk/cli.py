@@ -58,6 +58,13 @@ def build_parser():
     web.add_argument("--host", default="127.0.0.1")
     web.add_argument("--port", type=int, default=8790)
 
+    simulation = subparsers.add_parser("simulation-web", help="Migration notice: daily strategy UI moved to jq-strategy-platform")
+    simulation.add_argument("--project-root", default=".")
+    simulation.add_argument("--cache-db", default="data/jq_tushare_cache.db")
+    simulation.add_argument("--store-dir", default="data/simulations")
+    simulation.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost"))
+    simulation.add_argument("--port", type=int, default=8791)
+
     backtest = subparsers.add_parser("backtest")
     backtest.add_argument("strategy", nargs="?")
     backtest.add_argument("--strategy", dest="strategy_option")
@@ -73,6 +80,8 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if args.command == "simulation-web":
+        raise SystemExit("模拟工作台已迁移到独立项目 jq-strategy-platform，请在该项目中运行 jqsp web。")
     if args.command == "web":
         serve_web_console(
             project_root=args.project_root,

@@ -307,6 +307,14 @@ Web 控制台提供：
 
 Web 控制台只绑定本地地址时不会对外提供服务；如需改成其他监听地址，请自行确认网络和权限边界。
 
+## Strategy Platform
+
+连续策略工作台现已迁移到同级独立项目 `jq-strategy-platform`，由平台负责 Web UI、策略账户、历史交割、代码版本、任务调度与邮件配置。平台通过 `jq_tushare_sdk.daily` 的公开接口单向依赖 SDK，两者独立管理版本与发布说明。
+
+SDK 不再打包平台页面和账户服务。旧的 `jqts simulation-web` 命令提示迁移；请在平台项目使用 `jqsp web`。现有账户需按平台迁移文档停服、备份、迁移代码路径，不能重新导入策略代替历史迁移。
+
+公开日线契约包括 `run_day`、`analyze_source`、`inspect_readiness`、`DailyDataSync`、`DailyDataUnavailable`、`DataSyncError`、`CHECKPOINT_VERSION` 和 `RUNTIME_CONTRACT`。`run_day` 只计算一天并返回结果与内部检查点，持久化和事务提交由调用方负责。检查点只接受可信本机状态，不是外部交换格式。
+
 ## Results
 
 每次回测都会生成独立目录，典型结构如下：
@@ -384,7 +392,7 @@ http://127.0.0.1:8787/report.html
 
 ## Versioning
 
-当前版本：`v0.10.35`
+当前版本：`v0.11.0`
 
 版本号遵循 Semantic Versioning：
 

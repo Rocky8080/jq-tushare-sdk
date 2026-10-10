@@ -14,6 +14,7 @@ from typing import Iterable
 import pandas as pd
 
 from jq_tushare_sdk.data.code_map import normalize_date
+from jq_tushare_sdk.data.cache_lock import cache_write_lock
 from jq_tushare_sdk.data.income_periods import income_period_end
 from jq_tushare_sdk.data.income_periods import required_income_periods
 from jq_tushare_sdk.data.financial_provenance import (asof_timestamp, normalized_payload, capture_timestamp)
@@ -376,7 +377,9 @@ class TushareCacheBackend:
         self._last_request_ts = 0.0
         self._read_conn = None
         self._read_lock = threading.RLock()
-        self._ensure_schema()
+        self.read_only = os.environ.get("JQTS_SIMULATION_READ_ONLY") == "1"
+        if not self.read_only:
+            self._ensure_schema()
 
     @classmethod
     def resolve_package_path(cls, start_path: str | Path | None = None, package_path: str | Path | None = None) -> Path:
@@ -516,7 +519,7 @@ class TushareCacheBackend:
             f"ON CONFLICT({conflict_columns}) {update_sql}"
         )
         rows = [tuple(row) for row in frame[columns].itertuples(index=False, name=None)]
-        with self._connect() as conn:
+        with self._write_connect() as conn:
             if api_name in {"income", "forecast"}:
                 self._append_financial_revisions(conn, api_name, data)
             if api_name in {"stock_st", "stk_limit"}:
@@ -529,6 +532,8 @@ class TushareCacheBackend:
         return len(rows)
 
     def update_data(self, api_name: str, start_date: str | None = None, end_date: str | None = None, **params) -> int:
+        if self.read_only:
+            raise ValueError("Simulation workers cannot update the market-data cache")
         if self.cache_mode == "strict_local" and not self.token:
             raise ValueError("update_data requires TUSHARE_TOKEN or token even when backtest reads are strict_local")
 
@@ -693,7 +698,7 @@ class TushareCacheBackend:
         frame = self._normalize_frame(api_name, frame, spec)
         columns = list(frame.columns)
         rows = list(frame.where(pd.notna(frame), None).itertuples(index=False, name=None))
-        with self._connect() as conn:
+        with self._write_connect() as conn:
             # Replace exactly one completed snapshot atomically, retaining other days.
             conn.execute(f"DELETE FROM {spec.table} WHERE trade_date=?", (day,))
             conn.executemany(
@@ -826,7 +831,7 @@ class TushareCacheBackend:
     def _ensure_schema(self) -> None:
         db_path = Path(self.cache_db)
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
+        with self._write_connect() as conn:
             for spec in _API_SPECS.values():
                 conn.execute(self._create_table_sql(spec))
                 if spec.date_column:
@@ -1157,11 +1162,23 @@ class TushareCacheBackend:
 
     @contextmanager
     def _connect(self):
-        conn = sqlite3.connect(self.cache_db)
+        if self.read_only:
+            conn = sqlite3.connect(Path(self.cache_db).resolve().as_uri() + "?mode=ro", uri=True)
+            conn.execute("PRAGMA query_only=ON")
+        else:
+            conn = sqlite3.connect(self.cache_db)
         try:
             yield conn
         finally:
             conn.close()
+
+    @contextmanager
+    def _write_connect(self):
+        if self.read_only:
+            raise ValueError("Simulation workers cannot modify the market-data cache")
+        with cache_write_lock(self.cache_db):
+            with self._connect() as conn:
+                yield conn
 
     def _spec(self, api_name: str) -> ApiSpec:
         try:

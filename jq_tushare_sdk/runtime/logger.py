@@ -1,4 +1,5 @@
 import re
+import os
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +24,20 @@ def _redact_sensitive_text(value) -> str:
         text,
     )
     return _CREDENTIAL_URL.sub(r"\1******\3", text)
+
+
+def redact_sensitive_text(value) -> str:
+    """Public credential redaction for dependent applications."""
+    return _redact_sensitive_text(value)
+
+
+def redact_runtime_text(value) -> str:
+    """Also remove credential values present in the current environment."""
+    text = redact_sensitive_text(value)
+    for key, secret in os.environ.items():
+        if len(secret) >= 6 and re.search(r"token|password|passwd|secret|api.?key|authorization", key, re.I):
+            text = text.replace(secret, "******")
+    return text
 
 
 class RuntimeLogger:
