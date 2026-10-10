@@ -81,6 +81,7 @@ class BacktestRequest:
     cache_db: str | None = None
     output_dir: str | None = None
     optimize_data: bool = True
+    financial_mode: str = "cached_snapshot"
 
     @classmethod
     def from_payload(cls, payload: dict) -> "BacktestRequest":
@@ -92,6 +93,7 @@ class BacktestRequest:
             cache_db=_optional_text(payload.get("cache_db")),
             output_dir=_optional_text(payload.get("output_dir")),
             optimize_data=bool(payload.get("optimize_data", True)),
+            financial_mode=str(payload.get("financial_mode", "cached_snapshot")),
         )
 
 
@@ -213,6 +215,7 @@ class BacktestJobManager:
             "cache_db": config.cache_db,
             "output_dir": config.output_dir,
             "optimize_data": config.optimize_data,
+            "financial_mode": config.financial_mode,
             "run_id": None,
             "run_dir": None,
             "report_path": None,
@@ -596,6 +599,7 @@ class BacktestJobManager:
             cache_db=str(cache_db),
             output_dir=str(output_dir),
             optimize_data=bool(request.optimize_data),
+            financial_mode=request.financial_mode,
             **strategy_file_metadata(self.project_root, strategy_path),
         )
 
@@ -932,7 +936,7 @@ def _handler_factory(
                         manager._config_from_request(request),
                     )
                     blocking = [issue for issue in issues if not issue.get("advisory")]
-                    self._write_json({"ok": not blocking, "issues": issues})
+                    self._write_json({"ok": not blocking, "issues": issues, "financial_mode": request.financial_mode})
                 elif parsed.path == "/api/refresh-report":
                     self._write_json(_refresh_report_request(run_store, cache_db, payload))
                 else:
@@ -1009,6 +1013,7 @@ def _run_local_backtest(
         config.cache_db,
         token=os.environ.get("TUSHARE_TOKEN"),
         cache_mode="strict_local",
+        financial_mode=config.financial_mode,
     )
     def report(percent: float, stage: str, detail: str | None = None) -> None:
         if progress_callback is not None:
@@ -1022,6 +1027,8 @@ def _run_local_backtest(
         for issue in advisory:
             report(4, "数据提示", issue.message)
         if blocking:
+            if any(issue.api_name == "financial_vintages" for issue in blocking):
+                raise RuntimeError(_format_readiness_error(config, blocking, "Strict PIT financial history is not ready:"))
             from jq_tushare_sdk.data.readiness import update_missing_data
 
             try:
@@ -1083,6 +1090,7 @@ def _readiness_issues(config: BacktestConfig, *, backend=None):
             config.cache_db,
             token=os.environ.get("TUSHARE_TOKEN"),
             cache_mode="strict_local",
+            financial_mode=config.financial_mode,
         )
         try:
             return DataReadinessCheck(backend).check_required(config, _REQUIRED_LOCAL_APIS)
@@ -1197,6 +1205,17 @@ def _read_text_tail(path: Path, *, max_chars: int = 4000) -> str:
     return path.read_text(encoding="utf-8", errors="replace")[-max_chars:].strip()
 
 
+def _financial_mode_select_html() -> str:
+    return """<label>
+          <span>财务数据模式</span>
+          <select id="financial-mode" name="financial_mode">
+            <option value="cached_snapshot" selected>原始快照</option>
+            <option value="research_reconstructed">研究重构（非原生复现）</option>
+            <option value="strict_pit">严格历史（需历史版本）</option>
+          </select>
+        </label>"""
+
+
 def _render_app_html(project_root: Path, cache_db: Path, output_dir: Path) -> str:
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -1257,6 +1276,7 @@ def _render_app_html(project_root: Path, cache_db: Path, output_dir: Path) -> st
           <input id="optimize-data" name="optimize_data" type="checkbox" checked>
           <span>启用数据层批量优化</span>
         </label>
+        {_financial_mode_select_html()}
         <div class="action-row">
           <button type="submit" class="primary">运行回测</button>
           <button type="button" id="check-data" class="secondary">检查数据</button>
@@ -1565,6 +1585,7 @@ function requestPayload() {
     cache_db: $('cache-db').value,
     output_dir: $('output-dir').value,
     optimize_data: $('optimize-data').checked,
+    financial_mode: $('financial-mode').value,
   };
 }
 
@@ -1814,6 +1835,7 @@ def _render_app_html(project_root: Path, cache_db: Path, output_dir: Path) -> st
       <div id="settings-panel" class="settings-panel" hidden>
         <label><span>缓存数据库</span><input id="cache-db" name="cache_db" type="text" value="{escape(str(cache_db))}" required></label>
         <label><span>结果目录</span><input id="output-dir" name="output_dir" type="text" value="{escape(str(output_dir))}" required></label>
+        {_financial_mode_select_html()}
         <label class="switch-row"><input id="optimize-data" name="optimize_data" type="checkbox" checked><span>启用数据层批量优化</span></label>
         <div class="settings-actions">
           <button type="button" id="check-data" class="secondary">检查数据</button>
@@ -1982,7 +2004,7 @@ h2 { font-size: 18px; }
 }
 label { display: grid; gap: 5px; color: var(--muted); }
 label span { font-weight: 700; font-size: 12px; }
-input {
+input, select {
   width: 100%;
   height: 36px;
   border: 1px solid #ccd7e3;
@@ -2146,7 +2168,7 @@ input {
 .settings-panel {
   margin-top: 8px;
   display: grid;
-  grid-template-columns: minmax(240px, 1fr) minmax(220px, 1fr) auto auto minmax(220px, 1.2fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
   align-items: end;
   padding: 10px;
@@ -2413,6 +2435,7 @@ function requestPayload() {
     cache_db: $('cache-db').value,
     output_dir: $('output-dir').value,
     optimize_data: $('optimize-data').checked,
+    financial_mode: $('financial-mode').value,
   };
 }
 

@@ -1,3 +1,21 @@
+## [0.10.35] - 2026-10-10
+
+- Add explicit research data contracts, signed-PE/PB missing-value provenance, and announcement cutoffs for research quarterly queries.
+- Certify complete forecast publication windows, including verified empty days, and reject missing data before loading declared strategies.
+- Keep native forecast schema and strict historical-vintage limitations explicit; research operation does not imply JoinQuant reproduction.
+- Export the finance API to the actual strategy namespace and expose financial-mode selection in Web settings.
+- Allow large scalar stock pools during runtime inspection while preserving Redis isolation and bounded container/reference/depth checks.
+- Read A-share corporate actions from unified caches and yearly shards, deduplicate events, use gross cash dividends and total stock-distribution ratios, and preserve record-date entitlements and FIFO tax cohorts. Persist an auditable corporate-action ledger. Held deferred, fractional, or uncertified taxable-bonus events fail explicitly; the cash-dividend tax model remains a disclosed research assumption.
+
+## [0.10.34] — fundamentals and execution consistency
+
+- Separate fundamentals request date, report period and replay visibility; reject future EOD reads and date+statDate ambiguity.
+- Intersect required tables, propagate empty table schemas, distinguish annual cumulative and single-quarter income.
+- Map PE to TTM and preserve missing values; add explicit financial modes, append-only revision storage, signed TTM diagnostics and native forecast capability reporting.
+- Recognize 302 stocks with exchange/lifecycle checks; keep stale valuation identity and report unavailable values.
+- Apply JoinQuant engine slippage, STAR quantity increments and dated stock T+1 settlement; return native dates and schedule against the complete exchange calendar.
+- Historical cache migration cannot recover lost report revisions. Native STK_FIN_FORCAST remains unsupported until its schema is verified.
+
 # Changelog
 
 All notable changes to JQ Tushare SDK are documented in this file.

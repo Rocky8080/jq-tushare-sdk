@@ -435,6 +435,8 @@ def _is_inert_redis_client(value) -> bool:
 
 class BacktestRuntimeSafety:
     _MAX_WALK_OBJECTS = 2048
+    _MAX_WALK_EDGES = 131072
+    _MAX_WALK_DEPTH = 256
 
     def __init__(self, state, strategy_path: str | Path, loaded_run_type: str = "backtest"):
         self.state = state
@@ -530,6 +532,21 @@ class BacktestRuntimeSafety:
             "Backtest runtime safety walk budget exceeded while inspecting "
             f"{root_location} at {current_location} after {self._MAX_WALK_OBJECTS} objects"
         )
+
+    def _raise_scan_budget_exceeded(self, root_location, current_location, kind, limit):
+        raise RuntimeError(
+            f"Backtest runtime safety walk budget exceeded ({kind} limit {limit}) "
+            f"while inspecting {root_location} at {current_location}"
+        )
+
+    @staticmethod
+    def _is_atomic_runtime_value(value):
+        # Exact built-in scalar types cannot retain a hidden Redis wrapper.
+        # Subclasses may have __dict__ / custom state and must still be scanned.
+        value_type = type(value)
+        return (value_type is str or value_type is int or value_type is float
+                or value_type is bool or value_type is bytes or value_type is complex
+                or value_type is type(None))
 
     def _patch_wrapper_class(self, wrapper_cls: type):
         if getattr(wrapper_cls, "__jqts_backtest_safe__", False):
@@ -642,69 +659,79 @@ class BacktestRuntimeSafety:
 
     def _discover_wrapper_classes(self, root, location: str):
         discovered: list[tuple[type, str]] = []
-        visited: set[int] = set()
-        nodes_seen = 0
 
-        def _walk(value, current_location: str):
-            nonlocal nodes_seen
-            if value is None:
-                return
-            value_id = id(value)
-            if value_id in visited:
-                return
-            visited.add(value_id)
-            nodes_seen += 1
-            if nodes_seen > self._MAX_WALK_OBJECTS:
-                self._raise_walk_budget_exceeded(location, current_location)
+        def _discover(value, current_location):
             if self._is_wrapper_class(value):
                 discovered.append((value, current_location))
-                return
-            for child, child_location in self._iter_nested_objects(value, current_location):
-                _walk(child, child_location)
+                return True
+            return False
 
-        _walk(root, location)
+        self._scan_runtime_graph(root, location, _discover)
         return discovered
 
     def _walk_runtime_object(self, root, location: str):
+        def _sanitize(value, current_location):
+            if self._looks_like_wrapper_instance(value):
+                self._sanitize_wrapper_instance(value, current_location)
+                return True
+            return False
+
+        self._scan_runtime_graph(root, location, _sanitize)
+
+    def _scan_runtime_graph(self, root, location, visitor):
         visited: set[int] = set()
         nodes_seen = 0
+        edges_seen = 0
 
-        def _walk(value, current_location: str):
-            nonlocal nodes_seen
-            if value is None:
+        def _walk(value, current_location, depth):
+            nonlocal nodes_seen, edges_seen
+            # Count every reference, including repeated identities and atoms:
+            # exempting pure-data leaves must not allow unbounded flat scans.
+            edges_seen += 1
+            if edges_seen > self._MAX_WALK_EDGES:
+                self._raise_scan_budget_exceeded(location, current_location, 'references', self._MAX_WALK_EDGES)
+            if self._is_atomic_runtime_value(value):
                 return
             value_id = id(value)
             if value_id in visited:
                 return
+            if depth > self._MAX_WALK_DEPTH:
+                self._raise_scan_budget_exceeded(location, current_location, 'depth', self._MAX_WALK_DEPTH)
             visited.add(value_id)
             nodes_seen += 1
             if nodes_seen > self._MAX_WALK_OBJECTS:
                 self._raise_walk_budget_exceeded(location, current_location)
-            if self._looks_like_wrapper_instance(value):
-                self._sanitize_wrapper_instance(value, current_location)
+            if visitor(value, current_location):
                 return
             for child, child_location in self._iter_nested_objects(value, current_location):
-                _walk(child, child_location)
+                _walk(child, child_location, depth + 1)
 
-        _walk(root, location)
+        _walk(root, location, 0)
 
     def _iter_nested_objects(self, value, location: str):
         if isinstance(value, dict):
+            # Bound the temporary item snapshot before allocating it.
+            if len(value) > self._MAX_WALK_EDGES:
+                self._raise_scan_budget_exceeded(location, location, 'references', self._MAX_WALK_EDGES)
             for key, child in list(value.items()):
                 if self.module is not None and value is self.module.__dict__ and str(key).startswith("__"):
                     continue
+                yield key, f"{location}.<key>"
                 yield child, f"{location}[{key!r}]"
-            return
+            if type(value) is dict:
+                return
 
         if isinstance(value, (list, tuple)):
             for index, child in enumerate(value):
                 yield child, f"{location}[{index}]"
-            return
+            if type(value) is list or type(value) is tuple:
+                return
 
         if isinstance(value, (set, frozenset)):
             for index, child in enumerate(value):
                 yield child, f"{location}{{{index}}}"
-            return
+            if type(value) is set or type(value) is frozenset:
+                return
 
         if inspect.isfunction(value):
             if getattr(value, "__jqts_backtest_target_capture__", False):

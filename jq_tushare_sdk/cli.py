@@ -153,11 +153,13 @@ def main(argv=None):
         cache_db=args.cache_db,
         output_dir=args.output_dir,
         optimize_data=getattr(args, "optimize_data", True),
+        financial_mode=args.financial_mode,
     )
     backend = TushareCacheBackend(
         args.cache_db,
         token=os.environ.get("TUSHARE_TOKEN"),
         cache_mode="strict_local",
+        financial_mode=args.financial_mode,
     )
 
     try:
@@ -182,6 +184,8 @@ def _add_shared_args(parser):
     _add_cache_args(parser)
     parser.add_argument("--cash", type=float, default=1000000.0)
     parser.add_argument("--output-dir", default="backtest_runs")
+    parser.add_argument("--financial-mode", default="cached_snapshot",
+                        choices=("cached_snapshot", "research_reconstructed", "strict_pit"))
 
 
 def _add_cache_args(parser):
@@ -206,6 +210,10 @@ def _ensure_local_readiness(config, backend):
     _print_advisory_issues(issues)
     if not blocking:
         return []
+
+    if any(issue.api_name == "financial_vintages" for issue in blocking):
+        _print_readiness_issues(config, blocking)
+        return blocking
 
     print("Local cache is incomplete; attempting automatic Tushare data update...")
     try:

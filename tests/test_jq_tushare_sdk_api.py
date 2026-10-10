@@ -26,7 +26,9 @@ from jq_tushare_sdk.api.jqdata import (
 )
 from jq_tushare_sdk.api.query import query
 from jq_tushare_sdk.data.portal import DataPortal
-from jq_tushare_sdk.runtime.context import Context, Portfolio
+from jq_tushare_sdk.data.fundamentals_contract import FundamentalsUnavailableError
+from jq_tushare_sdk.data.security_state import HistoricalSecurityStateError
+from jq_tushare_sdk.runtime.context import Context, Portfolio, Position
 from jq_tushare_sdk.runtime.globals_state import RuntimeState
 
 
@@ -131,6 +133,27 @@ class APIPortalBackend:
                 ]
             ),
         }
+        # Complete, synthetic provider snapshots used only by API tests. An
+        # unrelated ST member keeps the complete ST table nonempty while the
+        # two order-test stocks are explicitly non-ST on their dated names.
+        days = ["20240102", "20240103", "20240104", "20240105"]
+        self.frames["stock_st"] = pd.DataFrame([
+            {"ts_code": "000999.SZ", "trade_date": day, "name": "*ST测试样本"}
+            for day in days
+        ])
+        self.frames["stk_limit"] = pd.DataFrame([
+            {"ts_code": code, "trade_date": day, "up_limit": high, "down_limit": low}
+            for day in days
+            for code, high, low in (("000001.SZ", 11.55, 9.45), ("600000.SH", 22.0, 18.0), ("000999.SZ", 10.5, 9.5))
+        ])
+        self.frames["security_state_coverage"] = pd.DataFrame([
+            {"api_name": api, "trade_date": day, "row_count": count}
+            for day in days for api, count in (("stock_st", 1), ("stk_limit", 3))
+        ])
+        self.frames["namechange"] = pd.DataFrame([
+            {"ts_code": code, "name": name, "start_date": "19900101", "end_date": ""}
+            for code, name in (("000001.SZ", "平安银行"), ("600000.SH", "浦发银行"), ("000999.SZ", "*ST测试样本"))
+        ])
 
     def fetch(self, api_name, **params):
         df = self.frames.get(api_name, pd.DataFrame()).copy()
@@ -223,7 +246,7 @@ class TestJoinQuantAPI(unittest.TestCase):
         self.assertEqual(df["code"].tolist(), ["000001.XSHE"])
         self.assertEqual(df["market_cap"].tolist(), [50.0])
 
-    def test_get_fundamentals_defaults_date_to_visible_data_date_at_open(self):
+    def test_get_fundamentals_statdate_does_not_implicitly_mix_date(self):
         class RecordingPortal(FakePortal):
             def __init__(self):
                 self.calls = []
@@ -242,7 +265,7 @@ class TestJoinQuantAPI(unittest.TestCase):
 
         get_fundamentals(query(valuation.code), statDate="2023q4")
 
-        self.assertEqual(str(portal.calls[0]["date"])[:10], "2024-01-02")
+        self.assertIsNone(portal.calls[0]["date"])
         self.assertEqual(portal.calls[0]["statDate"], "2023q4")
 
     def test_get_price_real_portal_drops_compat_noop_kwargs(self):
@@ -424,7 +447,7 @@ class TestJoinQuantAPI(unittest.TestCase):
         self.assertEqual(future_df["time"].tolist(), ["2024-01-03"])
         self.assertEqual(future_df["close"].tolist(), [10.6])
 
-    def test_get_fundamentals_at_open_clamps_context_date_to_previous_trade_day(self):
+    def test_get_fundamentals_at_open_rejects_unavailable_explicit_eod(self):
         set_runtime_state(
             RuntimeState(
                 data_portal=DataPortal(APIPortalBackend()),
@@ -432,14 +455,12 @@ class TestJoinQuantAPI(unittest.TestCase):
             )
         )
 
-        df = get_fundamentals(
-            query(valuation.code, valuation.market_cap, valuation.turnover_ratio),
-            date=pd.Timestamp("2024-01-03 09:30:00"),
-        )
-
-        self.assertEqual(df["code"].tolist(), ["000001.XSHE"])
-        self.assertEqual(df["market_cap"].tolist(), [0.0045])
-        self.assertEqual(df["turnover_ratio"].tolist(), [1.2])
+        with self.assertRaises(FundamentalsUnavailableError) as caught:
+            get_fundamentals(
+                query(valuation.code, valuation.market_cap, valuation.turnover_ratio),
+                date=pd.Timestamp("2024-01-03 09:30:00"),
+            )
+        self.assertEqual(caught.exception.reason, "daily_snapshot_not_yet_available")
 
     def test_get_current_data_at_open_exposes_current_day_open(self):
         set_runtime_state(
@@ -455,6 +476,20 @@ class TestJoinQuantAPI(unittest.TestCase):
         self.assertEqual(current["000001.XSHE"].day_open, 10.6)
         self.assertEqual(current["000001.XSHE"].high_limit, 11.55)
         self.assertEqual(current["000001.XSHE"].low_limit, 9.45)
+
+    def test_get_current_data_rejects_missing_history_coverage(self):
+        backend = APIPortalBackend()
+        backend.frames["security_state_coverage"] = pd.DataFrame()
+        set_runtime_state(RuntimeState(data_portal=DataPortal(backend), context=SimpleNamespace(current_dt=datetime(2024, 1, 3, 9, 30))))
+        with self.assertRaises(HistoricalSecurityStateError):
+            get_current_data(["000001.XSHE"])
+
+    def test_get_current_data_rejects_incomplete_official_limits(self):
+        backend = APIPortalBackend()
+        backend.frames["stk_limit"] = backend.frames["stk_limit"].query("ts_code != '000001.SZ'")
+        set_runtime_state(RuntimeState(data_portal=DataPortal(backend), context=SimpleNamespace(current_dt=datetime(2024, 1, 3, 9, 30))))
+        with self.assertRaises(HistoricalSecurityStateError):
+            get_current_data(["000001.XSHE"])
 
     def test_attribute_history_real_portal_supports_default_compat_kwargs(self):
         set_runtime_state(
@@ -563,6 +598,7 @@ class TestJoinQuantAPI(unittest.TestCase):
     def test_set_order_cost_updates_broker_fees_for_later_orders(self):
         exports = exported_globals()
         context = Context(Portfolio(100000.0), current_dt=datetime(2024, 1, 3, 9, 30))
+        context.portfolio.positions["000001.XSHE"] = Position("000001.XSHE", total_amount=100, closeable_amount=100, avg_cost=10.6, price=10.6)
         broker = Broker(context, DataPortal(APIPortalBackend()), CostModel())
         set_runtime_state(
             RuntimeState(
@@ -643,11 +679,12 @@ class TestJoinQuantAPI(unittest.TestCase):
         exports["set_slippage"](exports["PriceRelatedSlippage"](0.02))
         order = broker.order("000001.XSHE", 100)
 
-        self.assertAlmostEqual(order.price, 10.81)
+        self.assertAlmostEqual(order.price, 10.71)
 
     def test_set_slippage_supports_fixed_style(self):
         exports = exported_globals()
         context = Context(Portfolio(100000.0), current_dt=datetime(2024, 1, 3, 9, 30))
+        context.portfolio.positions["000001.XSHE"] = Position("000001.XSHE", total_amount=100, closeable_amount=100, avg_cost=10.6, price=10.6)
         broker = Broker(context, DataPortal(APIPortalBackend()), CostModel())
         set_runtime_state(
             RuntimeState(

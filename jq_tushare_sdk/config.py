@@ -23,6 +23,12 @@ class BacktestConfig:
     benchmark: str = "399006.XSHE"
     cache_mode: str = "strict_local"
     optimize_data: bool = True
+    financial_mode: str = "cached_snapshot"
+    financial_provenance: Optional[dict] = None
+
+    def __post_init__(self):
+        if self.financial_mode not in {"cached_snapshot", "research_reconstructed", "strict_pit"}:
+            raise ValueError(f"Unsupported financial_mode: {self.financial_mode}")
 
     def to_json_dict(self) -> dict:
         payload = asdict(self)

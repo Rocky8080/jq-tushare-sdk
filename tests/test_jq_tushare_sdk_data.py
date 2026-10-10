@@ -191,6 +191,30 @@ class FakeBackend:
             ),
         }
 
+        # Complete synthetic historical state is explicit fixture data. Current
+        # stock_basic names and calculated limits are not historical evidence.
+        self.frames.update({
+            "stock_st": pd.DataFrame([
+                {"ts_code": "000002.SZ", "trade_date": day, "name": "*ST示例", "type": "ST"}
+                for day in ("20240102", "20240103")
+            ]),
+            "stk_limit": pd.DataFrame([
+                {"ts_code": code, "trade_date": day, "up_limit": high, "down_limit": low}
+                for day in ("20240102", "20240103")
+                for code, high, low in (("000001.SZ", 11.55, 9.45), ("600000.SH", 22.44, 18.36), ("000002.SZ", 8.40, 7.60))
+            ]),
+            "security_state_coverage": pd.DataFrame([
+                {"api_name": api, "trade_date": day, "row_count": count}
+                for day in ("20240102", "20240103")
+                for api, count in (("stock_st", 1), ("stk_limit", 3))
+            ]),
+            "namechange": pd.DataFrame([
+                {"ts_code": "000001.SZ", "name": "平安银行", "start_date": "20120101", "end_date": None},
+                {"ts_code": "600000.SH", "name": "浦发银行", "start_date": "19991110", "end_date": None},
+                {"ts_code": "000002.SZ", "name": "*ST示例", "start_date": "20240102", "end_date": None},
+            ]),
+        })
+
     def fetch(self, api_name, **params):
         self.calls.append((api_name, params))
         df = self.frames.get(api_name, pd.DataFrame()).copy()
@@ -659,22 +683,22 @@ class TestDataLayer(unittest.TestCase):
         first = portal.get_trade_days(end_date="2024-01-04", count=2)
         second = portal.get_trade_days(end_date="2024-01-04", count=2)
 
-        self.assertEqual(first, ["2024-01-03", "2024-01-04"])
-        self.assertEqual(second, first)
+        self.assertEqual(first.tolist(), [date(2024, 1, 3), date(2024, 1, 4)])
+        self.assertEqual(second.tolist(), first.tolist())
         self.assertEqual(backend.fetch_counts["trade_cal"], 1)
 
     def test_get_trade_days_filters_open_days(self):
         portal = DataPortal(FakeBackend())
         self.assertEqual(
-            portal.get_trade_days("2024-01-01", "2024-01-03"),
-            ["2024-01-02", "2024-01-03"],
+            portal.get_trade_days("2024-01-01", "2024-01-03").tolist(),
+            [date(2024, 1, 2), date(2024, 1, 3)],
         )
 
     def test_get_trade_days_supports_end_date_count_and_strftime(self):
         portal = DataPortal(FakeBackend())
         trade_days = portal.get_trade_days(end_date="2024-01-04", count=2)
 
-        self.assertEqual(trade_days, ["2024-01-03", "2024-01-04"])
+        self.assertEqual(trade_days.tolist(), [date(2024, 1, 3), date(2024, 1, 4)])
         self.assertEqual(trade_days[0].strftime("%Y-%m-%d"), "2024-01-03")
         self.assertEqual(trade_days[1].strftime("%Y-%m-%d"), "2024-01-04")
 
@@ -1138,7 +1162,7 @@ class TestDataLayer(unittest.TestCase):
 
         self.assertEqual(backend.fetch_counts["daily_basic"], 1)
 
-    def test_get_fundamentals_uses_latest_valuation_on_or_before_non_trading_date(self):
+    def test_get_fundamentals_invalidates_old_valuation_when_open_day_snapshot_missing(self):
         from jq_tushare_sdk.api.finance_tables import valuation
         from jq_tushare_sdk.api.query import query
 
@@ -1149,7 +1173,9 @@ class TestDataLayer(unittest.TestCase):
             date="2024-01-04",
         )
 
-        self.assertEqual(df.to_dict("records"), [{"code": "000001.XSHE", "market_cap": 50.0}, {"code": "600000.XSHG", "market_cap": 90.0}])
+        # Fixture calendar marks Jan 4 open; Jan 3 quotes cannot stand in for Jan 4.
+        self.assertEqual(df["code"].tolist(), ["000001.XSHE", "600000.XSHG"])
+        self.assertTrue(df["market_cap"].isna().all())
 
     def test_get_fundamentals_excludes_non_a_share_valuation_rows(self):
         from jq_tushare_sdk.api.finance_tables import valuation
@@ -1197,11 +1223,14 @@ class TestDataLayer(unittest.TestCase):
         )
         portal = DataPortal(backend)
 
-        df = portal.get_fundamentals(query(valuation.code, valuation.pe_ratio), date="2024-01-03")
+        df = portal.get_fundamentals(
+            query(valuation.code, valuation.pe_ratio).filter(valuation.code == "000001.XSHE"),
+            date="2024-01-03",
+        )
 
         self.assertEqual(df["pe_ratio"].tolist(), [18.5])
 
-    def test_get_fundamentals_defaults_missing_pe_ratio_to_zero_for_joinquant_compatibility(self):
+    def test_get_fundamentals_preserves_missing_ttm_pe_without_false_zero(self):
         from jq_tushare_sdk.api.finance_tables import valuation
         from jq_tushare_sdk.api.query import query
 
@@ -1221,9 +1250,13 @@ class TestDataLayer(unittest.TestCase):
         )
         portal = DataPortal(backend)
 
-        df = portal.get_fundamentals(query(valuation.code, valuation.pe_ratio), date="2024-01-03")
+        df = portal.get_fundamentals(
+            query(valuation.code, valuation.pe_ratio).filter(valuation.code == "300825.XSHE"),
+            date="2024-01-03",
+        )
 
-        self.assertEqual(df.to_dict("records"), [{"code": "300825.XSHE", "pe_ratio": 0.0}])
+        self.assertEqual(df["code"].tolist(), ["300825.XSHE"])
+        self.assertTrue(pd.isna(df.iloc[0]["pe_ratio"]))
 
     def test_get_fundamentals_converts_income_cumulative_period_to_single_quarter(self):
         from jq_tushare_sdk.api.finance_tables import income
@@ -1259,7 +1292,7 @@ class TestDataLayer(unittest.TestCase):
         self.assertEqual(df["total_operating_revenue"].tolist(), [160.0])
         self.assertEqual(df["np_parent_company_owners"].tolist(), [25.0])
 
-    def test_get_fundamentals_returns_empty_when_requested_income_period_is_not_announced(self):
+    def test_income_period_asof_helper_returns_empty_before_announcement(self):
         from jq_tushare_sdk.api.finance_tables import income
         from jq_tushare_sdk.api.query import query
 
@@ -1306,19 +1339,12 @@ class TestDataLayer(unittest.TestCase):
         )
         portal = DataPortal(backend)
 
-        df = portal.get_fundamentals(
-            query(income.code, income.total_operating_revenue, income.np_parent_company_owners),
-            date="2026-01-05",
-            statDate="2025q4",
-        )
-
-        self.assertEqual(
-            df.columns.tolist(),
-            ["code", "total_operating_revenue", "np_parent_company_owners"],
-        )
+        # as_of is an independent PIT clock, not the public date+statDate pair.
+        df, period = portal._income_frame_for_stat_date("2025q4", "2026-01-05")
+        self.assertEqual(period, "20251231")
         self.assertTrue(df.empty)
 
-    def test_get_fundamentals_uses_requested_income_period_after_announcement(self):
+    def test_get_fundamentals_research_statdate_reads_requested_period(self):
         from jq_tushare_sdk.api.finance_tables import income
         from jq_tushare_sdk.api.query import query
 
@@ -1349,13 +1375,13 @@ class TestDataLayer(unittest.TestCase):
 
         df = portal.get_fundamentals(
             query(income.code, income.total_operating_revenue, income.np_parent_company_owners),
-            date="2026-01-20",
             statDate="2025q4",
         )
 
         self.assertEqual(df["code"].tolist(), ["000001.XSHE"])
         self.assertEqual(df["total_operating_revenue"].tolist(), [170.0])
         self.assertEqual(df["np_parent_company_owners"].tolist(), [25.0])
+        self.assertEqual(df.attrs["fundamentals_audit"]["financial_query"], "retrospective_report_period")
 
     def test_get_fundamentals_applies_filters_ordering_and_field_projection(self):
         from jq_tushare_sdk.api.finance_tables import valuation
@@ -1385,7 +1411,6 @@ class TestDataLayer(unittest.TestCase):
             query(valuation.code, income.total_operating_revenue, income.np_parent_company_owners)
             .filter(income.np_parent_company_owners > -1e7),
             date="2024-01-03",
-            statDate="2024q1",
         )
 
         self.assertEqual(
@@ -1398,7 +1423,9 @@ class TestDataLayer(unittest.TestCase):
         from jq_tushare_sdk.api.finance_tables import valuation
         from jq_tushare_sdk.api.query import query
 
-        portal = DataPortal(FakeBackend())
+        backend = FakeBackend()
+        backend.frames["trade_cal"] = pd.concat([backend.frames["trade_cal"], pd.DataFrame([{"cal_date": "20240105", "is_open": 1}])], ignore_index=True)
+        portal = DataPortal(backend)
 
         result = portal.get_fundamentals_continuously(
             query(valuation.code, valuation.turnover_ratio).filter(

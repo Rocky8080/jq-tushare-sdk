@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import sqlite3
 import threading
 import time
@@ -15,6 +16,7 @@ import pandas as pd
 from jq_tushare_sdk.data.code_map import normalize_date
 from jq_tushare_sdk.data.income_periods import income_period_end
 from jq_tushare_sdk.data.income_periods import required_income_periods
+from jq_tushare_sdk.data.financial_provenance import (asof_timestamp, normalized_payload, capture_timestamp)
 
 
 DEFAULT_PACKAGE_ENV = "JQ_TUSHARE_SDK_TUSHARE_PACKAGE"
@@ -214,6 +216,16 @@ _API_SPECS: dict[str, ApiSpec] = {
         date_column="trade_date",
         columns=("index_code", "con_code", "trade_date", "weight"),
     ),
+    "forecast": ApiSpec(
+        table="earnings_forecast",
+        primary_keys=("ts_code", "ann_date", "end_date", "type"),
+        date_column="ann_date",
+        columns=("ts_code", "ann_date", "end_date", "type", "p_change_min", "p_change_max", "net_profit_min", "net_profit_max", "last_parent_net", "first_ann_date", "summary", "change_reason"),
+    ),
+    "forecast_coverage": ApiSpec(
+        table="forecast_coverage", primary_keys=("scope", "start_date", "end_date"), date_column="end_date",
+        columns=("scope", "start_date", "end_date", "row_count", "observed_at", "source"),
+    ),
     "income": ApiSpec(
         table="income_statement",
         primary_keys=("ts_code", "end_date", "report_type"),
@@ -347,8 +359,15 @@ class TushareCacheBackend:
         cache_mode: str = "strict_local",
         package_path: str | None = None,
         request_interval: float = 0.2,
+        *,
+        strict_pit: bool = False,
+        financial_mode: str = "cached_snapshot",
     ):
         self.cache_db = str(cache_db)
+        if financial_mode not in {"cached_snapshot", "research_reconstructed", "strict_pit"}:
+            raise ValueError("financial_mode must be cached_snapshot, research_reconstructed, or strict_pit")
+        self.strict_pit = bool(strict_pit) or financial_mode == "strict_pit"
+        self.financial_mode = "strict_pit" if self.strict_pit else financial_mode
         self.token = token
         self.cache_mode = cache_mode
         self.package_path = package_path
@@ -367,6 +386,8 @@ class TushareCacheBackend:
         )
 
     def fetch(self, api_name: str, **params) -> pd.DataFrame:
+        if api_name == "financial_revision":
+            return self.financial_revisions(**params)
         spec = self._spec(api_name)
         where_sql, sql_params = self._where_clause(api_name, spec, params)
         latest_per_code = bool(params.get("latest_per_code", False))
@@ -405,6 +426,14 @@ class TushareCacheBackend:
         frame = self._read_sql(sql, sql_params)
         frame = frame.drop(columns=["_row_number"], errors="ignore")
         return self._project_fields(frame, params.get("fields"))
+
+    def daily_basic_asof(self, date) -> pd.DataFrame:
+        """Latest observed per-security snapshot, without a suspension-day cap.
+
+        Selection stays in indexed SQLite; callers receive at most one row per
+        security and must check each actual trade_date for availability.
+        """
+        return self.fetch("daily_basic", end_date=normalize_date(date), latest_per_code=True)
 
     def status(self, api_name: str) -> dict:
         spec = self._spec(api_name)
@@ -488,6 +517,8 @@ class TushareCacheBackend:
         )
         rows = [tuple(row) for row in frame[columns].itertuples(index=False, name=None)]
         with self._connect() as conn:
+            if api_name in {"income", "forecast"}:
+                self._append_financial_revisions(conn, api_name, data)
             if api_name in {"stock_st", "stk_limit"}:
                 conn.executemany(
                     "DELETE FROM security_state_coverage WHERE api_name=? AND trade_date=?",
@@ -509,6 +540,45 @@ class TushareCacheBackend:
             days = ([normalize_date(params["trade_date"])] if params.get("trade_date")
                     else self._trade_dates_for_update(start_date, end_date))
             return sum(self._update_security_day(api_name, day) for day in days)
+
+        if api_name == "forecast":
+            announcement = params.pop("ann_date", None)
+            if announcement:
+                start_date = start_date or announcement
+                end_date = end_date or announcement
+            if not start_date or not end_date:
+                raise ValueError("forecast requires explicit announcement start_date/end_date or ann_date for coverage")
+            start, end = normalize_date(start_date), normalize_date(end_date)
+            if start > end:
+                raise ValueError("forecast announcement start_date is after end_date")
+            scopes = [item.strip() for item in str(params.get("ts_code") or "").split(',') if item.strip()]
+            total = 0
+            # Official forecast endpoint requires ann_date or ts_code. A
+            # start/end pair alone is not an all-market query.
+            requests = [(start, end, self._api_params(api_name, start_date=start, end_date=end, **params))] if scopes else [
+                (day.strftime("%Y%m%d"), day.strftime("%Y%m%d"), {**params, "ann_date": day.strftime("%Y%m%d")})
+                for day in self._calendar_days(start, end)
+            ]
+            for first, last, api_params in requests:
+                data = self._security_pages(api_name, api_params)
+                if not data.empty:
+                    dates = data["ann_date"].fillna('').astype(str).str.replace('-', '', regex=False)
+                    if (~dates.between(first, last)).any():
+                        raise ValueError("forecast returned announcement rows outside requested date; coverage not established")
+                    if scopes and not set(data["ts_code"].astype(str)).issubset(set(scopes)):
+                        raise ValueError("forecast returned unrequested securities; coverage not established")
+                count = self.cache_data(api_name, data)
+                total += count
+                self.cache_data("forecast_coverage", pd.DataFrame([{
+                    "scope": scope, "start_date": first, "end_date": last, "row_count": count,
+                    "observed_at": capture_timestamp(), "source": "tushare.forecast",
+                } for scope in scopes or ['all']]))
+            if not scopes:
+                self.cache_data("forecast_coverage", pd.DataFrame([{
+                    "scope": "all", "start_date": start, "end_date": end, "row_count": total,
+                    "observed_at": capture_timestamp(), "source": "tushare.forecast",
+                }]))
+            return total
 
         if api_name == "namechange":
             # API start/end filter ANNOUNCEMENTS, not effective intervals. Fetch
@@ -774,7 +844,125 @@ class TushareCacheBackend:
                         f"CREATE INDEX IF NOT EXISTS idx_{spec.table}_trade_date_ts_code "
                         f"ON {spec.table}(trade_date, ts_code)"
                     )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_daily_basic_code_date ON daily_basic(ts_code,trade_date)")
+            conn.execute("""CREATE TABLE IF NOT EXISTS financial_revision (
+                api_name TEXT NOT NULL, ts_code TEXT NOT NULL, end_date TEXT NOT NULL,
+                report_type TEXT NOT NULL, announcement_date TEXT, observed_at TEXT NOT NULL,
+                available_at TEXT NOT NULL, source_version_id TEXT, provenance_kind TEXT NOT NULL,
+                payload_sha256 TEXT NOT NULL, payload_json TEXT NOT NULL,
+                PRIMARY KEY(api_name, ts_code, end_date, report_type, payload_sha256))""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_financial_revision_asof ON financial_revision(api_name,available_at,ts_code,end_date)")
+            conn.execute("""CREATE TRIGGER IF NOT EXISTS financial_revision_no_update
+                BEFORE UPDATE ON financial_revision BEGIN SELECT RAISE(ABORT,'financial revisions are append-only'); END""")
+            conn.execute("""CREATE TRIGGER IF NOT EXISTS financial_revision_no_delete
+                BEFORE DELETE ON financial_revision BEGIN SELECT RAISE(ABORT,'financial revisions are append-only'); END""")
+            # Evidence upgrades never rewrite an earlier captured version.
+            # Separate append-only storage safely extends older cache schemas.
+            conn.execute("""CREATE TABLE IF NOT EXISTS financial_revision_evidence (
+                api_name TEXT NOT NULL, ts_code TEXT NOT NULL, end_date TEXT NOT NULL,
+                report_type TEXT NOT NULL, announcement_date TEXT, observed_at TEXT NOT NULL,
+                available_at TEXT NOT NULL, source_version_id TEXT NOT NULL, provenance_kind TEXT NOT NULL,
+                payload_sha256 TEXT NOT NULL, payload_json TEXT NOT NULL,
+                PRIMARY KEY(api_name,ts_code,end_date,report_type,payload_sha256,source_version_id,available_at,provenance_kind))""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_financial_revision_evidence_asof ON financial_revision_evidence(api_name,available_at,ts_code,end_date)")
+            conn.execute("""CREATE TRIGGER IF NOT EXISTS financial_revision_evidence_no_update
+                BEFORE UPDATE ON financial_revision_evidence BEGIN SELECT RAISE(ABORT,'financial evidence is append-only'); END""")
+            conn.execute("""CREATE TRIGGER IF NOT EXISTS financial_revision_evidence_no_delete
+                BEFORE DELETE ON financial_revision_evidence BEGIN SELECT RAISE(ABORT,'financial evidence is append-only'); END""")
             conn.commit()
+
+    def _append_financial_revisions(self, conn, api_name, data):
+        spec = self._spec(api_name)
+        captured_at = capture_timestamp()
+        for raw in data.to_dict("records"):
+            normalized = self._normalize_frame(api_name, pd.DataFrame([raw]), spec)
+            if normalized.empty:
+                continue
+            row = normalized.iloc[0].to_dict()
+            payload, digest = normalized_payload(row)
+            announcement = row.get("f_ann_date") or row.get("ann_date")
+            if announcement is None or pd.isna(announcement) or not str(announcement).strip():
+                announcement = None
+            publication_at = asof_timestamp(str(announcement)) if announcement else captured_at
+            explicit_at = raw.get("_version_available_at")
+            explicit_verified = raw.get("_version_verified") is True and bool(raw.get("_source_version_id"))
+            if explicit_verified and explicit_at:
+                available_at = max(asof_timestamp(explicit_at), publication_at)
+                provenance = "source_version_verified"
+            else:
+                available_at = max(captured_at, publication_at)
+                provenance = "captured_revision"
+            values = (
+                api_name, str(row["ts_code"]), str(row.get("end_date") or ""),
+                str(row.get("report_type") or row.get("type") or ""), announcement,
+                captured_at, available_at, str(raw.get("_source_version_id") or ""), provenance, digest, payload)
+            columns = "api_name,ts_code,end_date,report_type,announcement_date,observed_at,available_at,source_version_id,provenance_kind,payload_sha256,payload_json"
+            inserted = conn.execute(f"INSERT OR IGNORE INTO financial_revision ({columns}) VALUES(?,?,?,?,?,?,?,?,?,?,?)", values).rowcount
+            if not inserted and provenance == "source_version_verified":
+                old = conn.execute("""SELECT source_version_id,available_at,provenance_kind FROM financial_revision
+                    WHERE api_name=? AND ts_code=? AND end_date=? AND report_type=? AND payload_sha256=?""", (*values[:4], digest)).fetchone()
+                if old != (values[7], values[6], values[8]):
+                    conn.execute(f"INSERT OR IGNORE INTO financial_revision_evidence ({columns}) VALUES(?,?,?,?,?,?,?,?,?,?,?)", values)
+
+    def financial_revisions(self, api_name="income", as_of=None, period=None, ts_code=None, **_):
+        clauses = ["api_name=?"]
+        parameters = [api_name]
+        if as_of is not None:
+            clauses.append("available_at<=?")
+            parameters.append(asof_timestamp(as_of))
+        if period is not None:
+            clauses.append("end_date=?")
+            parameters.append(self._period_to_end_date(period))
+        if ts_code is not None:
+            codes = [item.strip() for item in str(ts_code).split(',') if item.strip()]
+            clauses.append("ts_code IN (" + ','.join('?' for _ in codes) + ")")
+            parameters.extend(codes)
+        if not self._table_exists("financial_revision"):
+            result = pd.DataFrame(columns=list(self._spec(api_name).columns))
+        else:
+            with self._connect() as conn:
+                selection = "SELECT payload_json,available_at,observed_at,payload_sha256,provenance_kind FROM "
+                rows = conn.execute(selection + "financial_revision WHERE " + ' AND '.join(clauses), parameters).fetchall()
+                if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='financial_revision_evidence'").fetchone():
+                    rows.extend(conn.execute(selection + "financial_revision_evidence WHERE " + ' AND '.join(clauses), parameters).fetchall())
+            result = pd.DataFrame([{**json.loads(row[0]), "_available_at": row[1], "_observed_at": row[2], "_payload_sha256": row[3], "_provenance_kind": row[4]} for row in rows])
+            if result.empty:
+                result = pd.DataFrame(columns=list(self._spec(api_name).columns))
+        result.attrs.update(provenance_state="revisions_verified", as_of=str(as_of), source="tushare.financial_revision", historical_coverage_complete=False)
+        return result
+
+    def financial_readiness(self, as_of, api_name="income"):
+        """Readiness is independent of strict_local (which only controls network use)."""
+        if as_of is None:
+            return {'ready': False, 'reason': 'financial_asof_missing', 'legacy_cache_historical_vintages_recovered': False}
+        legacy = self.fetch(api_name)
+        revisions = self.financial_revisions(api_name=api_name, as_of=as_of)
+        key_columns = ['ts_code', 'end_date', 'report_type'] if api_name == 'income' else ['ts_code', 'end_date', 'type']
+        if legacy.empty:
+            return {'ready': False, 'reason': 'financial_source_coverage_missing', 'legacy_rows': 0, 'visible_revision_rows': len(revisions)}
+        visible_legacy = legacy.copy()
+        announcement_columns = [key for key in ('f_ann_date', 'ann_date') if key in visible_legacy]
+        unknown_announcement_keys = []
+        if announcement_columns:
+            announcements = visible_legacy[announcement_columns].fillna('').astype(str).max(axis=1).str.replace('-', '', regex=False).str[:8]
+            unknown = visible_legacy[announcements == '']
+            unknown_announcement_keys = [tuple(str(row.get(key, '')) for key in key_columns) for row in unknown.to_dict('records')]
+            visible_legacy = visible_legacy[(announcements != '') & (announcements <= asof_timestamp(as_of)[:10].replace('-', ''))]
+        else:
+            unknown_announcement_keys = [tuple(str(row.get(key, '')) for key in key_columns) for row in visible_legacy.to_dict('records')]
+        if api_name == 'income':
+            # A latest correction's future announcement cannot prove that no
+            # earlier version was published. Require every historically ended
+            # period to have a visible vintage or explicit completeness proof.
+            cutoff_day = asof_timestamp(as_of)[:10].replace('-', '')
+            periods = legacy['end_date'].fillna('').astype(str).str.replace('-', '', regex=False).str[:8]
+            visible_legacy = legacy[(periods != '') & (periods <= cutoff_day)]
+        required = {tuple(str(row.get(key, '')) for key in key_columns) for row in visible_legacy.to_dict('records')}
+        available = {tuple(str(row.get(key, '')) for key in key_columns) for row in revisions.to_dict('records')}
+        missing = sorted((required - available) | set(unknown_announcement_keys))
+        return {'ready': not missing and bool(required or len(revisions)), 'reason': 'financial_announcement_missing' if unknown_announcement_keys else 'financial_vintage_missing' if missing else 'ready' if required or len(revisions) else 'financial_source_coverage_missing',
+                'legacy_rows': len(visible_legacy), 'visible_revision_rows': len(revisions), 'unknown_announcement_key_count': len(unknown_announcement_keys), 'missing_key_count': len(missing), 'missing_keys': [list(key) for key in missing[:20]],
+                'legacy_cache_historical_vintages_recovered': False}
 
     def _table_columns(self, conn: sqlite3.Connection, table: str) -> set[str]:
         return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -782,7 +970,7 @@ class TushareCacheBackend:
     def _create_table_sql(self, spec: ApiSpec) -> str:
         column_defs = []
         for column in spec.columns:
-            if column.endswith("_date") or column.endswith("_code") or column.endswith("_name") or column in {"type", "change_reason", "ts_code", "index_code", "con_code", "security", "source_sha256", "exchange", "symbol", "name", "industry", "market", "list_status", "report_type", "comp_type", "is_hs", "area", "fullname", "enname", "cnspell", "curr_type", "delist_date", "act_name", "act_ent_type", "is_new", "src", "level"}:
+            if column.endswith("_date") or column.endswith("_code") or column.endswith("_name") or column in {"type", "change_reason", "ts_code", "index_code", "con_code", "security", "source_sha256", "scope", "observed_at", "source", "exchange", "symbol", "name", "industry", "market", "list_status", "report_type", "comp_type", "is_hs", "area", "fullname", "enname", "cnspell", "curr_type", "delist_date", "act_name", "act_ent_type", "is_new", "src", "level"}:
                 sql_type = "TEXT"
             elif column == "is_open":
                 sql_type = "INTEGER"

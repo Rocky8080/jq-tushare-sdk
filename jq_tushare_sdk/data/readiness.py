@@ -441,6 +441,17 @@ class DataReadinessCheck:
         )
 
     def _check_income(self, config, start: str, end: str) -> ReadinessIssue | None:
+        if getattr(config, "financial_mode", "cached_snapshot") == "strict_pit":
+            check = getattr(self.backend, "financial_readiness", None)
+            as_of = f"{start[:4]}-{start[4:6]}-{start[6:]} 00:00:00"
+            readiness = check(as_of) if callable(check) else {"ready": False, "reason": "financial_vintage_missing"}
+            if readiness.get("ready") is not True:
+                return ReadinessIssue(
+                    api_name="financial_vintages",
+                    message=f"Strict PIT income preflight failed at {as_of}: {readiness.get('reason', 'financial_vintage_missing')}.",
+                    suggestion="Import independently dated immutable financial versions and verify historical coverage; a current provider update cannot reconstruct overwritten vintages.",
+                    update_requests=(),
+                )
         required_periods = required_income_periods(start, end)
         status = self.backend.status("income")
         if not status.get("exists") or int(status.get("record_count", 0) or 0) == 0:

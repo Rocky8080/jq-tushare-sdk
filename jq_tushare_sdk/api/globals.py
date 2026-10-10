@@ -80,7 +80,7 @@ def exported_globals() -> dict:
         if type != "stock":
             raise NotImplementedError(f"Unsupported slippage type: {type}")
         if isinstance(slippage, PriceRelatedSlippage):
-            slippage_rate = float(slippage.rate)
+            slippage_rate = float(slippage.rate) / 2.0
             slippage_fixed = 0.0
         elif isinstance(slippage, FixedSlippage):
             slippage_rate = 0.0
@@ -132,6 +132,8 @@ def exported_globals() -> dict:
         "get_current_data": jqdata.get_current_data,
         "get_industry": jqdata.get_industry,
         "get_fundamentals": jqdata.get_fundamentals,
+        "get_data_contract": jqdata.get_data_contract,
+        "finance": jqdata.finance,
         "get_fundamentals_continuously": jqdata.get_fundamentals_continuously,
         "query": query,
         "valuation": valuation,

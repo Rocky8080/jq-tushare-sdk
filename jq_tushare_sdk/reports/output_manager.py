@@ -81,6 +81,12 @@ class OutputManager:
             "git_commit": config.git_commit,
             "benchmark": config.benchmark,
             "cache_mode": config.cache_mode,
+            "financial_mode": config.financial_mode,
+            "financial_provenance": config.financial_provenance or {"verified": False, "reason": "not_verified"},
+            # Financial input proof alone does not certify every factor,
+            # industry classification and execution input point in time.
+            "strict_pit_eligible": False,
+            "strict_pit_eligibility_reason": "end_to_end_pit_not_verified",
             "industry_provenance": industry_provenance(config.cache_db),
         }
 

@@ -18,15 +18,39 @@ from jq_tushare_sdk.data.readiness import DataUpdateRequest, ReadinessIssue
 from jq_tushare_sdk.runtime.engine import BacktestEngine
 
 
+RUN_ARTIFACTS = Path(os.environ.get('JQTS_TEST_ARTIFACT_DIR', str(Path.cwd() / 'jq_tushare_backtests/sdk_consistency_repaired_20261009/engine_unit_runs')))
+RUN_ARTIFACTS.mkdir(parents=True, exist_ok=True)
+
 class FakeBackend:
     def fetch(self, api_name, **params):
+        # Complete synthetic historical state for the engine's trading fixture.
+        # The extra ST security makes a nonempty affirmative ST snapshot while
+        # the traded bank is explicitly outside that snapshot.
+        if api_name == 'security_state_coverage':
+            return pd.DataFrame([{'api_name': 'stock_st', 'row_count': 1},
+                                 {'api_name': 'stk_limit', 'row_count': 1}])
+        if api_name == 'stock_st':
+            return pd.DataFrame([{'ts_code': '000002.SZ', 'name': '*ST Test'}])
+        if api_name == 'stk_limit':
+            return pd.DataFrame([{'ts_code': '000001.SZ', 'up_limit': 11., 'down_limit': 9.}])
+        if api_name == 'namechange':
+            return pd.DataFrame([{'ts_code': '000001.SZ', 'name': 'Ping An Bank',
+                                  'start_date': '20200101', 'end_date': ''},
+                                 {'ts_code': '000002.SZ', 'name': '*ST Test',
+                                  'start_date': '20200101', 'end_date': ''}])
         if api_name == "trade_cal":
-            return pd.DataFrame(
+            frame = pd.DataFrame(
                 [
+                    {"exchange": "SSE", "cal_date": "20231229", "is_open": 1},
                     {"exchange": "SSE", "cal_date": "20240102", "is_open": 1},
                     {"exchange": "SSE", "cal_date": "20240103", "is_open": 1},
                 ]
             )
+            if params.get('start_date'):
+                frame = frame[frame['cal_date'] >= str(params['start_date'])]
+            if params.get('end_date'):
+                frame = frame[frame['cal_date'] <= str(params['end_date'])]
+            return frame
         if api_name == "daily":
             ts_code = params.get("ts_code", "000001.SZ")
             return pd.DataFrame(
@@ -129,7 +153,7 @@ def old_open(context):
 def new_open(context):
     log.info('callback:new ready=%s', g.runtime_ready)
 """
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(dir=RUN_ARTIFACTS) as tmp:
             strategy_path = Path(tmp) / "lifecycle_strategy.py"
             strategy_path.write_text(source, encoding="utf-8")
             config = BacktestConfig(
@@ -164,7 +188,7 @@ def handle_open(context):
     order('000001.XSHE', 100)
     log.info('handled open')
 """
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(dir=RUN_ARTIFACTS) as tmp:
             strategy_path = Path(tmp) / "demo_strategy.py"
             strategy_path.write_text(source, encoding="utf-8")
             output_root = Path(tmp) / "runs"
@@ -313,7 +337,7 @@ def initialize(context):
 def handle_custom(context):
     log.info('handled custom')
 """
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(dir=RUN_ARTIFACTS) as tmp:
             config = self._write_strategy_config(tmp, source, strategy_name="custom-time")
 
             manifest = BacktestEngine(config, backend=FakeBackend()).run()
@@ -331,7 +355,7 @@ def initialize(context):
 def handle_bad(context):
     log.info('handled bad')
 """
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(dir=RUN_ARTIFACTS) as tmp:
             config = self._write_strategy_config(tmp, source, strategy_name="bad-time")
 
             with self.assertRaisesRegex(NotImplementedError, "not-a-time"):
@@ -387,6 +411,7 @@ def handle_bad(context):
             "/tmp/cache.db",
             token="placeholder",
             cache_mode="strict_local",
+            financial_mode="cached_snapshot",
         )
 
     def test_cli_backtest_reports_run_directory(self):
@@ -424,6 +449,7 @@ def handle_bad(context):
             "/tmp/cache.db",
             token="placeholder",
             cache_mode="strict_local",
+            financial_mode="cached_snapshot",
         )
         engine_cls.assert_called_once()
 
@@ -741,7 +767,7 @@ def initialize(context):
 def handle_open(context):
     order('000001.XSHE', 100)
 """
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(dir=RUN_ARTIFACTS) as tmp:
             config = self._write_strategy_config(tmp, source, strategy_name="summary-placeholder")
 
             manifest = BacktestEngine(config, backend=FakeBackend()).run()
@@ -766,7 +792,7 @@ def initialize(context):
 def handle_open(context):
     order('000001.XSHE', 100)
 """
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(dir=RUN_ARTIFACTS) as tmp:
             config = self._write_strategy_config(tmp, source, strategy_name="missing-benchmark")
 
             manifest = BacktestEngine(config, backend=FakeBackend()).run()
@@ -788,7 +814,7 @@ from jqdata import *
 def initialize(context):
     set_benchmark('000300.XSHG')
 """
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(dir=RUN_ARTIFACTS) as tmp:
             config = self._write_strategy_config(tmp, source, strategy_name="benchmark-metrics")
 
             manifest = BacktestEngine(config, backend=BenchmarkBackend()).run()
@@ -830,7 +856,7 @@ def select_stock(context):
 def check_holding_count(context):
     log.info("持仓数量检查完成")
 """
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(dir=RUN_ARTIFACTS) as tmp:
             strategy_path = Path(tmp) / "deferral_strategy.py"
             strategy_path.write_text(source, encoding="utf-8")
             config = BacktestConfig(
@@ -866,7 +892,7 @@ def housekeeping(context):
     log.info("使用上一交易日 %s 进行市值筛选", context.current_dt.date())
     log.info("本轮普通换仓顺延：正选含高开新票")
 """
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(dir=RUN_ARTIFACTS) as tmp:
             strategy_path = Path(tmp) / "housekeeping_strategy.py"
             strategy_path.write_text(source, encoding="utf-8")
             config = BacktestConfig(
@@ -896,7 +922,7 @@ def initialize(context):
 def handle_open(context):
     order('000001.XSHE', 100)
 """
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(dir=RUN_ARTIFACTS) as tmp:
             config = self._write_strategy_config(tmp, source, strategy_name="profile-report")
 
             manifest = BacktestEngine(config, backend=FakeBackend()).run()

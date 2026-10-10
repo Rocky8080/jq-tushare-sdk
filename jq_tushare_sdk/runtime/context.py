@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 
 
 @dataclass
@@ -68,5 +68,5 @@ class Portfolio:
 class Context:
     portfolio: Portfolio
     current_dt: datetime | None = None
-    previous_date: datetime | None = None
+    previous_date: date | None = None
     run_params: RunParams = field(default_factory=RunParams)

@@ -1,10 +1,12 @@
 import os
 import time
+import hashlib
 from collections import OrderedDict
 from datetime import date, datetime
 from types import SimpleNamespace
 from typing import Iterable
 
+import numpy as np
 import pandas as pd
 
 from jq_tushare_sdk.data.canonical_price_store import (
@@ -12,6 +14,7 @@ from jq_tushare_sdk.data.canonical_price_store import (
     CanonicalPriceStoreError,
 )
 from jq_tushare_sdk.data.code_map import (
+    is_tushare_a_share_code,
     is_tushare_fund_code,
     is_tushare_index_code,
     is_tushare_sw_index_code,
@@ -23,6 +26,13 @@ from jq_tushare_sdk.data.code_map import (
 from jq_tushare_sdk.data.joinquant_fields import PRICE_FIELD_MAP
 from jq_tushare_sdk.data.joinquant_industry import normalize_industry_code
 from jq_tushare_sdk.data.security_state import HistoricalSecurityState
+from jq_tushare_sdk.data.financial_provenance import FinancialVintageUnavailable, select_visible_reports, signed_ttm_by_security
+from jq_tushare_sdk.data.fundamentals_contract import (
+    FundamentalsUnavailableError,
+    previous_calendar_date,
+    validated_date,
+    validate_daily_snapshot_visibility,
+)
 
 
 class JoinQuantDateStr(str):
@@ -382,14 +392,14 @@ class DataPortal:
             raise NotImplementedError("get_trade_days requires start_date/end_date or end_date/count.")
         df = self._fetch("trade_cal", **params)
         if df.empty:
-            return []
+            return np.array([], dtype=object)
         open_df = df[df["is_open"].astype(int) == 1].copy()
         open_df = open_df.sort_values("cal_date")
         if count is not None:
             if int(count) <= 0:
-                return []
+                return np.array([], dtype=object)
             open_df = open_df.tail(int(count))
-        return [JoinQuantDateStr(joinquant_date(item)) for item in open_df["cal_date"].tolist()]
+        return np.array([date.fromisoformat(joinquant_date(item)) for item in open_df["cal_date"].tolist()], dtype=object)
 
     def get_index_stocks(self, index_symbol, date=None):
         params = {"index_code": to_tushare_code(index_symbol)}
@@ -410,9 +420,11 @@ class DataPortal:
         if df.empty:
             return pd.DataFrame()
         result = df.copy()
+        if "ts_code" in result.columns:
+            result = result[result["ts_code"].map(is_tushare_a_share_code)].copy()
         if date is not None:
             day = normalize_date(date)
-            ends = result["delist_date"].fillna("")
+            ends = result.get("delist_date", pd.Series("", index=result.index)).fillna("")
             result = result[(result["list_date"] <= day) & ((ends == "") | (ends >= day))].copy()
             historical_names = self._historical_security_state.names_on(day)
             result["name"] = [historical_names.get(code, code) for code in result["ts_code"]]
@@ -901,7 +913,51 @@ class DataPortal:
             "industry_name": name,
         }
 
-    def get_fundamentals(self, q, date=None, statDate=None):
+    def resolve_fundamentals_date(self, requested_date):
+        day = validated_date(requested_date)
+        calendar = self._fetch("trade_cal", exchange="SSE", end_date=day)
+        if calendar.empty or not {"cal_date", "is_open"}.issubset(calendar.columns):
+            raise FundamentalsUnavailableError("trade_calendar_unavailable", requested_date=day)
+        calendar = calendar.copy()
+        calendar["cal_date"] = calendar["cal_date"].map(validated_date)
+        # A stale calendar's last open day is not evidence of a holiday today.
+        if day not in set(calendar["cal_date"]):
+            raise FundamentalsUnavailableError("trade_calendar_coverage_missing", requested_date=day)
+        opened = calendar[(calendar["cal_date"] <= day) & (pd.to_numeric(calendar["is_open"], errors="coerce") == 1)]
+        if opened.empty:
+            raise FundamentalsUnavailableError("previous_trade_day_unavailable", requested_date=day)
+        return opened["cal_date"].max()
+
+    def get_fundamentals(self, q, date=None, statDate=None, *, as_of=None, requested_date=None):
+        if date is not None and statDate is not None:
+            raise ValueError("get_fundamentals date and statDate are mutually exclusive")
+        audit = {
+            "requested_date": str(requested_date if requested_date is not None else date) if (requested_date is not None or date is not None) else None,
+            "statDate": str(statDate) if statDate is not None else None,
+            "as_of": str(as_of) if as_of is not None else None,
+            "mode": "strict_point_in_time" if getattr(self.backend, "strict_pit", False) else "compatibility_retrospective",
+            "visibility_policy": "daily_snapshot_end_of_day" if as_of is not None else "research_eod_reconstruction",
+        }
+        if not hasattr(self, "fundamentals_audit"):
+            self.fundamentals_audit = []
+        try:
+            result = self._get_fundamentals_impl(q, date, statDate, as_of, audit)
+            audit["row_count"] = len(result)
+            audit["status"] = "empty_required_table" if audit.get("empty_tables") else "ok"
+            result.attrs["query_executed"] = True
+            result.attrs["fundamentals_audit"] = dict(audit)
+            if "valuation_provenance" in audit:
+                result.attrs["valuation_provenance"] = audit["valuation_provenance"]
+            return result
+        except Exception as exc:
+            audit["status"] = "unavailable"
+            audit["reason"] = getattr(exc, "reason", type(exc).__name__)
+            audit["details"] = getattr(exc, "details", {"message": str(exc)})
+            raise
+        finally:
+            self.fundamentals_audit.append(dict(audit))
+
+    def _get_fundamentals_impl(self, q, date, stat_date, as_of, audit):
         frames = []
         table_names = (
             {field.table for field in q.fields}
@@ -914,14 +970,39 @@ class DataPortal:
             raise NotImplementedError(
                 f"Fundamentals tables are not implemented locally: {names}"
             )
+        report_period = self._fundamental_report_period(stat_date) if stat_date is not None else None
+        valuation_date = None
         if "valuation" in table_names:
-            daily_basic = self._valuation_frame(date)
-            if not daily_basic.empty:
-                frames.append(daily_basic.copy())
+            request = report_period[0] if report_period else date
+            if request is None:
+                # Local research still defaults to a completed day, rather
+                # than treating the newest cached row as today's snapshot.
+                request = previous_calendar_date(as_of or datetime.now())
+            valuation_date = self.resolve_fundamentals_date(request)
+            audit["valuation_date"] = valuation_date
+            validate_daily_snapshot_visibility(valuation_date, as_of)
+        income_as_of = date
+        if stat_date is not None:
+            income_as_of = as_of if getattr(self.backend, "strict_pit", False) else None
+            if getattr(self.backend, "financial_mode", None) == "research_reconstructed" and as_of is not None:
+                # A quarterly query must not make later announcements visible
+                # during a historical research replay. Latest-only revisions
+                # remain explicitly unverified even with this cutoff.
+                income_as_of = previous_calendar_date(as_of)
+            audit["financial_query"] = "visible_report_period" if income_as_of is not None else "retrospective_report_period"
+        elif income_as_of is None:
+            income_as_of = previous_calendar_date(as_of or datetime.now())
+        audit["income_as_of"] = str(income_as_of) if income_as_of is not None else None
+        if report_period:
+            audit["report_period_end"] = report_period[0]
+            audit["income_semantics"] = "annual_cumulative" if report_period[1] else "single_quarter"
+        if "valuation" in table_names:
+            frames.append(("valuation", self._valuation_frame(valuation_date)))
         if "income" in table_names:
-            income_df, income_stat_date = self._income_frame_for_stat_date(statDate, date)
+            income_df, income_stat_date = self._income_frame_for_stat_date(stat_date, income_as_of)
             if not income_df.empty:
-                income_df = self._income_single_quarter_frame(income_df, income_stat_date, date=date)
+                if not (report_period and report_period[1]):
+                    income_df = self._income_single_quarter_frame(income_df, income_stat_date, date=income_as_of)
                 income_df = income_df.rename(
                     columns={
                         "ts_code": "code",
@@ -930,22 +1011,54 @@ class DataPortal:
                     }
                 )
                 income_df["code"] = [to_joinquant_code(code) for code in income_df["code"].tolist()]
-                frames.append(income_df)
+            frames.append(("income", income_df))
         if "indicator" in table_names:
-            indicator_df = self._income_growth_indicator_frame(date)
-            if not indicator_df.empty:
-                frames.append(indicator_df)
-        if not frames:
+            frames.append(("indicator", self._income_growth_indicator_frame(income_as_of, stat_date)))
+        references = list(q.fields) + [expr.field for expr in q.filters] + [item.field for item in q.ordering]
+        # Required tables cannot disappear from the join merely because their
+        # source frame is empty. Keep the selected/filter/order schema.
+        audit["empty_tables"] = [table for table, frame in frames if frame.empty]
+        prepared = []
+        for table, frame in frames:
+            if table == "valuation" and "valuation_provenance" in frame.attrs:
+                audit["valuation_provenance"] = dict(frame.attrs["valuation_provenance"])
+            if table == "income":
+                audit["income_provenance"] = dict(frame.attrs)
+            fields = [field for field in references if field.table == table]
+            public_columns = list(dict.fromkeys(["code", *[self._fundamental_column_name(field) for field in fields]]))
+            if frame.empty:
+                frame = pd.DataFrame({name: pd.Series(dtype="object" if name == "code" else "float64") for name in public_columns})
+            else:
+                missing = sorted(set(public_columns) - set(frame.columns))
+                if missing:
+                    raise NotImplementedError(f"Fundamentals {table} backend is missing required fields: {', '.join(missing)}")
+                frame = frame[public_columns].copy()
+                if frame["code"].duplicated().any():
+                    raise FundamentalsUnavailableError("duplicate_fundamental_security", table=table)
+            frame = frame.rename(columns={name: f"{table}.{name}" for name in public_columns if name != "code"})
+            prepared.append(frame)
+        if not prepared:
             return pd.DataFrame(columns=[self._fundamental_column_name(field) for field in q.fields])
-        result = frames[0]
-        for frame in frames[1:]:
-            result = result.merge(frame, on="code", how="outer")
-        result = self._ensure_fundamental_columns(result, q)
+        result = prepared[0]
+        for frame in prepared[1:]:
+            result = result.merge(frame, on="code", how="inner", validate="one_to_one")
         result = self._apply_query_filters(result, q.filters)
         result = self._apply_query_ordering(result, q.ordering)
+        audit["code_set_sha256"] = hashlib.sha256("\n".join(sorted(set(result["code"].astype(str)))).encode()).hexdigest()
         return self._project_fundamental_fields(result, q.fields)
 
+    def _fundamental_report_period(self, value):
+        text = str(value).strip().lower().replace("-", "")
+        if len(text) == 4 and text.isdigit():
+            return f"{text}1231", True
+        parsed = self._parse_income_period(text)
+        if parsed is None:
+            raise ValueError(f"Unsupported fundamentals statDate: {value!r}")
+        year, quarter = parsed
+        return f"{year:04d}{ {1: '0331', 2: '0630', 3: '0930', 4: '1231'}[quarter]}", False
+
     def get_fundamentals_continuously(self, q, end_date=None, count=1):
+        end_date = self.resolve_fundamentals_date(end_date or previous_calendar_date(datetime.now()))
         table_names = (
             {field.table for field in q.fields}
             | {expr.field.table for expr in q.filters}
@@ -1051,8 +1164,9 @@ class DataPortal:
         if date is None:
             return {}
         end = normalize_date(date)
-        start_dt = datetime.strptime(end, "%Y%m%d") - pd.Timedelta(days=14)
-        return {"start_date": start_dt.strftime("%Y%m%d"), "end_date": end}
+        # The backend can select a per-security as-of row with an index/window
+        # query. A fixed lookback window silently removes long suspensions.
+        return {"end_date": end, "latest_per_code": True}
 
     def _fetch(self, api_name: str, **params) -> pd.DataFrame:
         cache_key = (str(api_name), self._freeze_params(params))
@@ -1300,52 +1414,126 @@ class DataPortal:
         return result.sort_values(["trade_date", "ts_code"]).reset_index(drop=True)
 
     def _valuation_frame(self, date) -> pd.DataFrame:
-        cache_key = normalize_date(date) if date is not None else ""
+        mode = getattr(self.backend, "financial_mode", "strict_pit" if getattr(self.backend, "strict_pit", False) else "cached_snapshot")
+        cache_key = (normalize_date(date) if date is not None else "", mode)
         cached = self._valuation_cache.get(cache_key)
         if cached is not None:
             return cached.copy()
 
-        daily_basic = self._fetch("daily_basic", **self._valuation_date_params(date))
-        if not daily_basic.empty:
-            daily_basic = self._latest_per_security(daily_basic)
-            daily_basic = self._filter_a_share_rows(daily_basic)
-            daily_basic = daily_basic.rename(
-                columns={
-                    "ts_code": "code",
-                    "total_mv": "market_cap",
-                    "pe": "pe_ratio",
-                    "pb": "pb_ratio",
-                    "turnover_rate": "turnover_ratio",
-                }
-            )
-            if "market_cap" in daily_basic.columns:
-                daily_basic["market_cap"] = daily_basic["market_cap"].astype(float) / 10000.0
-            if "pe_ratio" in daily_basic.columns and "pe_ttm" in daily_basic.columns:
-                pe_ratio = pd.to_numeric(daily_basic["pe_ratio"], errors="coerce")
-                pe_ttm = pd.to_numeric(daily_basic["pe_ttm"], errors="coerce")
-                daily_basic["pe_ratio"] = pe_ratio.fillna(pe_ttm)
-            elif "pe_ratio" not in daily_basic.columns and "pe_ttm" in daily_basic.columns:
-                daily_basic["pe_ratio"] = pd.to_numeric(daily_basic["pe_ttm"], errors="coerce")
-            if "pe_ratio" in daily_basic.columns:
-                daily_basic["pe_ratio"] = pd.to_numeric(daily_basic["pe_ratio"], errors="coerce").fillna(0.0)
-            daily_basic["code"] = [to_joinquant_code(code) for code in daily_basic["code"].tolist()]
-        self._valuation_cache[cache_key] = daily_basic.copy()
-        return daily_basic.copy()
+        strict_reports = self._load_income_raw(date) if mode == "strict_pit" else None
+        snapshot_method = getattr(self.backend, "daily_basic_asof", None)
+        source = snapshot_method(date) if date is not None and callable(snapshot_method) else self._fetch("daily_basic", **self._valuation_date_params(date))
+        diagnostics = {"mode": mode, "financial_mode": mode,
+                       "requested_date": normalize_date(date) if date is not None else None,
+                       "pit_verified": False, "stale_codes": [], "missing_codes": [],
+                       "pe_status_by_code": {}, "pb_status_by_code": {}}
+        if source.empty:
+            result = source.copy()
+            result.attrs["valuation_provenance"] = {**diagnostics, "status": "valuation_snapshot_missing"}
+            self._valuation_cache[cache_key] = result.copy()
+            return result
+        result = self._filter_a_share_rows(self._latest_per_security(source)).copy()
+        # PE is explicitly TTM. Static pe cannot substitute for missing pe_ttm.
+        result["pe_ratio"] = pd.to_numeric(result.get("pe_ttm", pd.Series(float("nan"), index=result.index)), errors="coerce")
+        result["pe_ratio"] = result["pe_ratio"].replace([np.inf, -np.inf], np.nan)
+        statuses = pd.Series(np.where(result["pe_ratio"].notna(), "source_pe_ttm", "ttm_source_missing"), index=result.index)
+        if mode in {"research_reconstructed", "strict_pit"} and date is not None and result["pe_ratio"].isna().any():
+            reports = strict_reports if strict_reports is not None else self._load_income_raw(date)
+            reports = self._filter_income_asof(reports, date)
+            profits = signed_ttm_by_security(reports, date)
+            for index, row in result[result["pe_ratio"].isna()].iterrows():
+                profit, status = profits.get(str(row["ts_code"]), (float("nan"), "ttm_inputs_missing"))
+                statuses.loc[index] = status
+                market_value = pd.to_numeric(row.get("total_mv"), errors="coerce")
+                if np.isfinite(profit) and profit != 0 and np.isfinite(market_value) and market_value > 0:
+                    result.loc[index, "pe_ratio"] = float(market_value) * 10000.0 / profit
+                    statuses.loc[index] = "retrospective_reconstructed" if mode == "research_reconstructed" else "revision_ttm"
+        if date is not None and "trade_date" in result:
+            requested = normalize_date(date)
+            metadata = self._fetch("stock_basic")
+            active = pd.DataFrame()
+            if not metadata.empty and "ts_code" in metadata:
+                active = self._filter_a_share_rows(metadata)
+                if "list_date" in active:
+                    active = active[(active["list_date"].astype(str) <= requested) | active["list_date"].isna()]
+                if "delist_date" in active:
+                    active = active[active["delist_date"].isna() | active["delist_date"].astype(str).isin(["", "None", "nan"]) | (active["delist_date"].astype(str) >= requested)]
+                # Listed/delisted membership is a lifecycle boundary. A stale
+                # final quote does not keep a delisted security in today's pool.
+                known = set(metadata["ts_code"])
+                active_codes = set(active["ts_code"])
+                result = result[~result["ts_code"].isin(known) | result["ts_code"].isin(active_codes)]
+                statuses = statuses.loc[result.index]
+                missing_codes = sorted(active_codes - set(result["ts_code"]))
+                diagnostics["missing_codes"] = [to_joinquant_code(code) for code in missing_codes]
+                if missing_codes:
+                    missing = pd.DataFrame([{column: code if column == "ts_code" else float("nan") for column in result.columns} for code in missing_codes])
+                    result = pd.concat([result, missing], ignore_index=True)
+                    statuses = pd.Series([*statuses.tolist(), *["valuation_snapshot_missing" for _ in missing_codes]], index=result.index)
+            stale = result["trade_date"].notna() & (result["trade_date"].astype(str).map(normalize_date) != requested)
+            diagnostics["stale_codes"] = [to_joinquant_code(code) for code in result.loc[stale, "ts_code"]]
+            diagnostics["snapshot_date_by_code"] = {to_joinquant_code(row.ts_code): str(row.trade_date) if pd.notna(row.trade_date) else None for row in result.itertuples()}
+            # Old source rows remain traceable identities; their numeric values
+            # cannot stand in for as-of share capital/actions/financial updates.
+            invalid = stale | result["trade_date"].isna()
+            result.loc[invalid, "pe_ratio"] = float("nan")
+            statuses.loc[stale] = "stale_valuation_snapshot"
+            for column in ("total_mv", "pb", "turnover_rate"):
+                if column in result:
+                    result.loc[invalid, column] = float("nan")
+        diagnostics["pe_status_by_code"] = {to_joinquant_code(result.at[index, "ts_code"]): str(statuses.at[index]) for index in result.index}
+        for index, row in result.iterrows():
+            code = to_joinquant_code(row["ts_code"])
+            pb = pd.to_numeric(row.get("pb"), errors="coerce")
+            state = diagnostics["pe_status_by_code"][code]
+            diagnostics["pb_status_by_code"][code] = (
+                state if state in {"stale_valuation_snapshot", "valuation_snapshot_missing"}
+                else "source_pb" if pd.notna(pb) and np.isfinite(pb) else "source_pb_missing")
+        diagnostics["pit_verified"] = mode == "strict_pit"
+        diagnostics["status"] = "incomplete_snapshot" if diagnostics["stale_codes"] or diagnostics["missing_codes"] else "snapshot_available"
+        diagnostics["legacy_financial_vintages_recovered"] = False
+        result = result.rename(columns={"ts_code": "code", "total_mv": "market_cap", "pb": "pb_ratio", "turnover_rate": "turnover_ratio"})
+        if "market_cap" in result:
+            result["market_cap"] = pd.to_numeric(result["market_cap"], errors="coerce") / 10000.0
+        result["code"] = [to_joinquant_code(code) for code in result["code"]]
+        result.attrs["valuation_provenance"] = diagnostics
+        self._valuation_cache[cache_key] = result.copy()
+        return result.copy()
+
+    def _load_income_raw(self, date=None) -> pd.DataFrame:
+        strict = bool(getattr(self.backend, "strict_pit", False))
+        mode = getattr(self.backend, "financial_mode", "cached_snapshot")
+        if strict:
+            readiness_method = getattr(self.backend, "financial_readiness", None)
+            revision_method = getattr(self.backend, "financial_revisions", None)
+            if date is None or not callable(readiness_method) or not callable(revision_method):
+                raise FinancialVintageUnavailable("financial_vintage_missing: strict PIT requires as_of and revision storage")
+            readiness = readiness_method(date)
+            if not readiness.get("ready"):
+                raise FinancialVintageUnavailable(readiness.get("reason", "financial_vintage_missing"))
+            frame = revision_method(api_name="income", as_of=date)
+            frame.attrs["financial_readiness"] = readiness
+            return frame
+        frame = self._fetch("income").copy()
+        frame.attrs.update(provenance_state="research_reconstructed" if mode == "research_reconstructed" else "legacy_snapshot", pit_verified=False, legacy_financial_vintages_recovered=False)
+        return frame
 
     def _income_frame_for_stat_date(self, stat_date, date=None) -> tuple[pd.DataFrame, str | None]:
+        frame = self._filter_income_asof(self._load_income_raw(date), date)
         if stat_date is None:
-            return self._filter_income_asof(self._fetch("income"), date), None
+            return frame, None
+        period_end, annual = self._fundamental_report_period(stat_date)
+        period_column = "end_date" if "end_date" in frame.columns else "period"
+        if frame.empty:
+            return frame, period_end
+        if period_column not in frame.columns:
+            raise NotImplementedError("income backend data must include end_date")
+        dates = frame[period_column].astype(str).str.replace("-", "", regex=False).str[:8]
+        return frame[dates == period_end].reset_index(drop=True), period_end
 
-        period = self._normalize_income_period(stat_date)
-        if period is None:
-            return self._filter_income_asof(self._fetch("income", period=stat_date), date), stat_date
-
-        frame = self._filter_income_asof(self._fetch("income", period=period), date)
-        return frame, period
-
-    def _income_growth_indicator_frame(self, date=None) -> pd.DataFrame:
+    def _income_growth_indicator_frame(self, date=None, stat_date=None) -> pd.DataFrame:
         """Derive JoinQuant-style disclosed YoY indicators from cached income reports."""
-        visible = self._filter_income_asof(self._fetch("income"), date)
+        visible = self._filter_income_asof(self._load_income_raw(date), date)
         required = {"ts_code", "end_date", "total_revenue", "n_income_attr_p"}
         if visible.empty or not required.issubset(set(visible.columns)):
             return pd.DataFrame(
@@ -1401,18 +1589,23 @@ class DataPortal:
             on=["ts_code", "previous_cumulative_end_date"],
             how="left",
         )
+        previous_revenue = pd.to_numeric(reports["previous_cumulative_revenue"], errors="coerce")
+        previous_profit = pd.to_numeric(reports["previous_cumulative_profit"], errors="coerce")
+        first_quarter = reports["end_date"].str.endswith("0331")
+        previous_revenue = previous_revenue.where(~first_quarter, 0.0)
+        previous_profit = previous_profit.where(~first_quarter, 0.0)
         reports["single_quarter_revenue"] = pd.to_numeric(
             reports["total_revenue"], errors="coerce"
-        ) - pd.to_numeric(
-            reports["previous_cumulative_revenue"], errors="coerce"
-        ).fillna(0.0)
+        ) - previous_revenue
         reports["single_quarter_profit"] = pd.to_numeric(
             reports["n_income_attr_p"], errors="coerce"
-        ) - pd.to_numeric(
-            reports["previous_cumulative_profit"], errors="coerce"
-        ).fillna(0.0)
+        ) - previous_profit
 
-        latest = reports.groupby("ts_code", group_keys=False).tail(1).copy()
+        if stat_date is not None:
+            period_end, _annual = self._fundamental_report_period(stat_date)
+            latest = reports[reports["end_date"] == period_end].copy()
+        else:
+            latest = reports.groupby("ts_code", group_keys=False).tail(1).copy()
         latest["prior_end_date"] = latest["end_date"].map(
             lambda value: f"{int(value[:4]) - 1:04d}{value[4:]}"
         )
@@ -1500,21 +1693,34 @@ class DataPortal:
         ].reset_index(drop=True)
 
     def _filter_income_asof(self, income_df: pd.DataFrame, date=None) -> pd.DataFrame:
-        if income_df.empty or date is None:
-            return income_df
-        date_columns = [column for column in ("f_ann_date", "ann_date") if column in income_df.columns]
-        if not date_columns:
-            return income_df
-        asof = normalize_date(date)
+        strict = bool(getattr(self.backend, "strict_pit", False))
+        if strict and income_df.attrs.get("provenance_state") != "revisions_verified":
+            raise FinancialVintageUnavailable("financial_vintage_missing: latest-only income cannot establish historical versions")
+        if income_df.empty:
+            return income_df.copy()
+        if income_df.attrs.get("provenance_state") == "revisions_verified":
+            return select_visible_reports(income_df, date)
         result = income_df.copy()
+        if date is None:
+            return result
+        date_columns = [column for column in ("f_ann_date", "ann_date") if column in result.columns]
+        if not date_columns:
+            result = result.iloc[:0].copy()
+            result.attrs.update(income_df.attrs, financial_gap="announcement_date_missing")
+            return result
+        asof = normalize_date(date)
         visible = pd.Series(True, index=result.index)
         has_announcement_date = pd.Series(False, index=result.index)
         for column in date_columns:
             values = result[column].map(self._normalize_income_announcement_date)
             has_value = values.notna()
             has_announcement_date = has_announcement_date | has_value
-            visible = visible & (~has_value | (values <= asof))
-        return result[visible & has_announcement_date].reset_index(drop=True)
+            visible &= ~has_value | (values <= asof)
+        result = result[visible & has_announcement_date].reset_index(drop=True)
+        if "report_type" in result:
+            result = result[result["report_type"].astype(str).isin(["1", "1.0"])].reset_index(drop=True)
+        result.attrs.update(income_df.attrs)
+        return result
 
     def _normalize_income_announcement_date(self, value) -> str | None:
         if pd.isna(value):
@@ -1529,27 +1735,44 @@ class DataPortal:
 
     def _income_single_quarter_frame(self, income_df: pd.DataFrame, stat_date, date=None) -> pd.DataFrame:
         result = self._latest_income_per_security(income_df)
-        prev_period = self._previous_income_period(stat_date)
-        if prev_period is None:
+        if result.empty:
             return result
-
-        prev_df = self._fetch("income", period=prev_period)
-        prev_df = self._filter_income_asof(prev_df, date)
-        if prev_df.empty:
+        if stat_date is not None:
+            prev_period = self._previous_income_period(stat_date)
+            if prev_period is None:
+                return result
+            previous_end = self._fundamental_report_period(prev_period)[0]
+            target_previous = pd.Series(previous_end, index=result.index)
+        elif "end_date" in result.columns:
+            target_previous = result["end_date"].map(
+                lambda value: self._previous_income_period(value)
+            ).map(lambda value: self._fundamental_report_period(value)[0] if value else None)
+        else:
+            # Legacy fixtures with no period identity cannot support a
+            # cumulative-to-quarter transformation.
             return result
-        prev_df = self._latest_income_per_security(prev_df)
-        previous_by_code = prev_df.set_index("ts_code")
+        prev_df = self._filter_income_asof(self._load_income_raw(date), date)
+        if "end_date" not in prev_df.columns:
+            if "period" in prev_df.columns:
+                prev_df = prev_df.rename(columns={"period": "end_date"})
+            else:
+                prev_df = pd.DataFrame(columns=["ts_code", "end_date"])
+        prev_df = prev_df.copy()
+        prev_df["end_date"] = prev_df["end_date"].astype(str).str.replace("-", "", regex=False).str[:8]
+        previous_by_period = prev_df.sort_values([name for name in ("ts_code", "end_date", "f_ann_date", "ann_date", "report_type") if name in prev_df.columns]).drop_duplicates(["ts_code", "end_date"], keep="last").set_index(["ts_code", "end_date"])
+        previous_keys = pd.MultiIndex.from_arrays([result["ts_code"], target_previous])
         for column in ("total_revenue", "revenue", "n_income", "n_income_attr_p"):
-            if column not in result.columns or column not in previous_by_code.columns:
+            if column not in result.columns:
                 continue
-            previous_values = result["ts_code"].map(previous_by_code[column])
-            result[column] = result[column].astype(float) - previous_values.fillna(0.0).astype(float)
+            previous_values = (previous_by_period[column].reindex(previous_keys).to_numpy() if column in previous_by_period.columns else np.full(len(result), np.nan))
+            previous_values = pd.Series(previous_values, index=result.index).where(target_previous.notna(), 0.0)
+            result[column] = pd.to_numeric(result[column], errors="coerce") - pd.to_numeric(previous_values, errors="coerce")
         return result
 
     def _latest_income_per_security(self, income_df: pd.DataFrame) -> pd.DataFrame:
         if "ts_code" not in income_df.columns:
             return income_df
-        sort_columns = [column for column in ("ts_code", "f_ann_date", "ann_date", "report_type") if column in income_df.columns]
+        sort_columns = [column for column in ("ts_code", "end_date", "period", "f_ann_date", "ann_date", "report_type") if column in income_df.columns]
         if sort_columns:
             income_df = income_df.sort_values(sort_columns)
         return income_df.groupby("ts_code", group_keys=False).tail(1).reset_index(drop=True)
@@ -1571,7 +1794,7 @@ class DataPortal:
         return f"{year}q{quarter}"
 
     def _parse_income_period(self, stat_date) -> tuple[int, int] | None:
-        text = str(stat_date or "").strip().lower()
+        text = str(stat_date or "").strip().lower().replace("-", "")
         if len(text) == 6 and text[:4].isdigit() and text[4] == "q" and text[5].isdigit():
             quarter = int(text[5])
             if 1 <= quarter <= 4:
@@ -1596,13 +1819,12 @@ class DataPortal:
         return df[df["ts_code"].map(self._is_a_share_tushare_code)].reset_index(drop=True)
 
     def _is_a_share_tushare_code(self, code: str) -> bool:
-        raw = str(code).split(".", 1)[0]
-        return raw.startswith(("000", "001", "002", "003", "300", "301", "600", "601", "603", "605", "688", "689"))
+        return is_tushare_a_share_code(code)
 
     def _apply_query_filters(self, df: pd.DataFrame, filters) -> pd.DataFrame:
         result = df.copy()
         for expr in filters:
-            column = self._fundamental_column_name(expr.field)
+            column = self._fundamental_internal_column_name(expr.field)
             if column not in result.columns:
                 raise NotImplementedError(f"Fundamentals filter field is not available locally: {column}")
             value = expr.value
@@ -1640,19 +1862,25 @@ class DataPortal:
     def _apply_query_ordering(self, df: pd.DataFrame, ordering) -> pd.DataFrame:
         result = df.copy()
         for item in reversed(ordering):
-            column = self._fundamental_column_name(item.field)
+            column = self._fundamental_internal_column_name(item.field)
             if column not in result.columns:
                 raise NotImplementedError(f"Fundamentals ordering field is not available locally: {column}")
             result = result.sort_values(column, ascending=item.direction != "desc")
         return result.reset_index(drop=True)
 
     def _project_fundamental_fields(self, df: pd.DataFrame, fields) -> pd.DataFrame:
-        columns = [self._fundamental_column_name(field) for field in fields]
+        columns = [self._fundamental_internal_column_name(field) for field in fields]
         missing = [column for column in columns if column not in df.columns]
         if missing:
             names = ", ".join(missing)
             raise NotImplementedError(f"Fundamentals fields are not available locally: {names}")
-        return df[columns].reset_index(drop=True)
+        result = df[columns].reset_index(drop=True)
+        result.columns = [self._fundamental_column_name(field) for field in fields]
+        return result
+
+    def _fundamental_internal_column_name(self, field):
+        name = self._fundamental_column_name(field)
+        return name if name == "code" else f"{field.table}.{name}"
 
     def _fundamental_column_name(self, field) -> str:
         table = getattr(field, "table", "")

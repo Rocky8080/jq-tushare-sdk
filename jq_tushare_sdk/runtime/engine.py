@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import csv
+import json
+import math
+import ast
 import re
 import sqlite3
 import time as time_module
+from dataclasses import replace
 from collections import defaultdict
 from contextlib import closing, contextmanager
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Callable
 
+import pandas as pd
+
 from jq_tushare_sdk.broker.broker import Broker
+from jq_tushare_sdk.broker.costs import CostModel
 from jq_tushare_sdk.config import BacktestConfig, RunManifest
-from jq_tushare_sdk.data.code_map import is_tushare_fund_code, to_joinquant_code
+from jq_tushare_sdk.data.code_map import is_tushare_a_share_code, is_tushare_fund_code, normalize_date, to_joinquant_code
 from jq_tushare_sdk.data.portal import DataPortal
 from jq_tushare_sdk.data.readiness import infer_strategy_price_lookback_start
 from jq_tushare_sdk.reports.joinquant_formatter import JoinQuantOutputFormatter
@@ -49,15 +56,155 @@ class BacktestEngine:
         output_manager: OutputManager | None = None,
         progress_callback: Callable[[float, str, str | None], None] | None = None,
     ):
-        self.config = config
+        effective_mode = getattr(backend, "financial_mode", None)
+        if effective_mode is None:
+            effective_mode = "strict_pit" if getattr(backend, "strict_pit", False) else "cached_snapshot"
+        if config.financial_mode != "cached_snapshot" and config.financial_mode != effective_mode:
+            raise ValueError(f"financial_mode mismatch: requested {config.financial_mode}, backend {effective_mode}")
+        # Record the backend actually used, including a stricter backend passed
+        # programmatically with a default config. Never silently downgrade a
+        # nondefault financial contract.
+        self.config = replace(config, financial_mode=effective_mode, financial_provenance=None)
         self.backend = backend
         self.output_manager = output_manager or OutputManager()
         self.progress_callback = progress_callback
         self.active_run_dir = None
 
+    def _new_broker(self, context, portal):
+        # This engine runs JoinQuant strategies. Generic Broker/CostModel defaults
+        # remain unchanged; initialize() may override this through set_slippage.
+        return Broker(context, portal, CostModel(slippage_rate=0.00246 / 2.0))
+
+    def _initial_previous_trade_day(self, portal, trade_days):
+        if not trade_days:
+            return None
+        calendar_days = portal.get_trade_days(end_date=trade_days[0], count=2)
+        previous_days = [day for day in calendar_days if day < trade_days[0]]
+        if not previous_days:
+            raise NotImplementedError("Previous trading day is missing from the local calendar")
+        return previous_days[-1]
+
+    def _bind_schedule_calendar(self, scheduler, portal, trade_days):
+        if not trade_days:
+            scheduler.bind_calendar([])
+            return
+        kinds = {entry.kind for entry in scheduler.entries}
+        if not {"weekly", "monthly"}.intersection(kinds):
+            scheduler.bind_calendar(trade_days)
+            return
+        first, last = trade_days[0], trade_days[-1]
+        if "monthly" in kinds:
+            month_start = date(first.year, first.month, 1)
+            next_month = date(last.year + (last.month == 12), last.month % 12 + 1, 1)
+            month_end = next_month - timedelta(days=1)
+        else:
+            month_start, month_end = first, last
+        # Include the boundary weeks too, so a week spanning two months has all
+        # its trading days even when the replay starts in the middle of it.
+        calendar_start = month_start - timedelta(days=month_start.weekday())
+        calendar_end = month_end + timedelta(days=6 - month_end.weekday())
+        full_days = portal.get_trade_days(start_date=calendar_start, end_date=calendar_end)
+        fetch = getattr(portal, "_fetch", None)
+        if not callable(fetch):
+            raise NotImplementedError("Schedule calendar coverage cannot be verified")
+        calendar = fetch("trade_cal", exchange="SSE", start_date=normalize_date(calendar_start),
+                         end_date=normalize_date(calendar_end))
+        if not {"cal_date", "is_open"}.issubset(calendar.columns):
+            raise NotImplementedError("Schedule calendar is missing dated exchange open/closed rows")
+        expected = {normalize_date(calendar_start + timedelta(days=offset))
+                    for offset in range((calendar_end - calendar_start).days + 1)}
+        received = {normalize_date(value) for value in calendar["cal_date"]}
+        missing = sorted(expected - received)
+        if missing:
+            raise NotImplementedError("Incomplete schedule exchange calendar: missing " + ",".join(missing[:10]))
+        open_states = {}
+        for value, flag in zip(calendar["cal_date"], calendar["is_open"]):
+            day_key, opened = normalize_date(value), float(flag)
+            if opened not in (0., 1.) or (day_key in open_states and open_states[day_key] != opened):
+                raise NotImplementedError("Invalid or conflicting exchange calendar open flags")
+            open_states[day_key] = opened
+        expected_open = {day for day, opened in open_states.items() if day in expected and opened == 1.}
+        if expected_open != {normalize_date(day) for day in full_days}:
+            raise NotImplementedError("Schedule calendar open-day projection is inconsistent")
+        scheduler.bind_calendar(full_days)
+
+    def _preflight_declared_data(self):
+        """Validate explicit strategy requirements before loading any callbacks."""
+        from jq_tushare_sdk.api import finance
+
+        tree = ast.parse(Path(self.config.strategy_path).read_text(encoding="utf-8"))
+        declaration = None
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "JQTS_DATA_REQUIREMENTS" for target in node.targets):
+                declaration = ast.literal_eval(node.value)
+        if declaration is None:
+            return {"declared": False}
+        if not isinstance(declaration, dict) or self.config.financial_mode not in declaration:
+            raise ValueError("Strategy data preflight failed: missing mode-specific JQTS_DATA_REQUIREMENTS")
+        required = declaration[self.config.financial_mode]
+        if not isinstance(required, dict):
+            raise ValueError("Strategy data preflight failed: invalid JQTS_DATA_REQUIREMENTS")
+        tables = required.get("finance_tables", [])
+        capabilities = finance.capabilities()
+        unavailable = [str(table) for table in tables if not capabilities.get(table, {}).get("supported")]
+        if unavailable:
+            raise ValueError("Strategy data preflight failed: unsupported finance tables " + ", ".join(unavailable)
+                             + "; use a verified source contract or explicit research_reconstructed mode")
+        result = {"declared": True, "financial_mode": self.config.financial_mode, "finance_tables": list(tables)}
+        if "TUSHARE_FORECAST" in tables:
+            start = pd.Timestamp(self.config.start_date)
+            end = pd.Timestamp(self.config.end_date)
+            calendar_start = start - pd.Timedelta(days=40)
+            calendar = self.backend.fetch("trade_cal", exchange="SSE",
+                start_date=calendar_start.strftime("%Y%m%d"), end_date=end.strftime("%Y%m%d"))
+            if calendar.empty or not {"cal_date", "is_open"}.issubset(calendar.columns):
+                raise ValueError("Strategy data preflight failed: forecast calendar missing")
+            expected = {day.strftime("%Y%m%d") for day in pd.date_range(calendar_start, end)}
+            open_flags = {}
+            for day, flag in zip(calendar.cal_date, calendar.is_open):
+                key, value = normalize_date(day), float(flag)
+                if value not in (0., 1.) or key in open_flags and open_flags[key] != value:
+                    raise ValueError("Strategy data preflight failed: invalid forecast calendar flags")
+                open_flags[key] = value
+            if expected - set(open_flags):
+                raise ValueError("Strategy data preflight failed: incomplete forecast calendar")
+            open_dates = sorted(day for day, opened in open_flags.items() if day in expected and opened == 1.)
+            replay_dates = [day for day in open_dates if start.strftime("%Y%m%d") <= day <= end.strftime("%Y%m%d")]
+            if not replay_dates:
+                raise ValueError("Strategy data preflight failed: no replay trading days")
+            before_first = [day for day in open_dates if day < replay_dates[0]]
+            before_last = [day for day in open_dates if day < replay_dates[-1]]
+            if not before_first or not before_last:
+                raise ValueError("Strategy data preflight failed: forecast previous trading day missing")
+            lookback = int(required.get("forecast_lookback_days", 90))
+            if lookback <= 0:
+                raise ValueError("Strategy data preflight failed: invalid forecast lookback")
+            publication_start = (pd.Timestamp(before_first[-1]) - pd.Timedelta(days=lookback)).strftime("%Y%m%d")
+            publication_end = before_last[-1]
+            coverage = finance.forecast_coverage(self.backend, publication_start, publication_end)
+            if coverage.get("complete") is not True:
+                raise ValueError("Strategy data preflight failed: forecast_coverage_missing " + publication_start + ".." + publication_end)
+            result["forecast_coverage"] = coverage
+        return result
+
     def run(self) -> RunManifest:
         self._report_progress(0.0, "初始化策略")
         profiler = _PerformanceProfiler()
+        strategy_data = self._preflight_declared_data()
+        as_of = f"{self.config.start_date} 00:00:00"
+        provenance = {"as_of": as_of, "verified": False,
+                      "reason": "legacy_snapshot_not_pit_verified",
+                      "strategy_data_requirements": strategy_data}
+        if self.config.financial_mode == "strict_pit":
+            check = getattr(self.backend, "financial_readiness", None)
+            readiness = check(as_of) if callable(check) else {"ready": False, "reason": "financial_vintage_missing"}
+            provenance.update(readiness)
+            provenance["verified"] = readiness.get("ready") is True
+            if not provenance["verified"]:
+                raise ValueError(f"Strict PIT financial preflight failed: {readiness.get('reason', 'financial_vintage_missing')}")
+        elif self.config.financial_mode == "research_reconstructed":
+            provenance["reason"] = "retrospective_reconstruction_not_pit_verified"
+        self.config = replace(self.config, financial_provenance=provenance)
         output = self.output_manager.create_run(self.config)
         self.active_run_dir = output.run_dir
         logger = RuntimeLogger(output.logs_dir / "backtest.log")
@@ -82,7 +229,7 @@ class BacktestEngine:
         )
         scheduler = Scheduler()
         context = Context(Portfolio(self.config.initial_cash))
-        broker = Broker(context, portal)
+        broker = self._new_broker(context, portal)
         state = RuntimeState(
             data_portal=portal,
             scheduler=scheduler,
@@ -102,6 +249,7 @@ class BacktestEngine:
             security_names = self._security_names(portal)
             benchmark = getattr(state, "benchmark", None) or self.config.benchmark
             trade_days = list(portal.get_trade_days(self.config.start_date, self.config.end_date))
+            self._bind_schedule_calendar(scheduler, portal, trade_days)
             etf_dividend_events = self._load_etf_dividend_events()
             a_share_corporate_actions = self._load_a_share_corporate_actions()
         self._report_progress(0.04, "准备行情数据", f"共 {len(trade_days)} 个交易日")
@@ -114,7 +262,7 @@ class BacktestEngine:
         position_rows = []
         previous_total = None
         peak_value = float(context.portfolio.total_value)
-        previous_trade_day = None
+        previous_trade_day = self._initial_previous_trade_day(portal, trade_days)
         applied_etf_dividends: set[tuple[str, str]] = set()
         a_share_entitlements: dict[str, dict] = {}
         applied_a_share_actions: set[str] = set()
@@ -126,11 +274,12 @@ class BacktestEngine:
             day_mark_seconds = 0.0
             day_callback_count = 0
             context.previous_date = previous_trade_day
+            broker.settle_trading_day(trade_day)
             self._settle_a_share_corporate_actions(
                 context,
                 broker,
                 str(trade_day),
-                a_share_corporate_actions["pay_date"],
+                a_share_corporate_actions["ex_date"],
                 a_share_entitlements,
                 applied_a_share_actions,
             )
@@ -219,7 +368,7 @@ class BacktestEngine:
                 )
             )
             previous_total = current_total
-            previous_trade_day = datetime.strptime(str(trade_day), "%Y-%m-%d")
+            previous_trade_day = trade_day
             profiler.record_day(
                 date=str(trade_day),
                 seconds=profiler.elapsed(day_start),
@@ -268,6 +417,10 @@ class BacktestEngine:
                 trade_days=len(trade_days),
                 data_portal=portal.performance_snapshot(),
             ),
+        )
+        summary["corporate_actions"] = self._corporate_action_summary()
+        (output.artifacts_dir / "corporate_action_ledger.json").write_text(
+            json.dumps(self._corporate_action_ledger, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
         formatter.write_summary(output.reports_dir / "summary.json", summary)
         formatter.write_html_report(
@@ -618,37 +771,77 @@ class BacktestEngine:
         return time_method() == time(9, 30)
 
     def _load_a_share_corporate_actions(self) -> dict[str, dict[str, list[dict]]]:
-        events = {"record_date": defaultdict(list), "pay_date": defaultdict(list)}
-        seen: set[str] = set()
+        # Provider contract: stk_div is the TOTAL distribution, not an extra
+        # component; cash_div_tax is gross and cash_div is already after tax.
+        # https://tushare.pro/document/2?doc_id=103
+        groups = {key: defaultdict(list) for key in ("record_date", "ex_date", "pay_date", "div_listdate")}
+        seen: dict[str, dict] = {}
+        self._corporate_action_ledger = []
+        self._corporate_action_unsupported_held_count = 0
+        self._corporate_action_sources = []
+        required = {"ts_code", "div_proc", "record_date", "ex_date", "pay_date", "div_listdate",
+                    "cash_div", "cash_div_tax", "stk_div", "stk_bo_rate", "stk_co_rate"}
         for db_path in self._a_share_corporate_action_db_paths():
-            try:
-                with closing(sqlite3.connect(db_path)) as conn:
-                    rows = conn.execute(
-                        """
-                        SELECT event_id, ts_code, record_date, pay_date, cash_div,
-                               stk_div, stk_bo_rate, stk_co_rate
-                        FROM corporate_actions
-                        """
-                    ).fetchall()
-            except sqlite3.Error:
-                continue
-            for row in rows:
-                event_id, ts_code, record_date, pay_date, cash_div, stk_div, bonus, transfer = row
-                event_id = str(event_id or "")
-                record_date = self._corporate_action_date(record_date)
-                pay_date = self._corporate_action_date(pay_date)
-                if not event_id or event_id in seen or not record_date or not pay_date:
+            # Never create an empty file or modify the frozen input database.
+            with closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+                conn.row_factory = sqlite3.Row
+                exists = conn.execute("SELECT 1 FROM sqlite_master WHERE name='corporate_actions' AND type IN ('table','view')").fetchone()
+                if not exists:
                     continue
-                seen.add(event_id)
-                event = {
-                    "event_id": event_id,
-                    "security": to_joinquant_code(str(ts_code)),
-                    "cash_div": float(cash_div or 0.0),
-                    "share_ratio": float(stk_div or 0.0) + float(bonus or 0.0) + float(transfer or 0.0),
-                }
-                events["record_date"][record_date].append(event)
-                events["pay_date"][pay_date].append(event)
-        return {key: dict(grouped) for key, grouped in events.items()}
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(corporate_actions)")}
+                missing = sorted(required - columns)
+                if missing:
+                    raise ValueError(f"Invalid corporate_actions schema in {db_path}: missing {', '.join(missing)}")
+                rows = conn.execute("SELECT * FROM corporate_actions").fetchall()
+            self._corporate_action_sources.append(str(db_path))
+            for sqlite_row in rows:
+                row = dict(sqlite_row)
+                ts_code = str(row.get("ts_code") or "").strip()
+                if str(row.get("div_proc") or "").strip() != "实施" or not is_tushare_a_share_code(ts_code):
+                    continue
+                dates = {key: self._corporate_action_date(row.get(key)) for key in groups}
+                for key, value in dates.items():
+                    if row.get(key) not in (None, "") and not value:
+                        raise ValueError(f"Invalid corporate action {key}: {ts_code} {row.get(key)!r}")
+                if not dates["record_date"] or not dates["ex_date"] or dates["record_date"] >= dates["ex_date"]:
+                    raise ValueError(f"Invalid A-share corporate action record/ex dates: {ts_code} {dates}")
+                values = {}
+                for key in ("cash_div", "cash_div_tax", "stk_div", "stk_bo_rate", "stk_co_rate"):
+                    value = row.get(key)
+                    number = 0.0 if value is None else float(value)
+                    if not math.isfinite(number) or number < 0:
+                        raise ValueError(f"Invalid corporate action {key}: {ts_code} {value!r}")
+                    values[key] = number
+                if row.get("cash_div_tax") is None and values["cash_div"] > 0:
+                    raise ValueError(f"Gross cash_div_tax missing for corporate action: {ts_code}")
+                components = values["stk_bo_rate"] + values["stk_co_rate"]
+                share_ratio = components if row.get("stk_div") is None else values["stk_div"]
+                if row.get("stk_div") is not None and (row.get("stk_bo_rate") is not None or row.get("stk_co_rate") is not None):
+                    if not math.isclose(share_ratio, components, rel_tol=1e-8, abs_tol=1e-8):
+                        raise ValueError(f"Conflicting total/component stock distribution: {ts_code}")
+                if not values["cash_div_tax"] and not share_ratio:
+                    continue
+                event_id = f"tushare.dividend:{ts_code}:{dates['record_date']}:{dates['ex_date']}"
+                economic = {"event_id": event_id, "security": to_joinquant_code(ts_code), **dates,
+                            "cash_div": values["cash_div_tax"], "cash_per_share": values["cash_div_tax"],
+                            "share_ratio": share_ratio,
+                            "bonus_ratio": values["stk_bo_rate"], "transfer_ratio": values["stk_co_rate"]}
+                if event_id in seen:
+                    previous = {key: seen[event_id][key] for key in economic}
+                    if previous != economic:
+                        raise ValueError(f"Conflicting duplicate corporate action: {event_id}")
+                    seen[event_id]["source_databases"].append(str(db_path))
+                    continue
+                event = {**economic, "source": "tushare.dividend", "source_row": row,
+                         "source_databases": [str(db_path)]}
+                seen[event_id] = event
+        for event in sorted(seen.values(), key=lambda item: item["event_id"]):
+            for key in groups:
+                if event[key]:
+                    groups[key][event[key]].append(event)
+        self._corporate_action_loaded_count = len(seen)
+        self._persist_corporate_action_ledger()
+        return {key: dict(grouped) for key, grouped in groups.items()}
 
     def _a_share_corporate_action_db_paths(self) -> list[Path]:
         roots = [Path(str(self.config.cache_db))]
@@ -657,84 +850,136 @@ class BacktestEngine:
             roots.append(Path(str(backend_cache_dir)))
         paths: set[Path] = set()
         for root in roots:
-            candidates = (root, root / "a_share", root.parent / "a_share")
-            for candidate in candidates:
+            if root.is_file():
+                paths.add(root.resolve())
+            for candidate in (root, root / "a_share", root.parent / "a_share"):
                 if candidate.is_dir():
-                    paths.update(candidate.glob("a_share_????.db"))
+                    paths.update(path.resolve() for path in candidate.glob("a_share_????.db"))
+                    unified = candidate / "cache.db"
+                    if unified.is_file():
+                        paths.add(unified.resolve())
         return sorted(paths)
 
     def _corporate_action_date(self, value) -> str:
-        text = str(value or "").strip()[:10].replace("-", "")
-        if len(text) != 8 or not text.isdigit():
+        text = str(value or "").strip()
+        if re.fullmatch(r"\d{8}\.0+", text):
+            text = text.split(".", 1)[0]
+        elif isinstance(value, (date, datetime)):
+            text = value.strftime("%Y%m%d")
+        else:
+            text = text.replace("-", "")
+        if not re.fullmatch(r"\d{8}", text):
             return ""
-        return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+        try:
+            return datetime.strptime(text, "%Y%m%d").date().isoformat()
+        except ValueError:
+            return ""
 
-    def _capture_a_share_entitlements(
-        self,
-        context: Context,
-        broker: Broker,
-        trade_day: str,
-        events: dict[str, list[dict]],
-        entitlements: dict[str, dict],
-    ) -> None:
+    def _capture_a_share_entitlements(self, context: Context, broker: Broker, trade_day: str,
+                                      events: dict[str, list[dict]], entitlements: dict[str, dict]) -> None:
         for event in events.get(str(trade_day), []):
             event_id = str(event["event_id"])
             if event_id in entitlements:
                 continue
             position = context.portfolio.positions.get(str(event["security"]))
-            qualified_amount = float(position.total_amount) if position is not None else 0.0
-            qualified_amount = max(0.0, qualified_amount)
-            entitlements[event_id] = {
-                **event,
-                "qualified_amount": qualified_amount,
-                "tax_allocations": broker.capture_dividend_lots(
-                    str(event["security"]), qualified_amount
-                ),
-            }
+            amount = max(0., float(position.total_amount)) if position is not None else 0.
+            allocations = broker.capture_dividend_lots(str(event["security"]), amount)
+            if not math.isclose(sum(float(item["amount"]) for item in allocations), amount, abs_tol=1e-7):
+                raise ValueError(f"Corporate action entitlement has incomplete FIFO tax lots: {event_id}")
+            entitlement = {**event, "qualified_amount": amount, "eligible_quantity": amount,
+                           "tax_allocations": allocations,
+                           "record_avg_cost": float(position.avg_cost) if position is not None else 0.,
+                           "record_price": float(position.price) if position is not None else 0.}
+            entitlements[event_id] = entitlement
+            if amount > 0:
+                self._corporate_action_ledger.append({**entitlement, "phase": "capture", "date": str(trade_day),
+                    "settlement_date": None, "gross_cash": 0., "withheld_tax": 0., "net_cash": 0., "added_shares": 0})
+        self._persist_corporate_action_ledger()
 
-    def _settle_a_share_corporate_actions(
-        self,
-        context: Context,
-        broker: Broker,
-        trade_day: str,
-        events: dict[str, list[dict]],
-        entitlements: dict[str, dict],
-        applied: set[str],
-    ) -> None:
+    def _settle_a_share_corporate_actions(self, context: Context, broker: Broker, trade_day: str,
+                                        events: dict[str, list[dict]], entitlements: dict[str, dict], applied: set[str]) -> None:
+        context.current_dt = datetime.combine(date.fromisoformat(str(trade_day)), time.min)
         for event in events.get(str(trade_day), []):
             event_id = str(event["event_id"])
             if event_id in applied:
                 continue
             entitlement = entitlements.get(event_id)
-            if entitlement is None:
+            if entitlement is None or float(entitlement.get("qualified_amount") or 0.) <= 0:
                 continue
-            applied.add(event_id)
-            qualified_amount = float(entitlement.get("qualified_amount") or 0.0)
-            if qualified_amount <= 0:
-                continue
-            cash_div = float(entitlement.get("cash_div") or 0.0)
-            share_ratio = float(entitlement.get("share_ratio") or 0.0)
-            context.portfolio.available_cash += qualified_amount * cash_div
-            added_shares = qualified_amount * share_ratio
+            amount = float(entitlement["qualified_amount"])
+            cash_div = float(entitlement["cash_div"])
+            ratio = float(entitlement["share_ratio"])
+            # Deferred payments require receivables and unlisted-share balances.
+            # This ledger deliberately refuses such HELD events before ex-day
+            # valuation; it cannot publish a fake drawdown or spend unpaid cash.
+            reason = None
+            if float(entitlement.get("bonus_ratio") or 0.) > 0:
+                reason = "bonus-share dividend tax basis is not certified by the provider data"
+            if cash_div > 0 and event["pay_date"] != event["ex_date"]:
+                reason = "deferred/missing cash pay_date requires receivable accounting"
+            if ratio > 0 and event["div_listdate"] != event["ex_date"]:
+                reason = "deferred/missing stock listing requires unlisted-share accounting"
+            shares = amount * ratio
+            if not math.isclose(shares, round(shares), rel_tol=0., abs_tol=1e-7):
+                reason = "fractional stock entitlement has no verified allocation rule"
+            if reason:
+                self._corporate_action_unsupported_held_count += 1
+                self._corporate_action_ledger.append({**entitlement, "phase": "unsupported", "date": str(trade_day), "reason": reason})
+                self._persist_corporate_action_ledger()
+                raise NotImplementedError(f"Unsupported held corporate action {event_id}: {reason}")
+            added_shares = int(round(shares))
             security = str(entitlement["security"])
-            withheld_dividend_tax = broker.attach_dividend_tax(
-                security,
-                list(entitlement.get("tax_allocations") or []),
-                cash_per_share=cash_div,
-            )
-            context.portfolio.available_cash -= withheld_dividend_tax
+            gross_cash = amount * cash_div
+            withheld = broker.attach_dividend_tax(security, list(entitlement["tax_allocations"]), cash_per_share=cash_div)
+            if added_shares:
+                broker.add_corporate_action_shares(security, list(entitlement["tax_allocations"]), ratio)
+            context.portfolio.available_cash += gross_cash - withheld
             position = context.portfolio.positions.get(security)
-            if added_shares <= 0:
-                continue
-            if position is None:
-                position = Position(code=security)
-                context.portfolio.positions[security] = position
-            denominator = 1.0 + share_ratio
-            if denominator > 0 and float(position.total_amount or 0) > 0:
-                position.avg_cost = max(0.0, (float(position.avg_cost or 0.0) - cash_div) / denominator)
-                position.price = max(0.0, (float(position.price or 0.0) - cash_div) / denominator)
-            position.total_amount += added_shares
-            position.closeable_amount += added_shares
+            if position is not None or added_shares:
+                if position is None:
+                    position = Position(code=security)
+                    context.portfolio.positions[security] = position
+                old_amount = float(position.total_amount)
+                # Cash-only distributions reduce the cost of still-held eligible
+                # shares too. New shares carry their proportional record-date
+                # basis; shares sold between record/ex retain the entitlement.
+                existing_eligible = min(old_amount, broker.remaining_corporate_action_shares(entitlement["tax_allocations"]))
+                original_basis = float(entitlement["record_avg_cost"])
+                remaining_basis = float(position.avg_cost) * old_amount - existing_eligible * original_basis
+                adjusted_basis = max(0., original_basis - cash_div) / (1. + ratio)
+                new_total = old_amount + added_shares
+                position.avg_cost = max(0., remaining_basis + (existing_eligible + added_shares) * adjusted_basis) / new_total if new_total else 0.
+                position.price = max(0., (float(position.price or entitlement["record_price"]) - cash_div) / (1. + ratio))
+                position.total_amount += added_shares
+                position.closeable_amount += added_shares
+            applied.add(event_id)
+            self._corporate_action_ledger.append({**entitlement, "phase": "settlement", "date": str(trade_day),
+                "settlement_date": str(trade_day), "gross_cash": gross_cash, "withheld_tax": withheld,
+                "net_cash": gross_cash - withheld, "added_shares": added_shares,
+                "tax_model": "research_prepaid_cash_dividend_tax"})
+        self._persist_corporate_action_ledger()
+
+    def _persist_corporate_action_ledger(self) -> None:
+        run_dir = getattr(self, "active_run_dir", None)
+        if run_dir is not None:
+            path = Path(run_dir) / "artifacts" / "corporate_action_ledger.json"
+            path.write_text(json.dumps(self._corporate_action_ledger, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _corporate_action_summary(self) -> dict:
+        ledger = getattr(self, "_corporate_action_ledger", [])
+        settled = [row for row in ledger if row["phase"] == "settlement"]
+        unsupported = getattr(self, "_corporate_action_unsupported_held_count", 0)
+        return {"loaded_count": getattr(self, "_corporate_action_loaded_count", 0),
+                "source_databases": getattr(self, "_corporate_action_sources", []),
+                "held_capture_count": sum(row["phase"] == "capture" for row in ledger),
+                "settlement_count": len(settled), "unsupported_held_count": unsupported,
+                **{key: sum(row[key] for row in settled) for key in ("gross_cash", "withheld_tax", "net_cash", "added_shares")},
+                "ending_receivables": 0. if unsupported == 0 else None,
+                "supported_scope": "Shanghai/Shenzhen A-share same-ex/pay/listing-date integral distributions",
+                "tax_model": "research_prepaid_cash_dividend_tax",
+                "tax_model_note": "Cash dividends use gross provider amounts and 20% prepaid tax with FIFO holding-period refunds; exact live tax timing is not reproduced. Held bonus-share events without a certified tax basis are rejected; capital-reserve transfers are modeled as nontaxable, but their reserve origin is not certified.",
+                "data_completeness_verified": False,
+                "data_completeness_note": "Requires independent held-security adjustment-factor/event coverage audit."}
 
     def _load_etf_dividend_events(self) -> dict[str, list[dict]]:
         path = self._etf_dividend_events_path()

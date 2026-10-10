@@ -57,7 +57,7 @@ def is_tushare_fund_code(code: str) -> bool:
 
 
 _A_SHARE_SH_PREFIXES = ("600", "601", "603", "605", "688", "689")
-_A_SHARE_SZ_PREFIXES = ("000", "001", "002", "003", "300", "301")
+_A_SHARE_SZ_PREFIXES = ("000", "001", "002", "003", "300", "301", "302")
 
 
 def is_tushare_a_share_code(code: str) -> bool:
@@ -70,6 +70,8 @@ def is_tushare_a_share_code(code: str) -> bool:
     if "." not in raw:
         return False
     symbol, exchange = raw.split(".", 1)
+    if len(symbol) != 6 or not symbol.isdigit():
+        return False
     if exchange == "SH":
         return symbol.startswith(_A_SHARE_SH_PREFIXES)
     if exchange == "SZ":

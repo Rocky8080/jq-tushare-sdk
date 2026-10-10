@@ -98,117 +98,54 @@ class TestRuntime(unittest.TestCase):
 
     def test_scheduler_filters_weekday_and_time(self):
         scheduler = Scheduler()
+        scheduler.bind_calendar([datetime(2024, 1, day).date() for day in range(8, 13)])
         calls = []
-
-        def daily(context):
-            calls.append(("daily", context.current_dt.weekday()))
-
-        def weekly(context):
-            calls.append(("weekly", context.current_dt.weekday()))
-
-        scheduler.run_daily(daily, time="open")
-        scheduler.run_weekly(weekly, weekday=2, time="open")
-        scheduler.callbacks_for(datetime(2024, 1, 1, 9, 0), "before_open")
-        context = SimpleNamespace(current_dt=datetime(2024, 1, 2, 9, 30))
-
-        callbacks = scheduler.callbacks_for(context.current_dt, "open")
-        for callback in callbacks:
-            callback(context)
-
-        self.assertEqual(calls, [("daily", 1), ("weekly", 1)])
+        def daily(context): calls.append(('daily', context.current_dt.weekday()))
+        def weekly(context): calls.append(('weekly', context.current_dt.weekday()))
+        scheduler.run_daily(daily, time='open')
+        scheduler.run_weekly(weekly, weekday=2, time='open')
+        scheduler.callbacks_for(datetime(2024, 1, 8, 9, 0), 'before_open')
+        context = SimpleNamespace(current_dt=datetime(2024, 1, 9, 9, 30))
+        for callback in scheduler.callbacks_for(context.current_dt, 'open'): callback(context)
+        self.assertEqual(calls, [('daily', 1), ('weekly', 1)])
 
     def test_scheduler_counts_weekly_days_from_midweek_backtest_start(self):
+        # A midweek replay start retains the whole exchange week's ordinal.
         scheduler = Scheduler()
-
-        def second_day(_context):
-            return None
-
-        def fourth_day(_context):
-            return None
-
-        scheduler.run_weekly(second_day, weekday=2, time="open")
-        scheduler.run_weekly(fourth_day, weekday=4, time="open")
-
-        first = scheduler.callbacks_for(datetime(2026, 7, 7, 9, 30), "open")
-        second = scheduler.callbacks_for(
-            datetime(2026, 7, 8, 9, 30),
-            "open",
-            previous_dt=datetime(2026, 7, 7),
-        )
-        scheduler.callbacks_for(
-            datetime(2026, 7, 9, 9, 30),
-            "open",
-            previous_dt=datetime(2026, 7, 8),
-        )
-        fourth = scheduler.callbacks_for(
-            datetime(2026, 7, 10, 9, 30),
-            "open",
-            previous_dt=datetime(2026, 7, 9),
-        )
-
-        self.assertEqual(first, [])
-        self.assertEqual(second, [second_day])
-        self.assertEqual(fourth, [fourth_day])
+        scheduler.bind_calendar([datetime(2026, 7, day).date() for day in range(6, 11)])
+        def second_day(_context): return None
+        def fourth_day(_context): return None
+        scheduler.run_weekly(second_day, weekday=2, time='open')
+        scheduler.run_weekly(fourth_day, weekday=4, time='open')
+        self.assertEqual(scheduler.callbacks_for(datetime(2026, 7, 7, 9, 30), 'open'), [second_day])
+        self.assertEqual(scheduler.callbacks_for(datetime(2026, 7, 8, 9, 30), 'open'), [])
+        self.assertEqual(scheduler.callbacks_for(datetime(2026, 7, 9, 9, 30), 'open'), [fourth_day])
+        self.assertEqual(scheduler.callbacks_for(datetime(2026, 7, 10, 9, 30), 'open'), [])
 
     def test_scheduler_runs_weekly_on_first_trade_day_after_closed_weekday(self):
         scheduler = Scheduler()
+        scheduler.bind_calendar([datetime(2026, 5, day).date() for day in (6, 7, 8)])
         calls = []
-
-        def weekly(context):
-            calls.append(context.current_dt.date().isoformat())
-
-        scheduler.run_weekly(weekly, weekday=1, time="open")
+        def weekly(context): calls.append(context.current_dt.date().isoformat())
+        scheduler.run_weekly(weekly, weekday=1, time='open')
         context = SimpleNamespace(current_dt=datetime(2026, 5, 6, 9, 30))
+        for callback in scheduler.callbacks_for(context.current_dt, 'open', previous_dt=datetime(2026, 4, 30, 9, 30)): callback(context)
+        self.assertEqual(calls, ['2026-05-06'])
+        self.assertEqual(scheduler.callbacks_for(datetime(2026, 5, 7, 9, 30), 'open'), [])
 
-        callbacks = scheduler.callbacks_for(
-            context.current_dt,
-            "open",
-            previous_dt=datetime(2026, 4, 30, 9, 30),
-        )
-        for callback in callbacks:
-            callback(context)
-
-        self.assertEqual(calls, ["2026-05-06"])
-        self.assertEqual(
-            scheduler.callbacks_for(
-                datetime(2026, 5, 7, 9, 30),
-                "open",
-                previous_dt=context.current_dt,
-            ),
-            [],
-        )
-
-    def test_scheduler_runs_weekly_on_first_backtest_day_after_weekday(self):
+    def test_scheduler_does_not_repeat_first_weekday_at_midweek_backtest_start(self):
         scheduler = Scheduler()
-
-        def weekly(_context):
-            return None
-
-        scheduler.run_weekly(weekly, weekday=1, time="open")
-
-        callbacks = scheduler.callbacks_for(
-            datetime(2026, 6, 2, 9, 30),
-            "open",
-            previous_dt=None,
-        )
-
-        self.assertEqual(callbacks, [weekly])
+        scheduler.bind_calendar([datetime(2026, 6, day).date() for day in range(1, 6)])
+        def weekly(_context): return None
+        scheduler.run_weekly(weekly, weekday=1, time='open')
+        self.assertEqual(scheduler.callbacks_for(datetime(2026, 6, 2, 9, 30), 'open', previous_dt=None), [])
 
     def test_scheduler_waits_when_first_backtest_day_precedes_weekday(self):
         scheduler = Scheduler()
-
-        def weekly(_context):
-            return None
-
-        scheduler.run_weekly(weekly, weekday=5, time="open")
-
-        callbacks = scheduler.callbacks_for(
-            datetime(2026, 6, 2, 9, 30),
-            "open",
-            previous_dt=None,
-        )
-
-        self.assertEqual(callbacks, [])
+        scheduler.bind_calendar([datetime(2026, 6, day).date() for day in range(1, 6)])
+        def weekly(_context): return None
+        scheduler.run_weekly(weekly, weekday=5, time='open')
+        self.assertEqual(scheduler.callbacks_for(datetime(2026, 6, 2, 9, 30), 'open', previous_dt=None), [])
 
     def test_scheduler_rejects_unsupported_kwargs(self):
         scheduler = Scheduler()

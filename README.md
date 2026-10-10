@@ -384,7 +384,7 @@ http://127.0.0.1:8787/report.html
 
 ## Versioning
 
-当前版本：`v0.10.33`
+当前版本：`v0.10.35`
 
 版本号遵循 Semantic Versioning：
 
@@ -429,3 +429,24 @@ python -m unittest discover -s tests -p "test_*.py"
 - 大型日志、临时 CSV、下载文件
 
 建议通过环境变量传入 token，不要把 token 写进代码或配置文件。个人实验策略应放在 `experiments/`、`examples/private/` 或仓库外目录；这些路径默认不会提交或发布。
+
+## Fundamentals consistency in 0.10.34
+
+Fundamentals dates are independent from price clamping. Default queries use the previous completed trading day; date and statDate are mutually exclusive. Replay rejects a cached same-day EOD snapshot before its visibility cutoff. Quarter queries use quarter-end valuation and the specified income period, while annual statDate returns cumulative annual income. Referenced tables join by code intersection; a required empty table cannot disappear from the join.
+
+Financial modes are explicit: `cached_snapshot` preserves provider TTM PE and missing values, `research_reconstructed` allows clearly marked retrospective signed TTM calculations, and `strict_pit` requires captured or verified report revisions visible at the decision time. `strict_local` only controls network access. None of these settings can restore historical revisions already overwritten in an old cache. Long-paused identities remain traceable, but stale valuation fields are unavailable unless their inputs can be verified.
+
+`finance.capabilities()` reports native `STK_FIN_FORCAST` as unsupported until its schema and field mapping are verified. The separate `finance.TUSHARE_FORECAST` extension uses explicit announcement windows and coverage evidence; it never impersonates native JoinQuant data.
+
+The JoinQuant engine uses the documented half-spread, STAR minimum quantity and unit increments, dated stock T+1 settlement and complete exchange calendars for weekly/monthly callbacks. Calendar-returning APIs now provide a NumPy object array of native dates; callers must use `list(days)` rather than array truth tests.
+
+Use `--financial-mode strict_pit` with `check-data` or `backtest` to require verified historical versions. `--financial-mode research_reconstructed` is an explicitly retrospective research calculation. The default `cached_snapshot` is not a PIT certificate. The effective mode and financial provenance are saved in each run manifest. Programmatic Web requests accept the same `financial_mode` value.
+
+
+### Explicit research replay and strategy data requirements
+
+Use `--financial-mode research_reconstructed` for research strategies that explicitly support signed TTM reconstruction and disclosed per-security data exclusions. `get_data_contract()` exposes the effective mode and cache snapshot identity; it never grants native reproduction eligibility. Quarterly financial queries in this mode use the previous calendar day's announcement cutoff; this does not recover original historical financial versions.
+
+A strategy may declare a literal `JQTS_DATA_REQUIREMENTS` dictionary keyed by financial mode, with `finance_tables` and `forecast_lookback_days`. The engine validates declared table capabilities and continuous whole-market forecast coverage before importing the strategy. Unsupported native `STK_FIN_FORCAST` stays unsupported. An explicitly adapted research factor may use `finance.TUSHARE_FORECAST`, whose output identifies its source, units, publication cutoff, and coverage. Data capture time is never backdated.
+
+A-share corporate actions read the configured unified cache as well as yearly shards. `artifacts/corporate_action_ledger.json` records source rows, record-date entitlements, gross cash, withheld tax, net cash and added shares. The supported settlement scope is same-day ex/payment/listing with integral account quantities. Held deferred distributions, unverified fractional allocations and taxable bonus shares without a certified tax basis fail explicitly. Cash dividends retain the research model of 20% prepayment followed by FIFO holding-period refunds; exact live tax timing and capital-reserve tax treatment are not certified. A separate held-security adjustment-factor audit is needed to verify source-event completeness.

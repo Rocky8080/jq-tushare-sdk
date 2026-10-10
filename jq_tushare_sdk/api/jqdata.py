@@ -1,11 +1,21 @@
 import inspect
 import os
+import hashlib
+import json
+from pathlib import Path
 from datetime import datetime, time, timedelta
 
 import pandas as pd
 
+from jq_tushare_sdk.api import finance
 from jq_tushare_sdk.api.query import FilterExpr, Query
 from jq_tushare_sdk.data.code_map import normalize_date
+from jq_tushare_sdk.data.fundamentals_contract import (
+    FundamentalsUnavailableError,
+    previous_calendar_date,
+    validated_date,
+    validate_daily_snapshot_visibility,
+)
 
 _STATE = None
 
@@ -19,6 +29,35 @@ def runtime_state():
     if _STATE is None:
         raise RuntimeError("jq_tushare_sdk runtime state is not initialized")
     return _STATE
+
+
+def get_data_contract():
+    """Describe the actual local data contract, without granting native parity.
+
+    A strategy must opt into research behavior explicitly. Merely running in
+    the local engine or receiving incomplete values does not enable it.
+    """
+    backend = runtime_state().data_portal.backend
+    mode = getattr(backend, "financial_mode", "cached_snapshot")
+    identity = {"financial_mode": mode}
+    cache = getattr(backend, "cache_db", None)
+    if cache:
+        for suffix in ("", "-wal"):
+            path = Path(str(cache) + suffix)
+            try:
+                stat = path.stat()
+                identity[suffix or "database"] = [str(path.resolve()), stat.st_size, stat.st_mtime_ns]
+            except FileNotFoundError:
+                identity[suffix or "database"] = None
+    return {
+        "provider": "jq-tushare-sdk",
+        "financial_mode": mode,
+        "native_reproduction_eligible": False,
+        "data_snapshot_id": hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest(),
+        "report_visibility": "announcement_cutoff" if mode == "research_reconstructed" else mode,
+        "strict_pit_required": mode == "strict_pit",
+        "historical_vintages_verified": False,
+    }
 
 
 def get_price(
@@ -164,9 +203,30 @@ def get_industry(securities, date=None):
 
 
 def get_fundamentals(q: Query, date=None, statDate=None):
-    effective_date = _context_data_date(date)
-    df = runtime_state().data_portal.get_fundamentals(q, date=effective_date, statDate=statDate)
+    if date is not None and statDate is not None:
+        raise ValueError("get_fundamentals date and statDate are mutually exclusive")
+    portal = runtime_state().data_portal
+    current_dt = _context_current_date()
+    # statDate denotes a report period; it is not implicitly paired with date.
+    effective_date = None
+    if statDate is None:
+        requested = date
+        if requested is None and current_dt is not None:
+            requested = previous_calendar_date(current_dt)
+        if requested is not None:
+            effective_date = _resolve_fundamentals_trade_date(portal, requested)
+            validate_daily_snapshot_visibility(effective_date, current_dt)
+    parameters = {"date": effective_date, "statDate": statDate}
+    signature = inspect.signature(portal.get_fundamentals)
+    if "as_of" in signature.parameters:
+        parameters["as_of"] = current_dt
+        parameters["requested_date"] = date
+    df = portal.get_fundamentals(q, **parameters)
     _require_query_columns(df, [field.name for field in q.fields], "selected")
+    # A DataPortal executes filters/order before projection. Do not reapply
+    # filters on fields that have already been legitimately projected out.
+    if df.attrs.get("query_executed"):
+        return df.reset_index(drop=True)
     _require_query_columns(df, [expr.field.name for expr in q.filters], "filter")
     _require_query_columns(df, [ordering.field.name for ordering in q.ordering], "ordering")
     for expr in q.filters:
@@ -183,10 +243,35 @@ def get_fundamentals(q: Query, date=None, statDate=None):
     return df.reset_index(drop=True)
 
 
+def _resolve_fundamentals_trade_date(portal, requested):
+    day = validated_date(requested)
+    resolver = getattr(portal, "resolve_fundamentals_date", None)
+    if callable(resolver):
+        return resolver(day)
+    if not hasattr(portal, "get_trade_days"):
+        raise FundamentalsUnavailableError("trade_calendar_unavailable", requested_date=day)
+    signature = inspect.signature(portal.get_trade_days)
+    if "count" in signature.parameters:
+        days = portal.get_trade_days(end_date=day, count=1)
+    else:
+        days = portal.get_trade_days("1900-01-01", day)
+    visible = [validated_date(item) for item in days if validated_date(item) <= day]
+    if not visible:
+        raise FundamentalsUnavailableError("previous_trade_day_unavailable", requested_date=day)
+    return max(visible)
+
+
 def get_fundamentals_continuously(q: Query, end_date=None, count=1):
+    portal = runtime_state().data_portal
+    current_dt = _context_current_date()
+    request = end_date
+    if request is None and current_dt is not None:
+        request = previous_calendar_date(current_dt)
+    effective_date = _resolve_fundamentals_trade_date(portal, request) if request is not None else None
+    validate_daily_snapshot_visibility(effective_date, current_dt)
     return runtime_state().data_portal.get_fundamentals_continuously(
         q,
-        end_date=_context_data_date(end_date),
+        end_date=effective_date,
         count=count,
     )
 

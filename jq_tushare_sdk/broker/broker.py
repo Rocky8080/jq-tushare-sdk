@@ -10,7 +10,7 @@ import numpy as np
 
 from jq_tushare_sdk.broker.costs import CostModel
 from jq_tushare_sdk.broker.order import Order, Trade
-from jq_tushare_sdk.broker.portfolio import round_lot_amount, trade_lot_size
+from jq_tushare_sdk.broker.portfolio import minimum_trade_amount, round_lot_amount, trade_lot_size
 from jq_tushare_sdk.data.code_map import is_tushare_fund_code
 from jq_tushare_sdk.runtime.context import Position
 
@@ -34,10 +34,25 @@ class Broker:
         self.orders: list[Order] = []
         self.trades: list[Trade] = []
         self.target_portfolio_signals: list[dict] = []
+        current_dt = getattr(context, "current_dt", None)
+        self._settlement_date = str(current_dt)[:10] if current_dt is not None else None
         self._order_seq = 0
         self._trade_seq = 0
         self._tax_lot_seq = 0
         self._dividend_tax_lots: dict[str, list[_DividendTaxLot]] = {}
+        self._closed_dividend_tax_lots: dict[int, _DividendTaxLot] = {}
+        self._dividend_tax_sales: dict[int, list[tuple[float, datetime | None]]] = {}
+
+    def settle_trading_day(self, trading_day):
+        """Unlock existing stock inventory once at each completed day boundary."""
+        day_key = str(trading_day)[:10]
+        if self._settlement_date == day_key:
+            return
+        if self._settlement_date is not None and day_key < self._settlement_date:
+            raise ValueError("Trading-day settlement cannot move backwards")
+        self._settlement_date = day_key
+        for position in self.context.portfolio.positions.values():
+            position.closeable_amount = int(position.total_amount)
 
     def capture_dividend_lots(self, security: str, amount: float) -> list[dict]:
         remaining = max(0.0, float(amount or 0.0))
@@ -48,7 +63,11 @@ class Broker:
             allocated = min(remaining, float(lot.remaining_amount or 0.0))
             if allocated <= 0:
                 continue
-            allocations.append({"lot_id": lot.lot_id, "amount": allocated})
+            allocations.append({
+                "lot_id": lot.lot_id,
+                "amount": allocated,
+                "sales_offset": len(self._dividend_tax_sales.get(lot.lot_id, [])),
+            })
             remaining -= allocated
         return allocations
 
@@ -61,16 +80,70 @@ class Broker:
         tax_rate: float = 0.20,
     ) -> float:
         lots = {lot.lot_id: lot for lot in self._dividend_tax_lots.get(str(security), [])}
-        attached = 0.0
+        charges = []
         for allocation in allocations:
-            lot = lots.get(allocation.get("lot_id"))
+            lot_id = allocation.get("lot_id")
+            lot = lots.get(lot_id) or self._closed_dividend_tax_lots.get(lot_id)
             amount = max(0.0, float(allocation.get("amount") or 0.0))
-            if lot is None or amount <= 0:
+            if amount <= 0:
                 continue
-            tax = amount * max(0.0, float(cash_per_share or 0.0)) * max(0.0, float(tax_rate))
-            lot.pending_tax += tax
-            attached += tax
+            if lot is None:
+                raise ValueError("Dividend entitlement refers to an unknown tax lot")
+            # An entitlement survives a sale after its record date. Retain the
+            # actual sale date so a closed lot neither loses its dividend tax
+            # nor receives a future refund that can no longer be realized.
+            remaining = amount
+            sold_tax = 0.0
+            for sold_amount, sold_at in self._dividend_tax_sales.get(lot_id, [])[int(allocation.get("sales_offset", 0)):]:
+                consumed = min(remaining, sold_amount)
+                sold_tax += consumed * max(0.0, float(cash_per_share)) * self._dividend_tax_rate(lot.acquired_at, sold_at=sold_at)
+                remaining -= consumed
+                if remaining <= 0:
+                    break
+            if remaining > float(lot.remaining_amount) + 1e-8:
+                raise ValueError("Dividend tax lot does not cover the recorded entitlement")
+            pending = remaining * max(0.0, float(cash_per_share or 0.0)) * max(0.0, float(tax_rate))
+            charges.append((lot, pending, sold_tax))
+        attached = 0.0
+        for lot, pending, sold_tax in charges:
+            lot.pending_tax += pending
+            attached += pending + sold_tax
         return attached
+
+    def add_corporate_action_shares(self, security: str, allocations: list[dict], share_ratio: float) -> None:
+        """Carry a same-day stock distribution into the original FIFO cohorts.
+
+        Existing prepaid cash-dividend tax is preserved in total; it is not
+        multiplied by the new share count. Fractional cohort quantities are
+        allowed only when the engine has certified an integral account total.
+        """
+        if share_ratio <= 0:
+            return
+        lots = self._dividend_tax_lots.setdefault(str(security), [])
+        current = {lot.lot_id: lot for lot in lots}
+        additions = []
+        for allocation in allocations:
+            lot_id = allocation.get("lot_id")
+            lot = current.get(lot_id) or self._closed_dividend_tax_lots.get(lot_id)
+            if lot is None:
+                raise ValueError("Stock distribution refers to an unknown tax lot")
+            additions.append((lot, max(0., float(allocation.get("amount") or 0.)) * share_ratio))
+        for lot, amount in additions:
+            if lot.lot_id not in current:
+                lots.append(lot)
+                current[lot.lot_id] = lot
+                self._closed_dividend_tax_lots.pop(lot.lot_id, None)
+            lot.remaining_amount += amount
+        lots.sort(key=lambda lot: lot.lot_id)
+
+    def remaining_corporate_action_shares(self, allocations: list[dict]) -> float:
+        """Shares from the recorded entitlement that have not since been sold."""
+        total = 0.0
+        for allocation in allocations:
+            sales = self._dividend_tax_sales.get(allocation["lot_id"], [])
+            sold = sum(amount for amount, _ in sales[int(allocation.get("sales_offset", 0)):])
+            total += max(0., float(allocation["amount"]) - sold)
+        return total
 
     def order(
         self,
@@ -85,12 +158,20 @@ class Broker:
         self._validate_kwargs(kwargs)
         self._validate_style(style)
 
+        current_dt = getattr(self.context, "current_dt", None)
+        if current_dt is not None:
+            date_method = getattr(current_dt, "date", None)
+            self.settle_trading_day(date_method() if callable(date_method) else current_dt)
         requested_amount = int(amount or 0)
         if requested_amount == 0:
             return self._reject(security, 0, self._style_price(style), "zero amount order")
 
         side = "buy" if requested_amount > 0 else "sell"
-        rounded_amount = round_lot_amount(security, requested_amount, side)
+        # A remaining odd lot may be sold once in full; availability is checked below.
+        if side == "sell" and abs(requested_amount) == self._total_amount(security):
+            rounded_amount = requested_amount
+        else:
+            rounded_amount = round_lot_amount(security, requested_amount, side)
         if rounded_amount == 0:
             return self._reject(security, requested_amount, self._style_price(style), "amount below lot size")
 
@@ -260,7 +341,10 @@ class Broker:
             new_total = existing.total_amount + amount
             existing.avg_cost = (current_cost + amount * price) / new_total
             existing.total_amount = new_total
-            existing.closeable_amount += amount
+            # Dated stock orders settle on T+1. Preserve the existing undated
+            # simulation contract and the existing fund contract separately.
+            if is_tushare_fund_code(security) or self.context.current_dt is None:
+                existing.closeable_amount += amount
             existing.price = price
             return
 
@@ -298,15 +382,20 @@ class Broker:
                 adjustment += final_tax - withheld_tax
                 lot.pending_tax -= withheld_tax
             lot.remaining_amount -= consumed
+            self._dividend_tax_sales.setdefault(lot.lot_id, []).append(
+                (consumed, getattr(self.context, "current_dt", None))
+            )
             remaining -= consumed
+            if lot.remaining_amount <= 0:
+                self._closed_dividend_tax_lots[lot.lot_id] = lot
         self._dividend_tax_lots[str(security)] = [
             lot for lot in lots if lot.remaining_amount > 0
         ]
         return adjustment
 
-    def _dividend_tax_rate(self, acquired_at: datetime | None) -> float:
+    def _dividend_tax_rate(self, acquired_at: datetime | None, *, sold_at: datetime | None = None) -> float:
         acquired_on = self._as_date(acquired_at)
-        sold_on = self._as_date(getattr(self.context, "current_dt", None))
+        sold_on = self._as_date(sold_at if sold_at is not None else getattr(self.context, "current_dt", None))
         if acquired_on is None or sold_on is None:
             return 0.20
         if sold_on <= self._add_calendar_months(acquired_on, 1):
@@ -437,7 +526,7 @@ class Broker:
 
         max_budget = min(float(budget), float(self.context.portfolio.available_cash))
         lot = trade_lot_size(security, "buy")
-        low = 0
+        low = (minimum_trade_amount(security, "buy") + lot - 1) // lot
         high = desired_amount // lot
         best = 0
         while low <= high:
