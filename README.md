@@ -19,15 +19,25 @@ JQ Tushare SDK 是一个本地回测运行时，用 Tushare 数据和本地缓�
 
 建议使用 Python 3.11 或更新版本。
 
+仓库：[Rocky8080/jq-tushare-sdk](https://github.com/Rocky8080/jq-tushare-sdk)。当前发布包与更新说明：[v0.11.0](https://github.com/Rocky8080/jq-tushare-sdk/releases/tag/v0.11.0)。独立策略平台：[jq-strategy-platform](https://github.com/Rocky8080/jq-strategy-platform)（需仓库权限）。
+
 ```bash
-git clone <repo-url>
-cd <repo>
+git clone https://github.com/Rocky8080/jq-tushare-sdk.git
+cd jq-tushare-sdk
 
 python -m venv .venv
 source .venv/bin/activate
 
 pip install --upgrade pip
 pip install -e .
+```
+
+也可从 GitHub Release 安装固定版本（不依赖包索引上的同名版本）：
+
+```bash
+gh release download v0.11.0 --repo Rocky8080/jq-tushare-sdk \
+  --pattern '*.whl' --pattern SHA256SUMS --dir .packages
+python -m pip install .packages/jq_tushare_sdk-0.11.0-py3-none-any.whl
 ```
 
 更新 Tushare 数据缓存时需要配置 token：
