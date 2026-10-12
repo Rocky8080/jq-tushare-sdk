@@ -1,7 +1,7 @@
-"""Explicit finance capabilities; native schemas are never guessed.
+"""Forecast APIs with explicit source and observation boundaries.
 
-TUSHARE_FORECAST is a supported Tushare extension. STK_FIN_FORCAST remains
-unsupported until a verified JoinQuant native schema/mapping is supplied.
+TUSHARE_FORECAST retains the Tushare provider schema. STK_FIN_FORCAST reads
+complete native JoinQuant exports; Tushare text is never substituted.
 """
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import pandas as pd
 from jq_tushare_sdk.api.query import FieldRef, Query
 from jq_tushare_sdk.data.code_map import normalize_date, to_joinquant_code, to_tushare_code
 from jq_tushare_sdk.data.financial_provenance import FinancialVintageUnavailable
+from jq_tushare_sdk.data.native_forecast import NATIVE_FIELDS, run_native_forecast_query
 
 
 class FinanceCapabilityUnavailable(NotImplementedError):
@@ -32,7 +33,7 @@ class ForecastTable:
 _FIELDS = ('code', 'pub_date', 'end_date', 'type', 'p_change_min', 'p_change_max',
            'net_profit_min', 'net_profit_max', 'last_parent_net', 'first_ann_date', 'summary', 'change_reason')
 TUSHARE_FORECAST = ForecastTable('TUSHARE_FORECAST', _FIELDS)
-STK_FIN_FORCAST = ForecastTable('STK_FIN_FORCAST', ('code', 'pub_date'))
+STK_FIN_FORCAST = ForecastTable('STK_FIN_FORCAST', NATIVE_FIELDS)
 _NUMERIC_FIELDS = ('p_change_min', 'p_change_max', 'net_profit_min', 'net_profit_max', 'last_parent_net')
 _FIELD_UNITS = {'p_change_min': 'percent', 'p_change_max': 'percent',
                 'net_profit_min': 'ten_thousand_cny', 'net_profit_max': 'ten_thousand_cny',
@@ -41,7 +42,12 @@ _FIELD_UNITS = {'p_change_min': 'percent', 'p_change_max': 'percent',
 
 def capabilities():
     return {
-        'STK_FIN_FORCAST': {'supported': False, 'reason': 'native_forecast_schema_unverified', 'coverage': 'unavailable'},
+        'STK_FIN_FORCAST': {'supported': True, 'supported_fields': list(NATIVE_FIELDS),
+                            'source': 'joinquant.finance.STK_FIN_FORCAST',
+                            'coverage': 'requires_complete_native_snapshot_observed_before_decision',
+                            'tushare_text_substitution': False,
+                            'native_reproduction_eligible': False,
+                            'historical_vintage_coverage': 'not_certified_by_observation_export'},
         'TUSHARE_FORECAST': {'supported': True, 'source': 'tushare.forecast', 'schema': list(_FIELDS),
                              'profit_unit': 'ten_thousand_cny', 'growth_unit': 'percent',
                              'field_units': dict(_FIELD_UNITS),
@@ -141,14 +147,16 @@ def run_query(q: Query):
     tables = {field._table_name if isinstance(field, ForecastTable) else field.table for field in q.fields}
     tables.update(expr.field.table for expr in q.filters)
     tables.update(item.field.table for item in q.ordering)
-    if 'STK_FIN_FORCAST' in tables:
-        raise FinanceCapabilityUnavailable('native_forecast_schema_unverified: cannot fabricate STK_FIN_FORCAST from Tushare')
+    if tables == {'STK_FIN_FORCAST'}:
+        state = runtime_state()
+        return run_native_forecast_query(q, state, _publication_cutoff(state))
     if tables != {'TUSHARE_FORECAST'}:
         raise FinanceCapabilityUnavailable(f'Unsupported finance tables: {sorted(str(item) for item in tables)}')
     selected = list(_FIELDS) if any(isinstance(field, ForecastTable) for field in q.fields) else [field.name for field in q.fields]
     requested_fields = set(selected) | {expr.field.name for expr in q.filters} | {item.field.name for item in q.ordering}
-    if requested_fields - set(_FIELDS):
-        raise FinanceCapabilityUnavailable('Unsupported forecast fields: ' + ', '.join(sorted(requested_fields - set(_FIELDS))))
+    supported = _FIELDS
+    if requested_fields - set(supported):
+        raise FinanceCapabilityUnavailable('Unsupported forecast fields: ' + ', '.join(sorted(requested_fields - set(supported))))
     starts = [(_day(expr.value) + pd.Timedelta(days=int(expr.operator == '>'))).strftime('%Y%m%d')
               for expr in q.filters if expr.field.name == 'pub_date' and expr.operator in {'>=', '>', '=='}]
     ends = [(_day(expr.value) - pd.Timedelta(days=int(expr.operator == '<'))).strftime('%Y%m%d')
@@ -224,6 +232,8 @@ def run_query(q: Query):
         frame = frame.sort_values(item.field.name, ascending=item.direction != 'desc')
     result = frame[selected].reset_index(drop=True)
     result.attrs.update(source='tushare.forecast', native_compatibility_verified=False,
+                        requested_table='TUSHARE_FORECAST',
+                        complete_native_table_supported=False,
                         native_reproduction_eligible=False,
                         financial_mode=getattr(backend, 'financial_mode', 'cached_snapshot'),
                         pit_verified=bool(getattr(backend, 'strict_pit', False)),

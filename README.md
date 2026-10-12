@@ -15,6 +15,8 @@ JQ Tushare SDK 是一个本地回测运行时，用 Tushare 数据和本地缓�
 - 默认启用透明数据层优化，按 `count` 所需历史窗口读取行情，通过有限预读减少重复查询，并用复权因子变化节点加速前复权计算。
 - 提供本地 Web 控制台，可选择策略、设置资金和日期、运行回测并查看历史报告。
 
+高精度因子可显式选择 `sina_hfq` 或 `daily_ex_reference`，股本公告和原始发布时间独立归档；默认保留 Tushare 原值及财报原公告口径，月末股本不冒充逐笔登记日期。
+
 ## Installation
 
 建议使用 Python 3.11 或更新版本。
@@ -178,6 +180,8 @@ python scripts/export_joinquant_members_local.py \
 完全不同。每次回测会把生效口径写入 `manifest.json` 的 `industry_provenance` 字段
 （provider、compat、SW 成员表行数、导入的聚宽分类/成员 SHA-256）：
 
+默认 `joinquant_taxonomy` 使用 Tushare 历史成员及已导入的聚宽分类名称；没有分类字典时先导入，原始 Tushare 名称可显式设置 `JQTS_INDUSTRY_PROVIDER=tushare`。
+
 - `scripts/compare_backtest_runs.py` 在两侧行业口径不一致（或仅一侧记录）时拒绝对比，
   避免把行业数据差异误判为策略改动。
 - Readiness 检查在策略调用 `get_industry` 且所配置 provider 的表缺失时阻塞回测，
@@ -267,6 +271,23 @@ Web 控制台会为每次回测启动独立 worker 进程；macOS 上由一次�
 ```text
 Backtest complete: backtest_runs/<run_id>
 ```
+
+## 每日数据对账示例
+
+`examples/data_alignment_audit_strategy.py` 可复制到聚宽独立策略，也可在本地 SDK 运行，每天 09:00 和 15:30 记录行情、交易日历、指数成分、行业、估值、财报和样本虚拟选股信号。策略、采集工具和日志比较工具统一维护在 `examples/`。示例不下单、不调用 Redis，接口不支持或数据缺失会明确写入日志。
+
+安装 SDK 并准备真实缓存后，在仓库根目录运行：
+
+```bash
+python examples/run_data_alignment_audit.py \
+  --start 2026-10-08 --end 2026-10-09
+```
+
+结果保存在 Git ignored 的 `artifacts/data_alignment_<timestamp>_<pid>/`。将聚宽在相同日期、相同配置下导出的完整日志交给 `examples/compare_data_alignment_logs.py`，可生成按日期、接口、股票和字段展示原值的差异报告。完整步骤见 [使用说明](examples/DATA_ALIGNMENT_README.rst)，已知覆盖缺口见 [覆盖审查](examples/DATA_ALIGNMENT_REVIEW.rst)。没有聚宽日志时，只报告本地覆盖情况，不判定跨平台一致。
+
+v0.4.0 增加股本、年度/季度收入和净利润分项及有实际记录的预告样本。`examples/analyze_data_alignment_logs.py` 可生成去重差异、复权传播诊断、样本筛选/排名影响和双端完整解码；参考因子仅用于诊断，不写入 SDK 行情。
+
+原生预告与估值的完整导出、导入和诊断见 [导入说明](docs/native_data_import.md)。这些归档保留实际观察时间；历史 PIT 和完整聚宽执行等价性仍需独立验证。
 
 ## Baseline Template
 
@@ -454,7 +475,7 @@ Fundamentals dates are independent from price clamping. Default queries use the 
 
 Financial modes are explicit: `cached_snapshot` preserves provider TTM PE and missing values, `research_reconstructed` allows clearly marked retrospective signed TTM calculations, and `strict_pit` requires captured or verified report revisions visible at the decision time. `strict_local` only controls network access. None of these settings can restore historical revisions already overwritten in an old cache. Long-paused identities remain traceable, but stale valuation fields are unavailable unless their inputs can be verified.
 
-`finance.capabilities()` reports native `STK_FIN_FORCAST` as unsupported until its schema and field mapping are verified. The separate `finance.TUSHARE_FORECAST` extension uses explicit announcement windows and coverage evidence; it never impersonates native JoinQuant data.
+`finance.STK_FIN_FORCAST` reads complete, validated native JoinQuant export snapshots, including original fields and text. Availability depends on the requested publication window, security scope and actual observation/import times being visible before the decision. Historical vintages and native reproduction remain uncertified; `strict_pit` is blocked. The separate `finance.TUSHARE_FORECAST` extension retains the provider schema and never substitutes its text for native data.
 
 The JoinQuant engine uses the documented half-spread, STAR minimum quantity and unit increments, dated stock T+1 settlement and complete exchange calendars for weekly/monthly callbacks. Calendar-returning APIs now provide a NumPy object array of native dates; callers must use `list(days)` rather than array truth tests.
 
@@ -465,6 +486,6 @@ Use `--financial-mode strict_pit` with `check-data` or `backtest` to require ver
 
 Use `--financial-mode research_reconstructed` for research strategies that explicitly support signed TTM reconstruction and disclosed per-security data exclusions. `get_data_contract()` exposes the effective mode and cache snapshot identity; it never grants native reproduction eligibility. Quarterly financial queries in this mode use the previous calendar day's announcement cutoff; this does not recover original historical financial versions.
 
-A strategy may declare a literal `JQTS_DATA_REQUIREMENTS` dictionary keyed by financial mode, with `finance_tables` and `forecast_lookback_days`. The engine validates declared table capabilities and continuous whole-market forecast coverage before importing the strategy. Unsupported native `STK_FIN_FORCAST` stays unsupported. An explicitly adapted research factor may use `finance.TUSHARE_FORECAST`, whose output identifies its source, units, publication cutoff, and coverage. Data capture time is never backdated.
+A strategy may declare a literal `JQTS_DATA_REQUIREMENTS` dictionary keyed by financial mode, with `finance_tables` and `forecast_lookback_days`. The engine validates declared table capabilities and continuous whole-market forecast coverage before importing the strategy. Native `STK_FIN_FORCAST` requires a complete validated export visible before the decision; an archive captured later cannot unlock a historical query. An explicitly adapted research factor may use `finance.TUSHARE_FORECAST`, whose output identifies its source, units, publication cutoff, and coverage. Data capture time is never backdated.
 
 A-share corporate actions read the configured unified cache as well as yearly shards. `artifacts/corporate_action_ledger.json` records source rows, record-date entitlements, gross cash, withheld tax, net cash and added shares. The supported settlement scope is same-day ex/payment/listing with integral account quantities. Held deferred distributions, unverified fractional allocations and taxable bonus shares without a certified tax basis fail explicitly. Cash dividends retain the research model of 20% prepayment followed by FIFO holding-period refunds; exact live tax timing and capital-reserve tax treatment are not certified. A separate held-security adjustment-factor audit is needed to verify source-event completeness.

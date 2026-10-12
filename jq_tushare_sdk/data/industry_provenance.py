@@ -29,7 +29,7 @@ _JQ_MEMBER_TABLE = "jq_industry_member"
 
 def effective_industry_provider() -> str:
     """Return the industry provider that will actually be used."""
-    provider = os.environ.get("JQTS_INDUSTRY_PROVIDER", "tushare").strip()
+    provider = os.environ.get("JQTS_INDUSTRY_PROVIDER", "joinquant_taxonomy").strip()
     if provider not in _INDUSTRY_PROVIDERS:
         raise ValueError("JQTS_INDUSTRY_PROVIDER must be tushare, joinquant_taxonomy, or joinquant_full")
     return provider

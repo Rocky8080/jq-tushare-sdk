@@ -62,3 +62,6 @@ experiments/
 examples/private/
 strategies/
 *.secret.*
+
+# Private real-data verification evidence
+/artifacts/

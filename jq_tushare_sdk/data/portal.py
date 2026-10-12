@@ -1,6 +1,7 @@
 import os
 import time
 import hashlib
+from decimal import Decimal, ROUND_HALF_UP
 from collections import OrderedDict
 from datetime import date, datetime
 from types import SimpleNamespace
@@ -25,6 +26,7 @@ from jq_tushare_sdk.data.code_map import (
 )
 from jq_tushare_sdk.data.joinquant_fields import PRICE_FIELD_MAP
 from jq_tushare_sdk.data.joinquant_industry import normalize_industry_code
+from jq_tushare_sdk.data.industry_provenance import effective_industry_provider
 from jq_tushare_sdk.data.security_state import HistoricalSecurityState
 from jq_tushare_sdk.data.financial_provenance import FinancialVintageUnavailable, select_visible_reports, signed_ttm_by_security
 from jq_tushare_sdk.data.fundamentals_contract import (
@@ -33,6 +35,12 @@ from jq_tushare_sdk.data.fundamentals_contract import (
     validated_date,
     validate_daily_snapshot_visibility,
 )
+
+_DEFAULT_FQ = object()
+
+
+class PriceDataUnavailable(ValueError):
+    """Missing observations must not become synthetic suspension prices."""
 
 
 class JoinQuantDateStr(str):
@@ -105,15 +113,7 @@ class DataPortal:
         self._sw_l1_name_by_code = None
         self._jq_classification_cache = {}
         self._jq_members_index = None
-        self._industry_provider = os.environ.get("JQTS_INDUSTRY_PROVIDER", "tushare").strip()
-        if self._industry_provider not in {
-            "tushare",
-            "joinquant_taxonomy",
-            "joinquant_full",
-        }:
-            raise ValueError(
-                "JQTS_INDUSTRY_PROVIDER must be tushare, joinquant_taxonomy, or joinquant_full"
-            )
+        self._industry_provider = effective_industry_provider()
         self._valuation_cache = {}
         self._portal_calls = {"get_price": {"count": 0, "seconds": 0.0}}
         self._result_cache_hits = 0
@@ -137,7 +137,7 @@ class DataPortal:
         fields=None,
         frequency="daily",
         panel=False,
-        fq=None,
+        fq=_DEFAULT_FQ,
         **kwargs,
     ):
         started = time.perf_counter()
@@ -167,12 +167,10 @@ class DataPortal:
         fields=None,
         frequency="daily",
         panel=False,
-        fq=None,
+        fq=_DEFAULT_FQ,
         **kwargs,
     ):
-        if fq is None and self._default_fq:
-            # JoinQuant's get_price defaults to pre-adjusted (fq='pre'); the SDK
-            # stays raw (None) unless opted in via JQTS_DEFAULT_FQ or the portal.
+        if fq is _DEFAULT_FQ:
             fq = self._default_fq
         skip_paused = bool(kwargs.pop("skip_paused", False))
         fill_paused = bool(kwargs.pop("fill_paused", False))
@@ -274,6 +272,8 @@ class DataPortal:
                 adjust_seed=already_adjusted,
             )
         if df.empty:
+            if fill_paused and not skip_paused:
+                raise PriceDataUnavailable(f"price_data_missing: {api_name} has no observations for {securities}; prepare source data first")
             return pd.DataFrame(columns=["time", "code"] + fields)
         self._validate_price_frame(df)
         if source_count is not None and not canonical_selected:
@@ -285,6 +285,8 @@ class DataPortal:
                 fq=fq,
                 adjustment_end_date=end_date,
             )
+        if "factor" not in df:
+            df["factor"] = 1.0
         if skip_paused and "vol" in df.columns:
             volume = pd.to_numeric(df["vol"], errors="coerce").fillna(0.0)
             df = df[volume > 0].reset_index(drop=True)
@@ -296,12 +298,26 @@ class DataPortal:
                 start_date=start_date,
                 end_date=end_date,
                 count=count,
+                api_name=api_name,
+                securities=securities,
+                fq=fq,
             )
         format_started = time.perf_counter()
         try:
-            result = self._format_price_frame(df, fields)
+            result = self._format_price_frame(df, fields, api_name=api_name)
         finally:
             self._format_seconds += time.perf_counter() - format_started
+        result.attrs["price_provenance"] = {"source_api": api_name, "fq": fq,
+            "volume_unit": "shares", "money_unit": "CNY",
+            "adjustment_source": ({"sina_hfq": "sina.hfq precise change nodes", "daily_ex_reference": "Tushare observed ex-day reference price rule"}.get(getattr(self.backend, "adjustment_source", "tushare"), "Tushare dated adj_factor") if api_name == "daily" else "Tushare fund_adj") if fq == "pre" and api_name in {"daily", "fund_daily"} else "unadjusted",
+            "adjustment_historical_vintages_verified": False,
+            "factor_receipts": {code: receipt for code, receipt in getattr(self.backend, "precise_factor_provenance", {}).items()
+                                if api_name == "daily" and fq == "pre" and code in set(df.get("ts_code", []))},
+            "native_factor_equivalence_verified": False,
+            "factor_precision_policy": ("decimal_ratio_from_rounded_observed_reference_quotes; not_exact_native_reconstruction" if getattr(self.backend, "adjustment_source", "tushare") == "daily_ex_reference" else "retain_provider_precision; never infer_exact_factor_from_rounded_prices"),
+            "cash_dividend_note": "shareholder_cash_and_exchange_ex_dividend_cash_can_differ_when_treasury_shares_do_not_participate",
+            "price_decimals": (2 if api_name == "daily" else 3) if fq == "pre" and api_name in {"daily", "fund_daily"} else None,
+            "missing_data_policy": "block unless affirmative suspension/lifecycle evidence", "end_date": str(end_date)}
         if self.optimize_data:
             self._cache_price_result(result_cache_key, result)
         return result
@@ -430,6 +446,12 @@ class DataPortal:
             result["name"] = [historical_names.get(code, code) for code in result["ts_code"]]
         if "ts_code" in result.columns:
             result.index = [to_joinquant_code(code) for code in result["ts_code"].tolist()]
+        result["display_name"] = result["name"]
+        result["start_date"] = [datetime.strptime(normalize_date(x), "%Y%m%d").date() for x in result["list_date"]]
+        result["end_date"] = [datetime.strptime(normalize_date(x), "%Y%m%d").date()
+                              if pd.notna(x) and str(x).strip() else datetime(2200, 1, 1).date()
+                              for x in result.get("delist_date", pd.Series("", index=result.index))]
+        result["type"] = "stock"
         return result
 
     def get_security_info(self, security, as_of=None):
@@ -630,6 +652,7 @@ class DataPortal:
                 mapped[api_level] = {
                     "industry_code": code,
                     "industry_name": names.get((jq_level, code), value.get("industry_name", "")),
+                    "provider_industry_name": value.get("industry_name", ""),
                 }
             if mapped:
                 result[security] = mapped
@@ -928,6 +951,10 @@ class DataPortal:
             raise FundamentalsUnavailableError("previous_trade_day_unavailable", requested_date=day)
         return opened["cal_date"].max()
 
+    def validate_fundamentals_visibility(self, effective_date, as_of):
+        """Default daily visibility; specialized portals must supply observation evidence."""
+        validate_daily_snapshot_visibility(effective_date, as_of)
+
     def get_fundamentals(self, q, date=None, statDate=None, *, as_of=None, requested_date=None):
         if date is not None and statDate is not None:
             raise ValueError("get_fundamentals date and statDate are mutually exclusive")
@@ -980,7 +1007,7 @@ class DataPortal:
                 request = previous_calendar_date(as_of or datetime.now())
             valuation_date = self.resolve_fundamentals_date(request)
             audit["valuation_date"] = valuation_date
-            validate_daily_snapshot_visibility(valuation_date, as_of)
+            audit.update(self.validate_fundamentals_visibility(valuation_date, as_of) or {})
         income_as_of = date
         if stat_date is not None:
             income_as_of = as_of if getattr(self.backend, "strict_pit", False) else None
@@ -997,7 +1024,7 @@ class DataPortal:
             audit["report_period_end"] = report_period[0]
             audit["income_semantics"] = "annual_cumulative" if report_period[1] else "single_quarter"
         if "valuation" in table_names:
-            frames.append(("valuation", self._valuation_frame(valuation_date)))
+            frames.append(("valuation", self._valuation_frame(valuation_date, as_of=as_of)))
         if "income" in table_names:
             income_df, income_stat_date = self._income_frame_for_stat_date(stat_date, income_as_of)
             if not income_df.empty:
@@ -1008,8 +1035,18 @@ class DataPortal:
                         "ts_code": "code",
                         "n_income_attr_p": "np_parent_company_owners",
                         "total_revenue": "total_operating_revenue",
+                        "revenue": "operating_revenue",
+                        "n_income": "net_profit",
+                        "end_date": "statDate",
                     }
                 )
+                announcement = pd.Series(None, index=income_df.index, dtype="object")
+                for column in ("ann_date", "f_ann_date"):
+                    if column in income_df:
+                        values = income_df[column].map(self._normalize_income_announcement_date)
+                        announcement = values.where(values.notna(), announcement)
+                income_df["pubDate"] = announcement.map(lambda x: joinquant_date(x) if pd.notna(x) else None)
+                income_df["statDate"] = income_df["statDate"].map(lambda x: joinquant_date(x) if pd.notna(x) else None)
                 income_df["code"] = [to_joinquant_code(code) for code in income_df["code"].tolist()]
             frames.append(("income", income_df))
         if "indicator" in table_names:
@@ -1340,18 +1377,23 @@ class DataPortal:
             else pd.DataFrame()
         )
         if latest.empty or at_seed.empty or "adj_factor" not in latest.columns:
-            return seed
+            raise PriceDataUnavailable(f"adjustment_factor_missing: {factor_api} for suspension seed")
         latest_by_code = latest.set_index("ts_code")["adj_factor"]
         seed_by_code = at_seed.set_index("ts_code")["adj_factor"]
         scale = seed["ts_code"].map(seed_by_code) / seed["ts_code"].map(latest_by_code)
-        scale = pd.to_numeric(scale, errors="coerce").where(lambda values: values > 0, 1.0)
+        scale = pd.to_numeric(scale, errors="coerce")
+        if not (np.isfinite(scale) & (scale > 0)).all():
+            raise PriceDataUnavailable(f"adjustment_factor_missing: incomplete {factor_api} for suspension seed")
         result = seed.copy()
+        result["factor"] = scale
         for column in ("open", "high", "low", "close", "pre_close"):
             if column in result.columns:
-                result[column] = pd.to_numeric(result[column], errors="coerce") * scale
+                result[column] = (pd.to_numeric(result[column], errors="coerce") * scale).round(2 if api_name == "daily" else 3)
+        if "vol" in result:
+            result["vol"] = pd.to_numeric(result["vol"], errors="coerce") / scale
         return result
 
-    def _fill_paused_trade_days(self, df, *, start_date, end_date, count):
+    def _fill_paused_trade_days(self, df, *, start_date, end_date, count, api_name="daily", securities=(), fq=None):
         if df.empty or "trade_date" not in df.columns or "ts_code" not in df.columns:
             return df
         effective_end = end_date or df["trade_date"].max()
@@ -1368,6 +1410,10 @@ class DataPortal:
             calendar = [normalize_date(day) for day in trade_days]
         if not calendar:
             return df
+
+        absent_codes = {to_tushare_code(code) for code in securities} - set(df["ts_code"])
+        if absent_codes:
+            raise PriceDataUnavailable(f"price_data_missing: {api_name} missing securities {sorted(absent_codes)}")
 
         ordered = df.copy()
         ordered["trade_date"] = ordered["trade_date"].map(normalize_date)
@@ -1396,6 +1442,57 @@ class DataPortal:
         )
         indexed = ordered.set_index(["ts_code", "trade_date"]).reindex(grid)
         missing = indexed["_observed"].isna()
+        # Seed observations can have different dates across securities. Only
+        # requested sessions require complete bars or suspension evidence.
+        gaps = indexed.index[missing & indexed.index.get_level_values("trade_date").isin(calendar)]
+        if len(gaps):
+            confirmed = set()
+            if api_name == "daily":
+                suspensions = self._fetch("suspend_d", start_date=min(all_days), end_date=max(all_days))
+                if {"ts_code", "trade_date", "suspend_type"}.issubset(suspensions.columns):
+                    confirmed = set(zip(suspensions.loc[suspensions.suspend_type == "S", "ts_code"],
+                                        suspensions.loc[suspensions.suspend_type == "S", "trade_date"]))
+            metadata = self._security_metadata_map() if api_name == "daily" else {}
+            outside_lifecycle = set()
+            for code, day in gaps:
+                info = metadata.get(to_joinquant_code(code), {})
+                listed, delisted = info.get("list_date"), info.get("delist_date")
+                if (listed and pd.notna(listed) and day < normalize_date(listed)) or (
+                    delisted and pd.notna(delisted) and day > normalize_date(delisted)):
+                    outside_lifecycle.add((code, day))
+            unresolved = set(gaps) - confirmed - outside_lifecycle
+            if unresolved:
+                examples = ", ".join(f"{code}@{day}" for code, day in sorted(unresolved)[:8])
+                raise PriceDataUnavailable(f"price_data_missing: {api_name} missing {examples}; absent source bars are not confirmed suspensions")
+            if outside_lifecycle:
+                indexed = indexed.drop(list(outside_lifecycle))
+                missing = indexed["_observed"].isna()
+        factor_gaps = indexed.index[missing & indexed.index.get_level_values("trade_date").isin(calendar)]
+        if "factor" in indexed.columns and len(factor_gaps):
+            if fq != "pre" or api_name not in {"daily", "fund_daily"}:
+                indexed.loc[factor_gaps, "factor"] = 1.0
+            else:
+                # Price filling follows affirmative suspension evidence.
+                # Factor metadata must still use the actual dated source;
+                # carrying a prior factor would miss actions during a halt.
+                factor_api = "fund_adj" if api_name == "fund_daily" else "adj_factor"
+                gap_codes = sorted({code for code, _ in factor_gaps})
+                factors = self._fetch_price_adjustment_factors(
+                    factor_api, ts_codes=",".join(gap_codes),
+                    start_date=min(day for _, day in factor_gaps), end_date=normalize_date(effective_end))
+                anchors = self._fetch(factor_api, ts_code=",".join(gap_codes),
+                                      end_date=normalize_date(effective_end), latest_per_code=True)
+                if factors.empty or anchors.empty:
+                    raise PriceDataUnavailable("adjustment_factor_missing: confirmed suspension has no dated factor")
+                anchors = self._tail_per_security(anchors, 1).set_index("ts_code")["adj_factor"]
+                dated = factors.set_index(["ts_code", "trade_date"])["adj_factor"]
+                for identity in factor_gaps:
+                    value = dated.get(identity)
+                    anchor = anchors.get(identity[0])
+                    if (value is None or anchor is None or not np.isfinite(value)
+                            or not np.isfinite(anchor) or value <= 0 or anchor <= 0):
+                        raise PriceDataUnavailable(f"adjustment_factor_missing: confirmed suspension {identity}")
+                    indexed.at[identity, "factor"] = float(value / anchor)
         previous_close = pd.to_numeric(indexed["close"], errors="coerce").groupby(level=0).ffill()
         for column in ("open", "high", "low", "close"):
             if column in indexed.columns:
@@ -1413,9 +1510,10 @@ class DataPortal:
             result = self._tail_per_security(result, int(count))
         return result.sort_values(["trade_date", "ts_code"]).reset_index(drop=True)
 
-    def _valuation_frame(self, date) -> pd.DataFrame:
+    def _valuation_frame(self, date, *, as_of=None) -> pd.DataFrame:
         mode = getattr(self.backend, "financial_mode", "strict_pit" if getattr(self.backend, "strict_pit", False) else "cached_snapshot")
-        cache_key = (normalize_date(date) if date is not None else "", mode)
+        capital_source = getattr(self.backend, "capital_source", "tushare")
+        cache_key = (normalize_date(date) if date is not None else "", mode, str(as_of), capital_source)
         cached = self._valuation_cache.get(cache_key)
         if cached is not None:
             return cached.copy()
@@ -1425,8 +1523,15 @@ class DataPortal:
         source = snapshot_method(date) if date is not None and callable(snapshot_method) else self._fetch("daily_basic", **self._valuation_date_params(date))
         diagnostics = {"mode": mode, "financial_mode": mode,
                        "requested_date": normalize_date(date) if date is not None else None,
+                       "share_capital_source": "tushare.daily_basic",
+                       "share_capital_date_basis": "daily_snapshot_date; not_verified_corporate_action_effective_date",
+                       "share_capital_effective_date_verified": False,
                        "pit_verified": False, "stale_codes": [], "missing_codes": [],
                        "pe_status_by_code": {}, "pb_status_by_code": {}}
+        capital_reader = getattr(self.backend, "capital_evidence_asof", None)
+        if callable(capital_reader) and date is not None:
+            diagnostics["published_capital_evidence"] = capital_reader(date, as_of)
+            diagnostics["capital_evidence_policy"] = "publication_time_gate; period_end_bounds_do_not_override_snapshot_values"
         if source.empty:
             result = source.copy()
             result.attrs["valuation_provenance"] = {**diagnostics, "status": "valuation_snapshot_missing"}
@@ -1478,7 +1583,7 @@ class DataPortal:
             invalid = stale | result["trade_date"].isna()
             result.loc[invalid, "pe_ratio"] = float("nan")
             statuses.loc[stale] = "stale_valuation_snapshot"
-            for column in ("total_mv", "pb", "turnover_rate"):
+            for column in ("total_mv", "circ_mv", "pb", "turnover_rate", "total_share", "float_share"):
                 if column in result:
                     result.loc[invalid, column] = float("nan")
         diagnostics["pe_status_by_code"] = {to_joinquant_code(result.at[index, "ts_code"]): str(statuses.at[index]) for index in result.index}
@@ -1488,13 +1593,59 @@ class DataPortal:
             state = diagnostics["pe_status_by_code"][code]
             diagnostics["pb_status_by_code"][code] = (
                 state if state in {"stale_valuation_snapshot", "valuation_snapshot_missing"}
-                else "source_pb" if pd.notna(pb) and np.isfinite(pb) else "source_pb_missing")
+                else ("source_pb" if pd.notna(pb) and np.isfinite(pb) else "source_pb_missing"))
+        if capital_source == "disclosed_reference" and date is not None:
+            # Opt-in research view, not an inferred CSDC registration feed.
+            # Recompute from original financial statements rather than scale
+            # rounded source ratios or fit values to the comparison log.
+            references = self.backend.disclosed_capital_values(date, as_of)
+            receipts = {}
+            requested = normalize_date(date)
+            quote_rows = (pd.concat([self._fetch("daily", trade_date=requested, ts_code=code)
+                                    for code in references], ignore_index=True)
+                          if references else pd.DataFrame())
+            quotes = {str(row.ts_code): row for row in quote_rows.itertuples()}
+            for index, row in result.iterrows():
+                code = str(row["ts_code"])
+                basis = references.get(code)
+                if basis is None or pd.isna(row.get("trade_date")) or normalize_date(row["trade_date"]) != requested:
+                    continue
+                quote = quotes.get(code)
+                if (quote is None or normalize_date(quote.trade_date) != requested
+                        or not np.isfinite(quote.close) or quote.close <= 0):
+                    continue
+                price = Decimal(str(quote.close))
+                total = Decimal(basis["total_shares"])
+                circulating = Decimal(basis["circulating_a_shares"])
+                market_value = total * price
+                result.at[index, "total_share"] = float(total / 10000)
+                result.at[index, "float_share"] = float(circulating / 10000)
+                result.at[index, "total_mv"] = float(market_value / 10000)
+                result.at[index, "circ_mv"] = float(circulating * price / 10000)
+                quantum = Decimal("0.0001")
+                profit = Decimal(basis["ttm_parent_profit_cny"])
+                result.at[index, "pe_ratio"] = float((market_value / profit).quantize(quantum, rounding=ROUND_HALF_UP)) if profit else float("nan")
+                result.at[index, "pb"] = float((market_value / Decimal(basis["ordinary_equity_cny"])).quantize(quantum, rounding=ROUND_HALF_UP))
+                if circulating and np.isfinite(quote.vol):
+                    result.at[index, "turnover_rate"] = float((Decimal(str(quote.vol)) * 10000 / circulating).quantize(quantum, rounding=ROUND_HALF_UP))
+                jqcode = to_joinquant_code(code)
+                diagnostics["pe_status_by_code"][jqcode] = "original_filing_ttm_reconstructed"
+                diagnostics["pb_status_by_code"][jqcode] = "original_filing_common_equity_reconstructed"
+                receipts[jqcode] = {**basis, "price_source": "tushare.daily", "price_date": requested,
+                    "close": str(price), "valuation_rounding": "PE/PB/turnover: decimal ROUND_HALF_UP 4 places"}
+            diagnostics["share_capital_source"] = "per_code_disclosed_reference_with_tushare_snapshot_for_unqualified_rows"
+            diagnostics["share_capital_date_basis"] = "latest_visible_disclosed_period_end_snapshot; individual_registration_dates_unknown"
+            diagnostics["capital_evidence_policy"] = "explicit_research_view; publication_and_scope_gated; original_rows_preserved"
+            diagnostics["disclosed_capital_receipts"] = receipts
         diagnostics["pit_verified"] = mode == "strict_pit"
         diagnostics["status"] = "incomplete_snapshot" if diagnostics["stale_codes"] or diagnostics["missing_codes"] else "snapshot_available"
         diagnostics["legacy_financial_vintages_recovered"] = False
-        result = result.rename(columns={"ts_code": "code", "total_mv": "market_cap", "pb": "pb_ratio", "turnover_rate": "turnover_ratio"})
-        if "market_cap" in result:
-            result["market_cap"] = pd.to_numeric(result["market_cap"], errors="coerce") / 10000.0
+        # Both providers publish share capital in ten thousand shares. Keep
+        # the source values separate from market value (ten thousand CNY).
+        result = result.rename(columns={"ts_code": "code", "total_mv": "market_cap", "circ_mv": "circulating_market_cap", "pb": "pb_ratio", "turnover_rate": "turnover_ratio", "total_share": "capitalization", "float_share": "circulating_cap"})
+        for column in ("market_cap", "circulating_market_cap"):
+            if column in result:
+                result[column] = pd.to_numeric(result[column], errors="coerce") / 10000.0
         result["code"] = [to_joinquant_code(code) for code in result["code"]]
         result.attrs["valuation_provenance"] = diagnostics
         self._valuation_cache[cache_key] = result.copy()
@@ -1746,7 +1897,7 @@ class DataPortal:
         elif "end_date" in result.columns:
             target_previous = result["end_date"].map(
                 lambda value: self._previous_income_period(value)
-            ).map(lambda value: self._fundamental_report_period(value)[0] if value else None)
+            ).map(lambda value: self._fundamental_report_period(value)[0] if pd.notna(value) else None)
         else:
             # Legacy fixtures with no period identity cannot support a
             # cumulative-to-quarter transformation.
@@ -1998,7 +2149,7 @@ class DataPortal:
                 f"Price backend data is missing required columns: {names}"
             )
 
-    def _format_price_frame(self, df: pd.DataFrame, fields: Iterable[str]) -> pd.DataFrame:
+    def _format_price_frame(self, df: pd.DataFrame, fields: Iterable[str], *, api_name="daily") -> pd.DataFrame:
         self._validate_price_frame(df)
         result = pd.DataFrame()
         result["time"] = self._format_joinquant_dates(df["trade_date"])
@@ -2008,7 +2159,11 @@ class DataPortal:
             if source not in df.columns:
                 raise NotImplementedError(f"Requested field is not available from backend data: {field}")
             if field == "money":
-                result[field] = pd.to_numeric(df[source], errors="coerce").values * 1000.0
+                multiplier = 10000.0 if api_name == "sw_daily" else 1000.0
+                result[field] = pd.to_numeric(df[source], errors="coerce").values * multiplier
+            elif field == "volume":
+                multiplier = 10000.0 if api_name == "sw_daily" else 100.0
+                result[field] = np.round(pd.to_numeric(df[source], errors="coerce").values * multiplier)
             else:
                 result[field] = df[source].values
         return result.reset_index(drop=True)
@@ -2050,10 +2205,10 @@ class DataPortal:
                 start_date=start_date,
                 end_date=end_date,
             )
-        except NotImplementedError:
-            return df
+        except NotImplementedError as error:
+            raise PriceDataUnavailable(f"adjustment_factor_missing: {factor_api_name}: {error}") from error
         if factors.empty or "adj_factor" not in factors.columns:
-            return df
+            raise PriceDataUnavailable(f"adjustment_factor_missing: {factor_api_name} {ts_codes}")
 
         factor_frame = factors[["ts_code", "trade_date", "adj_factor"]].copy()
         factor_frame["adj_factor"] = pd.to_numeric(factor_frame["adj_factor"], errors="coerce")
@@ -2068,10 +2223,14 @@ class DataPortal:
         result = df.merge(factor_frame, on=["ts_code", "trade_date"], how="left")
         result["_latest_adj_factor"] = result["ts_code"].map(latest_by_code)
         scale = result["adj_factor"] / result["_latest_adj_factor"]
-        scale = scale.where(scale.notna() & (scale > 0), 1.0)
+        if not (np.isfinite(scale) & (scale > 0)).all():
+            raise PriceDataUnavailable(f"adjustment_factor_missing: incomplete {factor_api_name} for requested prices")
+        result["factor"] = scale
         for column in ("open", "high", "low", "close", "pre_close"):
             if column in result.columns:
-                result[column] = pd.to_numeric(result[column], errors="coerce") * scale
+                result[column] = (pd.to_numeric(result[column], errors="coerce") * scale).round(2 if api_name == "daily" else 3)
+        if "vol" in result:
+            result["vol"] = pd.to_numeric(result["vol"], errors="coerce") / scale
         return result.drop(columns=["adj_factor", "_latest_adj_factor"], errors="ignore")
 
     def _fetch_price_adjustment_factors(
@@ -2082,6 +2241,11 @@ class DataPortal:
         start_date: str,
         end_date: str,
     ) -> pd.DataFrame:
+        if factor_api_name == "adj_factor" and getattr(self.backend, "adjustment_source", "tushare") != "tushare":
+            # Optional receipts cover requested stocks, not the entire market.
+            # Filter source identities before resolving their factor source.
+            return self._fetch(factor_api_name, ts_code=ts_codes,
+                               start_date=start_date, end_date=end_date)
         if self.optimize_data and start_date and end_date:
             return self._cached_date_range_frame_for_ts_codes(
                 factor_api_name,

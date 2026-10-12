@@ -105,7 +105,7 @@ class CanonicalPriceStore:
                     int(count) if count is not None else None,
                 )
             if fq == "pre" and factor_api_name is not None and not result.empty:
-                result = self._adjusted_source(api_name, factor_api_name, result)
+                result = self._adjusted_source(api_name, factor_api_name, result, requested_end)
             return result.reset_index(drop=True)
         finally:
             self._stats.slice_calls += 1
@@ -328,11 +328,12 @@ class CanonicalPriceStore:
         api_name: str,
         factor_api_name: str,
         result: pd.DataFrame,
+        requested_end: str,
     ) -> pd.DataFrame:
         started = perf_counter()
         try:
             factor_start = normalize_date(result["trade_date"].min())
-            factor_end = normalize_date(result["trade_date"].max())
+            factor_end = normalize_date(requested_end)
             factor_codes = self._unique_codes(result["ts_code"].tolist())
             self._ensure_raw(
                 factor_api_name,
@@ -347,7 +348,7 @@ class CanonicalPriceStore:
                 factor_end,
             )
             if not factor_views:
-                return result
+                raise CanonicalPriceStoreError("adjustment_factor_missing: no factor observations")
             if cache_hit:
                 self._stats.adjusted_hits += 1
             else:
@@ -355,11 +356,14 @@ class CanonicalPriceStore:
             scale_values = self._factor_scales(result, factor_views)
 
             adjusted = result.copy()
+            adjusted["factor"] = scale_values
             for column in ("open", "high", "low", "close", "pre_close"):
                 if column in adjusted.columns:
                     adjusted[column] = (
                         pd.to_numeric(adjusted[column], errors="coerce").to_numpy() * scale_values
-                    )
+                    ).round(2 if api_name == "daily" else 3)
+            if "vol" in adjusted:
+                adjusted["vol"] = pd.to_numeric(adjusted["vol"], errors="coerce").to_numpy() / scale_values
             return adjusted.drop(columns=["adj_factor"], errors="ignore")
         finally:
             self._stats.adjustment_seconds += perf_counter() - started
@@ -437,7 +441,7 @@ class CanonicalPriceStore:
         result: pd.DataFrame,
         views: dict[str, _FactorCodeView],
     ) -> np.ndarray:
-        scales = np.ones(len(result), dtype=float)
+        scales = np.full(len(result), np.nan, dtype=float)
         dates = result["trade_date"].astype(np.int64).to_numpy()
         groups = result.groupby("ts_code", sort=False).indices
         for code, indices in groups.items():
@@ -457,8 +461,10 @@ class CanonicalPriceStore:
             computed = view.values[positions[valid]] / latest
             target = np.asarray(indices)[valid]
             scales[target] = np.where(
-                np.isfinite(computed) & (computed > 0), computed, 1.0
+                np.isfinite(computed) & (computed > 0), computed, np.nan
             )
+        if not (np.isfinite(scales) & (scales > 0)).all():
+            raise CanonicalPriceStoreError("adjustment_factor_missing: incomplete factors for requested prices")
         return scales
 
     def _count_window_start(self, requested_end: str, count: int) -> str:

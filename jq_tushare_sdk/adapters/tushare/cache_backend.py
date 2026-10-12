@@ -32,6 +32,8 @@ class ApiSpec:
 
 
 _API_SPECS: dict[str, ApiSpec] = {
+    "suspend_d": ApiSpec("suspension_daily", ("ts_code", "trade_date", "suspend_type"),
+                         "trade_date", ("ts_code", "trade_date", "suspend_timing", "suspend_type")),
     "bse_mapping": ApiSpec(
         "bse_mapping", ("o_code",), None, ("name", "o_code", "n_code", "list_date"),
     ),
@@ -363,12 +365,21 @@ class TushareCacheBackend:
         *,
         strict_pit: bool = False,
         financial_mode: str = "cached_snapshot",
+        adjustment_source: str | None = None,
+        capital_source: str | None = None,
     ):
         self.cache_db = str(cache_db)
         if financial_mode not in {"cached_snapshot", "research_reconstructed", "strict_pit"}:
             raise ValueError("financial_mode must be cached_snapshot, research_reconstructed, or strict_pit")
         self.strict_pit = bool(strict_pit) or financial_mode == "strict_pit"
         self.financial_mode = "strict_pit" if self.strict_pit else financial_mode
+        self.adjustment_source = adjustment_source or os.environ.get("JQTS_ADJUSTMENT_SOURCE", "tushare")
+        if self.adjustment_source not in {"tushare", "sina_hfq", "daily_ex_reference"}:
+            raise ValueError("adjustment_source must be tushare, sina_hfq or daily_ex_reference")
+        self.precise_factor_provenance = {}
+        self.capital_source = capital_source or os.environ.get("JQTS_CAPITAL_SOURCE", "tushare")
+        if self.capital_source not in {"tushare", "disclosed_reference"}:
+            raise ValueError("capital_source must be tushare or disclosed_reference")
         self.token = token
         self.cache_mode = cache_mode
         self.package_path = package_path
@@ -404,6 +415,9 @@ class TushareCacheBackend:
             for field in str(params.get("fields") or "").split(",")
             if field.strip() in spec.columns
         ]
+        precise_stock_factors = api_name == "adj_factor" and self.adjustment_source in {"sina_hfq", "daily_ex_reference"}
+        if precise_stock_factors and requested_fields:
+            requested_fields = list(dict.fromkeys([*requested_fields, "ts_code", "trade_date", "adj_factor"]))
         select_columns = ", ".join(requested_fields) if requested_fields else "*"
         if row_limit and "ts_code" in spec.primary_keys and spec.date_column:
             sql = (
@@ -428,7 +442,20 @@ class TushareCacheBackend:
             sql += " ORDER BY " + ", ".join(order_columns)
         frame = self._read_sql(sql, sql_params)
         frame = frame.drop(columns=["_row_number"], errors="ignore")
+        if precise_stock_factors:
+            from jq_tushare_sdk.data.market_reference import precise_factor_frame
+            frame = precise_factor_frame(self.cache_db, frame, as_of=params.get("as_of"), strict_pit=self.strict_pit,
+                                         source=self.adjustment_source)
+            self.precise_factor_provenance.update(frame.attrs.get("precise_factor_provenance", {}))
         return self._project_fields(frame, params.get("fields"))
+
+    def capital_evidence_asof(self, effective_date, knowledge_asof):
+        from jq_tushare_sdk.data.market_reference import capital_evidence_asof
+        return capital_evidence_asof(self.cache_db, effective_date, knowledge_asof)
+
+    def disclosed_capital_values(self, date, knowledge_asof):
+        from jq_tushare_sdk.data.market_reference import disclosed_capital_values
+        return disclosed_capital_values(self.cache_db, date, knowledge_asof, strict_pit=self.strict_pit)
 
     def daily_basic_asof(self, date) -> pd.DataFrame:
         """Latest observed per-security snapshot, without a suspension-day cap.
@@ -665,7 +692,7 @@ class TushareCacheBackend:
         return self.cache_data(api_name, data)
 
     def _security_pages(self, api_name: str, params: dict) -> pd.DataFrame:
-        page_size = 1000 if api_name == "stock_st" else 5000
+        page_size = {"stock_st": 1000, "dividend": 2000}.get(api_name, 5000)
         payload = {**params, "fields": ",".join(self._spec(api_name).columns)}
         payload.pop("offset", None)
         payload.pop("limit", None)
@@ -711,13 +738,51 @@ class TushareCacheBackend:
         return len(rows)
 
     def _update_income_period(self, period: str) -> int:
-        api_params = self._api_params("income", period=period, fields=_INCOME_UPDATE_FIELDS)
+        period_end = self._period_to_end_date(period)
         pro = self._pro_api()
-        method = getattr(pro, "income_vip", None)
-        if method is None:
-            method = getattr(pro, "income")
-        self._wait_for_rate_limit()
-        data = method(**api_params)
+        params = {"period": period_end, "fields": _INCOME_UPDATE_FIELDS, "report_type": "1"}
+        frames, seen, offset = [], set(), 0
+        for _ in range(100):
+            self._wait_for_rate_limit()
+            try:
+                page = pro.income_vip(**params, limit=5000, offset=offset)
+            except Exception as exc:
+                # Permission fallback uses the ordinary per-security API, never
+                # income(period=...) pretending to return the whole market.
+                message = str(exc).lower()
+                if offset or not any(word in message for word in ("权限", "积分", "permission", "无权")):
+                    raise
+                stocks = self.fetch("stock_basic")
+                if stocks.empty:
+                    raise ValueError("income requires stock_basic for per-security permission fallback") from None
+                for code in stocks.ts_code.dropna().unique():
+                    self._wait_for_rate_limit()
+                    response = pro.income(ts_code=code, **params)
+                    if response is not None and not response.empty:
+                        frames.append(response)
+                break
+            if page is None:
+                raise ValueError("income_vip returned no response; incomplete period")
+            if page.empty:
+                break
+            if not {"ts_code", "end_date", "report_type", "ann_date"}.issubset(page.columns):
+                raise ValueError("income_vip missing report identity")
+            if set(page.end_date.astype(str)) != {period_end}:
+                raise ValueError("income_vip returned a different report period")
+            identities = set(pd.util.hash_pandas_object(page, index=False).tolist())
+            if identities.issubset(seen):
+                raise ValueError("income_vip repeated a complete page; cannot establish coverage")
+            seen.update(identities)
+            frames.append(page)
+            offset += len(page)
+            if len(page) < 5000:
+                break
+        else:
+            raise ValueError("income_vip exceeded 100 pages; incomplete period")
+        if not frames:
+            raise ValueError(f"income has no published reports for {period_end}")
+        data = pd.concat(frames, ignore_index=True).drop_duplicates()
+        data = data.sort_values([c for c in ("ts_code", "end_date", "f_ann_date", "ann_date") if c in data], na_position="first")
         return self.cache_data("income", data)
 
     def _update_sw_classify(self, params: dict) -> int:
@@ -975,7 +1040,7 @@ class TushareCacheBackend:
     def _create_table_sql(self, spec: ApiSpec) -> str:
         column_defs = []
         for column in spec.columns:
-            if column.endswith("_date") or column.endswith("_code") or column.endswith("_name") or column in {"type", "change_reason", "ts_code", "index_code", "con_code", "security", "source_sha256", "scope", "observed_at", "source", "exchange", "symbol", "name", "industry", "market", "list_status", "report_type", "comp_type", "is_hs", "area", "fullname", "enname", "cnspell", "curr_type", "delist_date", "act_name", "act_ent_type", "is_new", "src", "level"}:
+            if column.endswith("_date") or column.endswith("_code") or column.endswith("_name") or column in {"type", "change_reason", "ts_code", "index_code", "con_code", "security", "source_sha256", "scope", "observed_at", "source", "exchange", "symbol", "name", "industry", "market", "list_status", "report_type", "comp_type", "is_hs", "area", "fullname", "enname", "cnspell", "curr_type", "delist_date", "act_name", "act_ent_type", "is_new", "src", "level", "suspend_timing", "suspend_type"}:
                 sql_type = "TEXT"
             elif column == "is_open":
                 sql_type = "INTEGER"

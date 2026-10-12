@@ -39,7 +39,9 @@ def get_data_contract():
     """
     backend = runtime_state().data_portal.backend
     mode = getattr(backend, "financial_mode", "cached_snapshot")
-    identity = {"financial_mode": mode}
+    adjustment_source = getattr(backend, "adjustment_source", "tushare")
+    capital_source = getattr(backend, "capital_source", "tushare")
+    identity = {"financial_mode": mode, "adjustment_source": adjustment_source, "capital_source": capital_source}
     cache = getattr(backend, "cache_db", None)
     if cache:
         for suffix in ("", "-wal"):
@@ -51,6 +53,10 @@ def get_data_contract():
                 identity[suffix or "database"] = None
     return {
         "provider": "jq-tushare-sdk",
+        "stock_adjustment_source": adjustment_source,
+        "capital_source": capital_source,
+        "capital_policy": "latest_disclosed_research_view" if capital_source == "disclosed_reference" else "provider_daily_snapshot",
+        "adjustment_historical_vintages_verified": False,
         "financial_mode": mode,
         "native_reproduction_eligible": False,
         "data_snapshot_id": hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest(),
@@ -308,7 +314,7 @@ def _validate_price_compat_kwargs(skip_paused, fq, fill_paused):
         raise NotImplementedError(
             f"Unsupported JoinQuant get_price skip_paused value: {skip_paused!r}"
         )
-    if fq != "pre":
+    if fq not in {None, "pre"}:
         raise NotImplementedError(f"Unsupported JoinQuant get_price fq value: {fq!r}")
     if fill_paused is not True:
         raise NotImplementedError(

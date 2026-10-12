@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import sys
 
@@ -47,6 +48,14 @@ def build_parser():
     import_industry.add_argument("--as-of")
     import_industry.add_argument("--cache-db", required=True)
 
+    import_native = subparsers.add_parser("import-jq-native", help="Verify and append complete JoinQuant forecast and valuation log exports")
+    import_native.add_argument("input", help="Downloaded full log ZIP or UTF-8 log")
+    import_native.add_argument("--cache-db", required=True)
+    import_native.add_argument("--data-date", required=True, help="Exact exported data day, YYYY-MM-DD")
+    import_native.add_argument("--lookback-days", type=int, default=90)
+    import_native.add_argument("--source-reference", required=True, help="JoinQuant backtest detail URL")
+    import_native.add_argument("--validate-only", action="store_true", help="Verify everything without opening or writing the cache")
+
     refresh_report = subparsers.add_parser("refresh-report")
     refresh_report.add_argument("run_dir")
     refresh_report.add_argument("--cache-db", required=True)
@@ -80,6 +89,18 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if args.command == "import-jq-native":
+        from jq_tushare_sdk.data.native_import import import_native_log
+        from jq_tushare_sdk.runtime.logger import redact_runtime_text
+        try:
+            result = import_native_log(args.cache_db, args.input, data_date=args.data_date,
+                source_reference=args.source_reference, lookback_days=args.lookback_days,
+                validate_only=args.validate_only)
+        except Exception as error:
+            print(redact_runtime_text(f"Native import failed: {error}"), file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
+        return 0
     if args.command == "simulation-web":
         raise SystemExit("模拟工作台已迁移到独立项目 jq-strategy-platform，请在该项目中运行 jqsp web。")
     if args.command == "web":

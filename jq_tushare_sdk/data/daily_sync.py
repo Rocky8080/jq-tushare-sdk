@@ -9,7 +9,7 @@ from __future__ import annotations
 import ast
 import calendar
 import math
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 import os
 from pathlib import Path
 import sqlite3
@@ -19,6 +19,7 @@ import pandas as pd
 
 from jq_tushare_sdk.adapters.tushare.cache_backend import TushareCacheBackend
 from jq_tushare_sdk.data.cache_lock import cache_write_lock
+from jq_tushare_sdk.data.income_periods import required_income_periods, income_period_end
 from jq_tushare_sdk.data.code_map import (
     normalize_date, to_tushare_code, is_tushare_a_share_code,
     is_tushare_fund_code, is_tushare_index_code, is_tushare_sw_index_code,
@@ -73,6 +74,9 @@ class _Provider:
                     raise
                 except Exception as error:
                     detail = redact(str(error))[:400]
+                    if any(word in detail.lower() for word in (
+                            "参数校验", "参数不能都为空", "invalid parameter", "missing required parameter")):
+                        raise DataSyncError("parameters", f"Tushare {api} 请求参数无效：{detail}") from None
                     permission = any(word in detail.lower() for word in (
                         "权限", "积分", "无权", "token", "permission", "unauthorized", "无效", "认证"))
                     if permission:
@@ -155,7 +159,7 @@ class DailyDataSync:
         spec = self._backend._spec(api)
         with self._connect() as connection:
             marker = connection.execute(
-                "SELECT row_count FROM simulation_data_coverage WHERE api_name=? AND scope=? AND trade_date=?",
+                "SELECT row_count,updated_at FROM simulation_data_coverage WHERE api_name=? AND scope=? AND trade_date=?",
                 (api, scope, day)).fetchone()
             if marker is None:
                 return False
@@ -170,11 +174,21 @@ class DailyDataSync:
             count = connection.execute(f"SELECT COUNT(*) FROM {spec.table}{where}", params).fetchone()[0]
             if count != marker[0]:
                 return False
+            if api == "stock_st":
+                # The provider publishes the daily ST list at 09:20. An early
+                # partial response is not a completed session snapshot, even
+                # when its cached row count still matches the coverage marker.
+                try:
+                    captured_at = datetime.fromisoformat(marker[1])
+                except (TypeError, ValueError):
+                    return False
+                if captured_at.tzinfo is None or captured_at < datetime.combine(_day(day), time(9, 20), CHINA):
+                    return False
             if api in {"stock_st", "stk_limit"}:
                 complete = connection.execute(
                     "SELECT row_count FROM security_state_coverage WHERE api_name=? AND trade_date=?", (api, day)).fetchone()
                 return complete is not None and complete[0] == count and count > 0
-            return count > 0 or api == "dividend"
+            return count > 0 or api in {"dividend", "suspend_d"}
 
     def _mark(self, api, scope, day, count):
         with self._connect() as connection:
@@ -199,10 +213,28 @@ class DailyDataSync:
         self._updated[api] = self._updated.get(api, 0) + int(count)
 
     def _daily_snapshot(self, api, day, scope="all"):
+        if api == "stock_st" and datetime.now(CHINA) < datetime.combine(_day(day), time(9, 20), CHINA):
+            raise DataSyncError("waiting_data", f"stock_st 的 {day} 名单在北京时间 09:20 更新；等待发布后取得完整当日状态，盘前策略尚未执行。")
         if self._covered(api, scope, day):
             return False
         self._progress("daily", f"正在补齐 {day} 的 {api}", api=api, date=_day(day).isoformat())
         backend = self._backend
+        if api == "suspend_d":
+            frame = backend._security_pages(api, {"trade_date": day})
+            if not frame.empty and set(frame.trade_date.map(normalize_date)) != {day}:
+                raise DataSyncError("waiting_data", f"suspend_d 返回了不同日期的停牌记录：{day}")
+            spec = backend._spec(api)
+            frame = backend._normalize_frame(api, frame, spec)
+            with self._connect() as connection:
+                connection.execute(f"DELETE FROM {spec.table} WHERE trade_date=?", (day,))
+                if not frame.empty:
+                    columns = list(frame.columns)
+                    rows = list(frame.astype(object).where(pd.notna(frame), None).itertuples(index=False, name=None))
+                    connection.executemany(f"INSERT INTO {spec.table} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})", rows)
+                connection.execute("INSERT OR REPLACE INTO simulation_data_coverage VALUES (?,?,?,?,?)",
+                                   (api, scope, day, len(frame), datetime.now(CHINA).isoformat()))
+            self._add(api, len(frame))
+            return True
         if api in {"stock_st", "stk_limit"}:
             count = backend.update_data(api, trade_date=day)
             self._mark(api, scope, day, count)
@@ -244,8 +276,9 @@ class DailyDataSync:
                 arguments.append(scope)
             connection.execute(f"DELETE FROM {spec.table} WHERE {clause}", arguments)
             connection.executemany(f"INSERT INTO {spec.table} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})", rows)
+            observed_at = datetime.now(CHINA)
             connection.execute("INSERT OR REPLACE INTO simulation_data_coverage VALUES (?,?,?,?,?)",
-                               (api, scope, day, len(rows), datetime.now(CHINA).isoformat()))
+                               (api, scope, day, len(rows), observed_at.isoformat()))
         self._add(api, len(rows))
         return True
 
@@ -262,6 +295,16 @@ class DailyDataSync:
                 if "list_status" not in frame:
                     frame["list_status"] = status
                 count += self._backend.cache_data(api, frame)
+        elif api == "dividend" and scope == "all":
+            # The all-security intraday reference covers this ex-dividend day.
+            # An unfiltered dividend request is rejected by the provider; it
+            # is also not evidence of complete historical corporate actions.
+            frame = self._backend._security_pages(api, {"ex_date": day})
+            if not frame.empty and (
+                    "ex_date" not in frame or
+                    set(frame.ex_date.map(normalize_date)) != {day}):
+                raise DataSyncError("waiting_data", f"dividend 返回了不同除权日期的记录：{day}")
+            count = self._backend.cache_data(api, frame)
         else:
             count = self._backend.update_data(api, **({"ts_code": scope} if scope != "all" else {}))
         current = self._count(api, scope)
@@ -304,6 +347,44 @@ class DailyDataSync:
             # The existing resolver uses an honest security-code label for
             # these rows; the complete dated ST list remains mandatory.
 
+    def _financial_dependencies(self, lower, upper, source):
+        if "get_fundamentals" not in source:
+            return
+        periods = set(required_income_periods(lower, upper))
+        latest = max(int(p[:4]) * 4 + int(p[-1]) - 1 for p in periods)
+        periods.update(f"{i//4}q{i%4+1}" for i in range(latest-3, latest+1))
+        if source:
+            for node in ast.walk(ast.parse(source)):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    value = node.value.lower()
+                    if len(value) == 6 and value[:4].isdigit() and value[4] == "q" and value[5] in "1234":
+                        periods.add(value)
+        # Single-quarter values need the preceding cumulative report, and TTM
+        # growth requires the same period last year. Source snapshots captured
+        # today remain explicitly unverified as historical revisions.
+        for period in list(periods):
+            year, quarter = int(period[:4]), int(period[-1])
+            if quarter > 1:
+                periods.add(f"{year}q{quarter-1}")
+            if "indicator" in source:
+                periods.update(f"{year-1}q{q}" for q in range(1, quarter+1))
+        with self._connect() as connection:
+            connection.execute("CREATE TABLE IF NOT EXISTS income_period_coverage (period TEXT PRIMARY KEY,row_count INTEGER NOT NULL,captured_at TEXT NOT NULL)")
+        for period in sorted(periods):
+            end = income_period_end(period)
+            with self._connect() as connection:
+                marker = connection.execute("SELECT row_count,captured_at FROM income_period_coverage WHERE period=?", (end,)).fetchone()
+                count = connection.execute("SELECT COUNT(*) FROM income_statement WHERE end_date=? AND report_type='1'", (end,)).fetchone()[0]
+            if marker and marker[0] == count and count and marker[1][:10] == datetime.now(CHINA).date().isoformat():
+                continue
+            self._progress("financial", f"正在补齐 {period} 的完整利润表", api="income", period=period)
+            self._add("income", self._backend.update_data("income", period=period))
+            with self._connect() as connection:
+                count = connection.execute("SELECT COUNT(*) FROM income_statement WHERE end_date=? AND report_type='1'", (end,)).fetchone()[0]
+                if not count:
+                    raise DataSyncError("waiting_data", f"利润表 {period} 仍然缺失，策略不能继续")
+                connection.execute("INSERT OR REPLACE INTO income_period_coverage VALUES (?,?,?)", (end,count,datetime.now(CHINA).isoformat()))
+
     def prepare(self, start_date, end_date, benchmark="000300.XSHG", progress=None,
                 cancelled=None, source="", securities=()):
         if not self._mutex.acquire(blocking=False):
@@ -324,6 +405,21 @@ class DailyDataSync:
                 symbols.update(securities)
                 symbols.add(benchmark)
                 symbols = {to_tushare_code(symbol) for symbol in symbols}
+                if self._backend.adjustment_source == "sina_hfq":
+                    from jq_tushare_sdk.data.market_reference import refresh_precise_factors
+                    factor_codes = [symbol for symbol in symbols if is_tushare_a_share_code(symbol)
+                                    and not is_tushare_index_code(symbol) and symbol.endswith((".SH", ".SZ"))]
+                    self._progress("precise_factors", "正在补齐明确股票依赖的高精度复权因子")
+                    refresh_precise_factors(self.cache_db, factor_codes, cancelled=self._cancelled,
+                                           progress=lambda row: self._add("sina_precise_factors", row["nodes"]))
+                if os.environ.get("JQTS_SYNC_ANNOUNCEMENTS") == "szse":
+                    from jq_tushare_sdk.data.market_reference import sync_szse_announcements
+                    announcement_codes = [symbol for symbol in symbols if is_tushare_a_share_code(symbol)
+                                          and not is_tushare_index_code(symbol) and symbol.endswith(".SZ")]
+                    self._progress("announcements", "正在补齐深交所公告的原始发布时间")
+                    receipts = sync_szse_announcements(self.cache_db, announcement_codes,
+                        lower - timedelta(days=45), upper, cancelled=self._cancelled)
+                    self._add("szse_announcements", sum(len(row["rows"]) for row in receipts))
                 lookback = 0
                 if source:
                     tree = ast.parse(source)
@@ -331,6 +427,11 @@ class DailyDataSync:
                     context = _context_numeric_env(tree, env)
                     for node in ast.walk(tree):
                         if isinstance(node, ast.Call):
+                            name=getattr(node.func,"id",getattr(node.func,"attr",""))
+                            keyword,position=("frequency",4) if name=="get_price" else ("unit",1 if name=="history" else 2)
+                            unit=next((k.value for k in node.keywords if k.arg==keyword),node.args[position] if len(node.args)>position else None)
+                            if isinstance(unit,ast.Constant) and unit.value in {"minute","1m","1min"}:
+                                continue  # minute counts must not become daily lookbacks
                             count_node = _price_count_argument_node(node)
                             count = _evaluate_numeric_expression(count_node, env, context) if count_node else None
                             if isinstance(count, (int, float)) and 0 < count <= 10000:
@@ -360,11 +461,14 @@ class DailyDataSync:
                     stamp = _stamp(day)
                     is_target = day >= full_lower
                     changed = False
-                    for api in ("daily", "daily_basic", "adj_factor", "stock_st", "stk_limit"):
+                    for api in ("daily", "daily_basic", "adj_factor", "stock_st", "stk_limit", "suspend_d"):
                         if not is_target:
                             if api in {"daily_basic", "stock_st", "stk_limit"}:
                                 continue
-                            if self._count(api, day=stamp):
+                            # A missing historical bar needs official suspension
+                            # evidence too. Some suspension rows are not proof of
+                            # a complete day; reuse only its full-fetch marker.
+                            if api != "suspend_d" and self._count(api, day=stamp):
                                 continue
                         changed = self._daily_snapshot(api, stamp) or changed
                     for symbol in sorted(symbols):
@@ -388,6 +492,7 @@ class DailyDataSync:
                 for symbol in sorted(symbols):
                     if is_tushare_a_share_code(symbol) and not is_tushare_index_code(symbol):
                         self._metadata("dividend", day_stamp, symbol)
+                self._financial_dependencies(lower, upper, source)
                 if "get_index_stocks" in source:
                     for symbol in sorted(symbols):
                         if is_tushare_index_code(symbol):
@@ -398,8 +503,16 @@ class DailyDataSync:
                           "prepared_from": price_lower.isoformat(),
                           "updated_rows": dict(self._updated), "reused_days": reused,
                           "scope": "核心 A 股日线、历史状态和明确证券依赖；动态证券、行业与财务历史仍由策略执行时严格检查。"}
-                self._progress("ready", "日线及配套数据已准备，接下来推进策略", completed=len(price_days), total=len(price_days))
-                return result
+            if self._backend.adjustment_source == "daily_ex_reference":
+                from jq_tushare_sdk.data.market_reference import prepare_reference_price_factors
+                factor_codes = [symbol for symbol in symbols if is_tushare_a_share_code(symbol)
+                                and not is_tushare_index_code(symbol)]
+                self._progress("reference_factors", "正在归档除权参考报价及可复验的复权规则")
+                references = prepare_reference_price_factors(self.cache_db, factor_codes,
+                                                             price_lower, upper)
+                result["reference_price_factors"] = references
+            self._progress("ready", "日线及配套数据已准备，接下来推进策略", completed=len(price_days), total=len(price_days))
+            return result
         except InterruptedError:
             raise DataSyncError("cancelled", "数据补齐已停止，已完成的数据保留供下次继续。") from None
         except DataSyncError:
